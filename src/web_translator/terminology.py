@@ -26,9 +26,10 @@ def normalize_first_use(
 ) -> list[Translation]:
     """Keep English terms and add one canonical Korean gloss at first use.
 
-    Records must already be in document order. Protected placeholders are opaque,
-    so terms contained by code, URLs, identifiers, and inline tag tokens are never
-    inspected or rewritten here.
+    Records must already be in document order. Placeholder values are never
+    inspected. Code, URL, identifier, and other full-value placeholders are opaque
+    barriers; paired tag-boundary placeholders are transparent only when their
+    exact ``ProtectedToken`` metadata is supplied.
     """
     records = list(ordered)
     if any(not isinstance(record, Translation) for record in records):
@@ -77,10 +78,10 @@ def _normalize_record(
 ) -> str:
     """Normalize visible characters while retaining opaque tokens verbatim.
 
-    Removing tokens in the matching projection makes paired inline tag markers
+    Removing tag tokens in the matching projection makes paired inline markers
     transparent, so a term such as ``Spring <em>AI</em>`` is still one visual
-    occurrence. A full code/URL/identifier token contributes no characters and
-    its protected value remains uninspected.
+    occurrence. A full code/URL/identifier token contributes an opaque barrier,
+    and its protected value remains uninspected.
     """
     visible_characters: list[str] = []
     original_positions: list[int] = []
@@ -106,12 +107,12 @@ def _normalize_record(
             continue
         term = match.group("term")
         gloss = canonical[term]
-        suffix_end = _gloss_suffix_end(projected, match.end(), gloss)
-        if suffix_end > match.end():
-            ignored_ranges.append((match.end(), suffix_end))
-        removed_positions.update(
-            original_positions[index] for index in range(match.end(), suffix_end)
-        )
+        exact_gloss_ranges = _exact_gloss_ranges(projected, match.end(), gloss)
+        ignored_ranges.extend(exact_gloss_ranges)
+        for start, end in exact_gloss_ranges:
+            removed_positions.update(
+                original_positions[index] for index in range(start, end)
+            )
         if term not in seen:
             seen.add(term)
             insertion_position = (
@@ -130,17 +131,50 @@ def _normalize_record(
     return "".join(rebuilt)
 
 
-def _gloss_suffix_end(text: str, start: int, canonical_gloss: str) -> int:
+def _exact_gloss_ranges(
+    text: str, start: int, canonical_gloss: str
+) -> list[tuple[int, int]]:
+    """Return exact canonical entries in one contiguous parenthetical suffix."""
     position = start
-    parenthetical = re.compile(r"[ \t]*\((?P<content>[^()\r\n]*)\)")
+    exact: list[tuple[int, int]] = []
+    saw_group = False
+    previous_was_exact = False
     while True:
-        match = parenthetical.match(text, position)
-        if match is None:
-            return position
-        content = match.group("content").strip()
-        if not _looks_like_gloss(content, canonical_gloss):
-            return position
-        position = match.end()
+        whitespace_start = position
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != "(":
+            return exact
+        opening = position
+        closing = _balanced_parenthetical_end(text, opening)
+        if closing is None:
+            return exact
+        is_exact = _looks_like_gloss(
+            text[opening + 1 : closing - 1], canonical_gloss
+        )
+        if is_exact:
+            removal_start = (
+                whitespace_start
+                if not saw_group or previous_was_exact
+                else opening
+            )
+            exact.append((removal_start, closing))
+        saw_group = True
+        previous_was_exact = is_exact
+        position = closing
+
+
+def _balanced_parenthetical_end(text: str, opening: int) -> int | None:
+    depth = 0
+    for position in range(opening, len(text)):
+        character = text[position]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return position + 1
+    return None
 
 
 def _looks_like_gloss(content: str, canonical_gloss: str) -> bool:
@@ -151,9 +185,7 @@ def _looks_like_gloss(content: str, canonical_gloss: str) -> bool:
     would lose meaning. Future structured variant metadata can extend this exact
     comparison without reintroducing a language-shape heuristic.
     """
-    compact_content = re.sub(r"[\s·_-]+", "", content)
-    compact_canonical = re.sub(r"[\s·_-]+", "", canonical_gloss)
-    return compact_content == compact_canonical
+    return content == canonical_gloss
 
 
 def _validated_token_metadata(

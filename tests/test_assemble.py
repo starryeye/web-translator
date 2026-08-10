@@ -99,6 +99,72 @@ def test_first_use_removes_existing_gloss_variants_and_is_idempotent() -> None:
 
 
 @pytest.mark.parametrize(
+    "nonexact",
+    [
+        "권한-위임",
+        " 권한 위임 ",
+        "권한  위임",
+        "권한·위임",
+        "권한_위임",
+    ],
+)
+def test_first_use_preserves_nonexact_canonical_lookalikes(nonexact: str) -> None:
+    records = [translation("a", f"OAuth({nonexact}) 요청")]
+
+    once = normalize_first_use(records, {"OAuth": "권한 위임"})
+    twice = normalize_first_use(once, {"OAuth": "권한 위임"})
+
+    assert once[0].text == f"OAuth(권한 위임)({nonexact}) 요청"
+    assert twice == once
+
+
+def test_first_use_removes_all_exact_glosses_across_qualifications() -> None:
+    records = [
+        translation(
+            "a",
+            "OAuth(선택 사항)(권한 위임)(추가 제한)(권한 위임) 요청",
+        ),
+        translation("b", "OAuth(후속 제한)(권한 위임) 재사용"),
+    ]
+
+    once = normalize_first_use(records, {"OAuth": "권한 위임"})
+    twice = normalize_first_use(once, {"OAuth": "권한 위임"})
+
+    assert [item.text for item in once] == [
+        "OAuth(권한 위임)(선택 사항)(추가 제한) 요청",
+        "OAuth(후속 제한) 재사용",
+    ]
+    assert twice == once
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "OAuth(선택 사항(기본))(권한 위임) 요청",
+            "OAuth(권한 위임)(선택 사항(기본)) 요청",
+        ),
+        (
+            "OAuth(선택 사항)\n(권한 위임) 요청",
+            "OAuth(권한 위임)(선택 사항)\n 요청",
+        ),
+    ],
+    ids=["balanced-nested-qualification", "newline-adjacent-canonical"],
+)
+def test_first_use_scans_balanced_whitespace_separated_suffix(
+    text: str, expected: str
+) -> None:
+    records = [translation("a", text)]
+
+    once = normalize_first_use(records, {"OAuth": "권한 위임"})
+    twice = normalize_first_use(once, {"OAuth": "권한 위임"})
+
+    assert once[0].text == expected
+    assert once[0].text.count("(권한 위임)") == 1
+    assert twice == once
+
+
+@pytest.mark.parametrize(
     "qualification",
     [
         "사용자 승인에 따라 동작함",
@@ -149,7 +215,8 @@ def test_first_use_matches_terms_across_inline_tag_tokens() -> None:
     assert normalized[1].text == "Spring AI 재사용"
 
 
-def test_first_use_does_not_match_across_opaque_code_token() -> None:
+@pytest.mark.parametrize("token_kind", ["code", "url", "identifier"])
+def test_first_use_does_not_match_across_opaque_token(token_kind: str) -> None:
     records = [
         translation("a", f"Spring {TOKEN}AI code"),
         translation("b", "Spring AI prose"),
@@ -159,7 +226,7 @@ def test_first_use_does_not_match_across_opaque_code_token() -> None:
         records,
         {"Spring AI": "스프링 AI"},
         protected_by_segment={
-            "a": [ProtectedToken(TOKEN, "code", "<code>x</code>")],
+            "a": [ProtectedToken(TOKEN, token_kind, "opaque-value")],
             "b": [],
         },
     )
@@ -256,6 +323,31 @@ def test_assembly_changes_only_marked_content_and_restores_inline_code(
     assert "data-wt-segment" not in soup.p.attrs
     assert soup.p.code.string == "x"
     assert soup.p.get_text() == "안녕하세요 x."
+
+
+def test_assembly_preserves_complete_unmarked_sibling_and_link(tmp_path: Path) -> None:
+    source = write_source(
+        tmp_path,
+        '<main><p data-wt-segment="seg-000001">Hello</p></main>'
+        '<aside id="related" class="box"><a class="external" '
+        'href="https://example.com/other?x=1#part">Related</a></aside>',
+    )
+
+    output = assemble_page(
+        source,
+        {"seg-000001": segment("seg-000001", "Hello")},
+        {"seg-000001": translation("seg-000001", "안녕하세요")},
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    soup = BeautifulSoup(output.read_text("utf-8"), "lxml")
+    assert soup.aside["id"] == "related"
+    assert soup.aside["class"] == ["box"]
+    assert soup.aside.get_text() == "Related"
+    assert soup.aside.a["class"] == ["external"]
+    assert soup.aside.a["href"] == "https://example.com/other?x=1#part"
 
 
 def test_assembly_normalizes_glosses_in_document_order_not_mapping_order(
@@ -366,6 +458,44 @@ def test_assembly_copies_assets_and_adds_offline_csp_and_attribution(
     assert soup.body.contents.index(attribution) > soup.body.contents.index(soup.main)
 
 
+def test_assembly_serializes_early_canonical_utf8_after_csp(tmp_path: Path) -> None:
+    source = write_source(
+        tmp_path,
+        '<p data-wt-segment="seg-000001">Hello</p>',
+        head=(
+            '<meta charset="windows-1252">'
+            '<meta http-equiv="Content-Type" content="text/html; charset=shift_jis">'
+            '<script src="https://example.com/app.js"></script>'
+        ),
+    )
+
+    output = assemble_page(
+        source,
+        {"seg-000001": segment("seg-000001", "Hello")},
+        {"seg-000001": translation("seg-000001", "안녕하세요")},
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    content = output.read_bytes()
+    soup = BeautifulSoup(content, "lxml")
+    head_tags = [node for node in soup.head.children if getattr(node, "name", None)]
+    charset_metas = soup.find_all("meta", attrs={"charset": True})
+    legacy_content_types = [
+        node
+        for node in soup.find_all("meta")
+        if str(node.get("http-equiv", "")).lower() == "content-type"
+    ]
+    assert head_tags[0].get("http-equiv") == "Content-Security-Policy"
+    assert head_tags[1].get("charset") == "utf-8"
+    assert len(charset_metas) == 1
+    assert not legacy_content_types
+    assert content.index(b'<meta charset="utf-8"') < 1024
+    assert content.index(b"Content-Security-Policy") < content.index(b"<script")
+    assert "안녕하세요" in content.decode("utf-8")
+
+
 def test_assembly_requires_exact_segment_translation_and_marker_sets(
     tmp_path: Path,
 ) -> None:
@@ -456,7 +586,8 @@ def test_assembly_rejects_executable_restored_markup_and_changed_shape(
     ],
 )
 def test_assembly_rejects_malformed_source(tmp_path: Path, html: str) -> None:
-    source = tmp_path / "source.html"
+    source = tmp_path / "capture" / "source.html"
+    source.parent.mkdir()
     source.write_text(html, encoding="utf-8")
 
     with pytest.raises(AssemblyError, match="source HTML"):
@@ -481,6 +612,36 @@ def test_assembly_rejects_existing_output_and_unsafe_source_url(tmp_path: Path) 
             tmp_path / "unsafe-url",
             "javascript:alert(1)",
         )
+
+
+def test_assembly_rejects_source_output_tree_overlap_before_writes(tmp_path: Path) -> None:
+    source = write_source(tmp_path, '<p data-wt-segment="seg-000001">One</p>')
+    assets = source.parent / "assets"
+    assets.mkdir()
+    (assets / "theme.css").write_text("body{}", encoding="utf-8")
+    segments = {"seg-000001": segment("seg-000001", "One")}
+    translations = {"seg-000001": translation("seg-000001", "하나")}
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+
+    for output_dir in (
+        assets,
+        assets / "nested bundle",
+        source.parent,
+        source.parent.parent,
+    ):
+        with pytest.raises(AssemblyError, match="overlap"):
+            assemble_page(
+                source,
+                segments,
+                translations,
+                {},
+                output_dir,
+                "https://example.com/",
+            )
+
+    after = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+    assert after == before
+    assert not list(tmp_path.rglob("*.assembling-*"))
 
 
 def test_assembly_rejects_symlinked_asset(tmp_path: Path) -> None:

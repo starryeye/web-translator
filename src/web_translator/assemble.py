@@ -63,6 +63,7 @@ def assemble_page(
     """Build an offline HTML bundle without mutating the captured source."""
     source_html = Path(source_html)
     output_dir = Path(output_dir)
+    _reject_source_output_overlap(source_html.parent, output_dir)
     _reject_unsafe_output_ancestors(output_dir)
     if output_dir.exists() or output_dir.is_symlink():
         raise AssemblyError(f"output directory already exists: {output_dir}")
@@ -120,7 +121,7 @@ def assemble_page(
     if soup.select_one("[data-wt-segment]") is not None:
         raise AssemblyError("not all DOM segment markers were consumed")
 
-    _add_csp(soup)
+    _add_offline_head_metadata(soup)
     _add_attribution(soup, final_source_url)
     return _publish_bundle(source_html.parent, soup, output_dir)
 
@@ -245,13 +246,21 @@ def _reject_source_meta_policies(soup: BeautifulSoup) -> None:
             )
 
 
-def _add_csp(soup: BeautifulSoup) -> None:
+def _add_offline_head_metadata(soup: BeautifulSoup) -> None:
     assert soup.head is not None
-    meta = soup.new_tag("meta")
-    meta["http-equiv"] = "Content-Security-Policy"
-    meta["content"] = _CSP
-    meta["data-wt-csp"] = "offline"
-    soup.head.insert(0, meta)
+    for existing in list(soup.find_all("meta")):
+        directive = str(existing.get("http-equiv", "")).strip().lower()
+        if existing.has_attr("charset") or directive == "content-type":
+            existing.decompose()
+
+    charset = soup.new_tag("meta")
+    charset["charset"] = "utf-8"
+    csp = soup.new_tag("meta")
+    csp["http-equiv"] = "Content-Security-Policy"
+    csp["content"] = _CSP
+    csp["data-wt-csp"] = "offline"
+    soup.head.insert(0, charset)
+    soup.head.insert(0, csp)
 
 
 def _add_attribution(soup: BeautifulSoup, source_url: str) -> None:
@@ -275,7 +284,11 @@ def _publish_bundle(source_root: Path, soup: BeautifulSoup, output_dir: Path) ->
     try:
         _copy_assets(source_root / "assets", temporary / "assets", temporary)
         index = temporary / "index.html"
-        index.write_text(str(soup), encoding="utf-8", newline="\n")
+        serialized = str(soup).encode("utf-8")
+        charset_offset = serialized.find(b'<meta charset="utf-8"')
+        if charset_offset < 0 or charset_offset >= 1024:
+            raise AssemblyError("UTF-8 charset declaration must occur in the first 1024 bytes")
+        index.write_bytes(serialized)
         try:
             temporary.rename(output_dir)
         except FileExistsError as error:
@@ -347,3 +360,19 @@ def _reject_unsafe_output_ancestors(output_dir: Path) -> None:
         if parent == candidate:
             break
         candidate = parent
+
+
+def _reject_source_output_overlap(source_root: Path, output_dir: Path) -> None:
+    try:
+        source_resolved = source_root.resolve(strict=False)
+        output_resolved = output_dir.resolve(strict=False)
+    except OSError as error:
+        raise AssemblyError(f"cannot resolve source/output paths: {error}") from error
+    if (
+        source_resolved == output_resolved
+        or source_resolved.is_relative_to(output_resolved)
+        or output_resolved.is_relative_to(source_resolved)
+    ):
+        raise AssemblyError(
+            f"source and output directory trees overlap: {source_resolved} and {output_resolved}"
+        )
