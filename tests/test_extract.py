@@ -249,6 +249,223 @@ def test_optional_package_operand_does_not_consume_a_sentence_final_adverb() -> 
 @pytest.mark.parametrize(
     "command",
     [
+        "make clean test",
+        "make -j 4 test",
+        "go mod tidy",
+        "docker compose -f compose.yml up",
+        "docker run --rm ubuntu echo hello",
+        "npx vite build",
+        "git -C repo status",
+    ],
+)
+def test_command_detection_keeps_supported_nested_and_multi_operand_commands(
+    command: str,
+) -> None:
+    fragment = f"Run {command}; then review."
+
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    ("fragment", "command", "visible_prose"),
+    [
+        ("Run docker build carefully.", "docker build", "carefully."),
+        (
+            "The npm install command is useful.",
+            "npm install",
+            "command is useful.",
+        ),
+    ],
+)
+def test_command_detection_stops_at_sentence_role_boundaries(
+    fragment: str,
+    command: str,
+    visible_prose: str,
+) -> None:
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert visible_prose in protected
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    ("fragment", "command", "visible_prose"),
+    [
+        (
+            "Run make clean test to verify outputs.",
+            "make clean test",
+            "to verify outputs.",
+        ),
+        (
+            "Run npx vite build to bundle assets.",
+            "npx vite build",
+            "to bundle assets.",
+        ),
+        (
+            "Run docker run --rm ubuntu echo hello before reviewing output.",
+            "docker run --rm ubuntu echo hello",
+            "before reviewing output.",
+        ),
+    ],
+)
+def test_command_detection_stops_before_following_prose_clauses(
+    fragment: str,
+    command: str,
+    visible_prose: str,
+) -> None:
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert visible_prose in protected
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    ("fragment", "command", "visible_prose"),
+    [
+        (
+            "Run make clean test for a fresh build.",
+            "make clean test",
+            "for a fresh build.",
+        ),
+        (
+            "Run npx vite build with production settings.",
+            "npx vite build",
+            "with production settings.",
+        ),
+        (
+            "Run docker run --rm ubuntu echo hello as a smoke test.",
+            "docker run --rm ubuntu echo hello",
+            "as a smoke test.",
+        ),
+        (
+            "Run docker run --rm ubuntu echo hello without keeping the container.",
+            "docker run --rm ubuntu echo hello",
+            "without keeping the container.",
+        ),
+    ],
+)
+def test_command_detection_stops_before_following_prose_adjuncts(
+    fragment: str,
+    command: str,
+    visible_prose: str,
+) -> None:
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert visible_prose in protected
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    ("fragment", "command", "visible_prose"),
+    [
+        (
+            "Run make clean test once the build completes.",
+            "make clean test",
+            "once the build completes.",
+        ),
+        (
+            "Run npx vite build although the server is busy.",
+            "npx vite build",
+            "although the server is busy.",
+        ),
+        (
+            "Run docker run --rm ubuntu echo hello despite the warning.",
+            "docker run --rm ubuntu echo hello",
+            "despite the warning.",
+        ),
+        (
+            "Run npx vite build under CI.",
+            "npx vite build",
+            "under CI.",
+        ),
+    ],
+)
+def test_bounded_command_grammars_do_not_depend_on_every_prose_marker(
+    fragment: str,
+    command: str,
+    visible_prose: str,
+) -> None:
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert visible_prose in protected
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "and",
+        "or",
+        "then",
+        "although",
+        "unless",
+        "because",
+        "since",
+        "whereas",
+        "while",
+        "when",
+        "whenever",
+        "after",
+        "before",
+        "once",
+        "despite",
+        "as",
+        "if",
+        "so",
+        "that",
+        "which",
+        "who",
+        "whose",
+        "where",
+        "during",
+        "without",
+        "with",
+        "for",
+        "from",
+        "into",
+        "over",
+        "under",
+        "through",
+        "against",
+        "around",
+        "near",
+    ],
+)
+def test_closed_class_prose_boundaries_apply_after_command_acceptance(
+    boundary: str,
+) -> None:
+    fragment = f"The npm install {boundary} visible prose."
+
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == ["npm install"]
+    assert f"{boundary} visible prose." in protected
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize("operand", ["from", "under", "when"])
+def test_closed_class_boundary_words_remain_valid_required_operands(
+    operand: str,
+) -> None:
+    command = f"pip install {operand}"
+    fragment = f"Run {command}; then review."
+
+    protected, tokens = protect_fragment(fragment)
+
+    assert [token.value for token in tokens] == [command]
+    assert restore_tokens(protected, tokens) == fragment
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         'pip install "package>=2"',
         'git commit -m "fix broken login"',
         "git config user.name Alice",

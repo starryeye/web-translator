@@ -66,6 +66,22 @@ _SHELL_TOKEN_PATTERN = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s;,
 _ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_]\w*=.+")
 _PATHLIKE_PATTERN = re.compile(r"(?:\./\.\.\.|.*[/:@+~<>=-].*|.+\.[A-Za-z0-9].*)")
 _MAKE_START_TARGETS = {"all", "build", "clean", "install", "test"}
+_GO_MOD_SUBCOMMANDS = {"download", "edit", "graph", "init", "tidy", "vendor", "verify"}
+_DOCKER_COMPOSE_SUBCOMMANDS = {
+    "build",
+    "config",
+    "create",
+    "down",
+    "exec",
+    "logs",
+    "pull",
+    "push",
+    "restart",
+    "run",
+    "start",
+    "stop",
+    "up",
+}
 _SUBCOMMANDS = {
     "npm": {"add", "build", "ci", "exec", "install", "publish", "remove", "run", "test", "update"},
     "pnpm": {"add", "build", "exec", "install", "publish", "remove", "run", "test", "update"},
@@ -95,7 +111,7 @@ _REQUIRED_PLAIN_OPERANDS = {
     ("pip", "uninstall"): 1, ("pip", "wheel"): 1,
     ("git", "add"): 1, ("git", "checkout"): 1, ("git", "clone"): 1,
     ("git", "restore"): 1, ("git", "switch"): 1,
-    ("docker", "build"): 1, ("docker", "compose"): 1, ("docker", "exec"): 1,
+    ("docker", "exec"): 1,
     ("docker", "logs"): 1, ("docker", "pull"): 1, ("docker", "push"): 1,
     ("docker", "run"): 1, ("docker", "stop"): 1,
     ("kubectl", "apply"): 1, ("kubectl", "create"): 1, ("kubectl", "delete"): 1,
@@ -116,9 +132,58 @@ _VALUED_OPTIONS = {
     "dotnet": {"-c", "--configuration", "-f", "--framework", "-o", "--output"},
     "uv": {"-o", "--output-file", "--python"},
     "git": {"-m", "-n", "--author", "--file", "--format"},
-    "make": {"-C", "-f", "--directory", "--file"},
+    "make": {"-C", "-f", "-j", "--directory", "--file", "--jobs"},
+    "docker": {"-f", "--file", "--project-directory", "--project-name"},
 }
-_PROSE_CONNECTORS = {"and", "but", "then"}
+# Closed-class words that introduce an English clause or adjunct after a command.
+# The argument parser consults them only after all required operands are present.
+_PROSE_CONNECTORS = {"and", "but", "nor", "or", "so", "then", "yet"}
+_PROSE_CLAUSE_MARKERS = {
+    "after",
+    "although",
+    "because",
+    "before",
+    "if",
+    "once",
+    "since",
+    "that",
+    "to",
+    "unless",
+    "until",
+    "when",
+    "whenever",
+    "where",
+    "whereas",
+    "while",
+    "which",
+    "who",
+    "whose",
+}
+_PROSE_ADJUNCT_MARKERS = {
+    "against",
+    "around",
+    "as",
+    "at",
+    "by",
+    "despite",
+    "during",
+    "for",
+    "from",
+    "in",
+    "into",
+    "near",
+    "on",
+    "over",
+    "through",
+    "under",
+    "using",
+    "via",
+    "with",
+    "without",
+}
+_COMMAND_META_NOUNS = {"command", "commands", "example", "option", "options"}
+_POLITE_BOUNDARIES = {"please"}
+_GIT_GLOBAL_VALUED_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree"}
 _KEYWORD_PATTERN = (
     r"(?-i:\b(?:MUST\s+NOT|SHALL\s+NOT|SHOULD\s+NOT|NOT\s+RECOMMENDED|MUST|REQUIRED|"
     r"SHALL|SHOULD|RECOMMENDED|MAY|OPTIONAL)\b)"
@@ -311,7 +376,15 @@ def _parse_command(html: str, tokens: list[_ShellToken]) -> int | None:
         return _parse_python_command(tokens)
     if normalized == "make":
         return _parse_make_command(html, tokens)
-    if normalized in {"curl", "wget", "npx"}:
+    if normalized == "git":
+        return _parse_git_command(tokens)
+    if normalized == "docker":
+        return _parse_docker_command(tokens)
+    if normalized == "npx":
+        return _consume_command_arguments(
+            tokens, 1, normalized, required_plain=1, plain_tail_limit=1
+        )
+    if normalized in {"curl", "wget"}:
         return _consume_command_arguments(tokens, 1, normalized, required_plain=1)
     if len(tokens) < 2:
         return None
@@ -320,10 +393,10 @@ def _parse_command(html: str, tokens: list[_ShellToken]) -> int | None:
         return None
     if normalized == "uv" and subcommand == "pip":
         return _parse_uv_pip_command(tokens)
+    if normalized == "go" and subcommand == "mod":
+        return _parse_go_mod_command(tokens)
     required_plain = _REQUIRED_PLAIN_OPERANDS.get((normalized, subcommand), 0)
     optional_plain = _OPTIONAL_PLAIN_OPERANDS.get((normalized, subcommand), 0)
-    if normalized == "git" and subcommand == "config":
-        required_plain = 2
     if normalized == "dotnet" and subcommand == "add":
         required_plain = 2
     return _consume_command_arguments(
@@ -333,6 +406,83 @@ def _parse_command(html: str, tokens: list[_ShellToken]) -> int | None:
         required_plain=required_plain,
         optional_plain=optional_plain,
     )
+
+
+def _parse_git_command(tokens: list[_ShellToken]) -> int | None:
+    cursor = 1
+    while cursor < len(tokens) and _is_option(tokens[cursor].value):
+        option = tokens[cursor].value
+        cursor += 1
+        option_name = option.split("=", 1)[0]
+        if option_name in _GIT_GLOBAL_VALUED_OPTIONS and "=" not in option:
+            if cursor >= len(tokens):
+                return None
+            cursor += 1
+    if cursor >= len(tokens):
+        return None
+    subcommand = tokens[cursor].value
+    if subcommand not in _SUBCOMMANDS["git"]:
+        return None
+    cursor += 1
+    required_plain = _REQUIRED_PLAIN_OPERANDS.get(("git", subcommand), 0)
+    if subcommand == "config":
+        required_plain = 2
+    return _consume_command_arguments(
+        tokens,
+        cursor,
+        "git",
+        required_plain=required_plain,
+    )
+
+
+def _parse_go_mod_command(tokens: list[_ShellToken]) -> int | None:
+    if len(tokens) < 3 or tokens[2].value not in _GO_MOD_SUBCOMMANDS:
+        return None
+    return _consume_command_arguments(tokens, 3, "go", required_plain=0)
+
+
+def _parse_docker_command(tokens: list[_ShellToken]) -> int | None:
+    if len(tokens) < 2:
+        return None
+    subcommand = tokens[1].value
+    if subcommand not in _SUBCOMMANDS["docker"]:
+        return None
+    if subcommand == "compose":
+        cursor = _consume_leading_options(tokens, 2, "docker")
+        if cursor is None or cursor >= len(tokens):
+            return None
+        if tokens[cursor].value not in _DOCKER_COMPOSE_SUBCOMMANDS:
+            return None
+        return _consume_command_arguments(
+            tokens,
+            cursor + 1,
+            "docker",
+            required_plain=0,
+        )
+    required_plain = _REQUIRED_PLAIN_OPERANDS.get(("docker", subcommand), 0)
+    return _consume_command_arguments(
+        tokens,
+        2,
+        "docker",
+        required_plain=required_plain,
+        plain_tail_limit=2 if subcommand in {"exec", "run"} else 0,
+    )
+
+
+def _consume_leading_options(
+    tokens: list[_ShellToken], start: int, executable: str
+) -> int | None:
+    cursor = start
+    valued_options = _VALUED_OPTIONS.get(executable, set())
+    while cursor < len(tokens) and _is_option(tokens[cursor].value):
+        option = tokens[cursor].value
+        cursor += 1
+        option_name = option.split("=", 1)[0]
+        if option_name in valued_options and "=" not in option:
+            if cursor >= len(tokens):
+                return None
+            cursor += 1
+    return cursor
 
 
 def _parse_python_command(tokens: list[_ShellToken]) -> int | None:
@@ -374,11 +524,10 @@ def _parse_make_command(html: str, tokens: list[_ShellToken]) -> int | None:
             return None
 
     consumed = 1
-    target_count = 0
     valued_options = _VALUED_OPTIONS["make"]
     while consumed < len(tokens):
         value = tokens[consumed].value
-        if value.lower() in _PROSE_CONNECTORS:
+        if _is_prose_boundary(value):
             break
         if _is_option(value):
             consumed += 1
@@ -390,8 +539,7 @@ def _parse_make_command(html: str, tokens: list[_ShellToken]) -> int | None:
         if _ASSIGNMENT_PATTERN.fullmatch(value):
             consumed += 1
             continue
-        if target_count == 0:
-            target_count += 1
+        if value in _MAKE_START_TARGETS or _PATHLIKE_PATTERN.fullmatch(value):
             consumed += 1
             continue
         break
@@ -405,13 +553,15 @@ def _consume_command_arguments(
     *,
     required_plain: int,
     optional_plain: int = 0,
+    plain_tail_limit: int = 0,
 ) -> int | None:
     consumed = start
     plain_count = 0
+    plain_tail_remaining = plain_tail_limit
     valued_options = _VALUED_OPTIONS.get(executable, set())
     while consumed < len(tokens):
         value = tokens[consumed].value
-        if value.lower() in _PROSE_CONNECTORS:
+        if plain_count >= required_plain and _is_prose_boundary(value):
             break
         if _is_option(value):
             consumed += 1
@@ -434,11 +584,29 @@ def _consume_command_arguments(
             optional_plain -= 1
             consumed += 1
             continue
+        if plain_tail_remaining:
+            plain_tail_remaining -= 1
+            consumed += 1
+            continue
         if _is_quoted(value) or _PATHLIKE_PATTERN.fullmatch(value):
             consumed += 1
             continue
         break
     return consumed if plain_count == required_plain else None
+
+
+def _is_prose_boundary(value: str) -> bool:
+    if _is_quoted(value):
+        return False
+    lower = value.lower()
+    return (
+        lower in _PROSE_CONNECTORS
+        or lower in _PROSE_CLAUSE_MARKERS
+        or lower in _PROSE_ADJUNCT_MARKERS
+        or lower in _COMMAND_META_NOUNS
+        or lower in _POLITE_BOUNDARIES
+        or (lower.isalpha() and lower.endswith("ly"))
+    )
 
 
 def _is_option(value: str) -> bool:
