@@ -542,3 +542,18 @@ def test_two_redirect_aliases_share_failed_destination_cache(tmp_path: Path) -> 
 
     capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
     assert requested.count("https://example.com/real.png") == 1
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<main><h1>Authors</h1><form id="author-search"><input name="query"></form></main>',
+        '<article><h1>Account guide</h1><p>Readers can sign in on the service.</p></article>'
+        '<form action="/search"><input name="query"></form>',
+        '<article><h1>Security writing</h1><p>A security check may take just a moment in examples.</p></article>',
+    ],
+)
+def test_static_content_with_auth_or_challenge_phrases_is_accepted(tmp_path: Path, html: str) -> None:
+    transport = mock_transport({"https://example.com/": (200, html.encode(), "text/html")})
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+    assert result.source_html.is_file()

@@ -541,20 +541,24 @@ def _validate_supported_html(html: str) -> None:
     markup = str(soup).lower()
     if any(signal in markup for signal in ("g-recaptcha", "h-captcha", "hcaptcha", "recaptcha")):
         raise CaptureError("unsupported CAPTCHA page")
-    auth_pattern = re.compile(r"(?:log[ -]?in|sign[ -]?in|auth|session)", re.IGNORECASE)
-    auth_form = soup.find("form", action=auth_pattern) or soup.find(
-        "form", attrs={"id": auth_pattern}
-    ) or soup.find("form", attrs={"class": auth_pattern})
     visible_text = soup.get_text(" ", strip=True)
-    if auth_form is not None or (soup.find("form") is not None and auth_pattern.search(visible_text)):
+    if any(_is_authentication_form(form) for form in soup.find_all("form")):
         raise CaptureError("unsupported authentication page")
-    interstitial_signals = (
-        "just a moment",
+    challenge_headings = {
+        re.sub(r"[^a-z ]+", "", node.get_text(" ", strip=True).lower()).strip()
+        for node in soup.find_all(["title", "h1"])
+    }
+    has_challenge_heading = bool(
+        challenge_headings & {"just a moment", "security check", "verify you are human"}
+    )
+    challenge_markers = (
         "checking your browser",
         "verify you are human",
-        "security check",
+        "cf-challenge",
+        "challenge-form",
+        "captcha",
     )
-    if any(signal in visible_text.lower() for signal in interstitial_signals):
+    if len(visible_text) <= 500 and has_challenge_heading and any(marker in markup for marker in challenge_markers):
         raise CaptureError("unsupported interstitial page")
     had_script = soup.find("script") is not None
     app_shell = soup.find(id=re.compile(r"^(?:app|root|__next|__nuxt)$", re.IGNORECASE))
@@ -565,6 +569,26 @@ def _validate_supported_html(html: str) -> None:
         node.decompose()
     if not soup.get_text(" ", strip=True) and had_script:
         raise CaptureError("unsupported JavaScript-only page")
+
+
+def _is_authentication_form(form: object) -> bool:
+    auth_attribute = re.compile(
+        r"(?:^|[^a-z0-9])(?:login|log-in|signin|sign-in|auth|session)(?:[^a-z0-9]|$)",
+        re.IGNORECASE,
+    )
+    for attribute in ("action", "id", "class"):
+        value = form.get(attribute, "")
+        serialized = " ".join(str(part) for part in value) if isinstance(value, list) else str(value)
+        if auth_attribute.search(serialized):
+            return True
+    form_text = form.get_text(" ", strip=True)
+    if re.search(r"\b(?:log|sign)[ -]?in\b", form_text, re.IGNORECASE):
+        return True
+    for control in form.find_all(["input", "button"]):
+        for attribute in ("name", "id", "value", "aria-label"):
+            if auth_attribute.search(str(control.get(attribute, ""))):
+                return True
+    return False
 
 
 def _css_url_value(token: object, *, allow_string: bool = True) -> str | None:
