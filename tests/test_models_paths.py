@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
+import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -44,6 +46,8 @@ def test_segment_jsonl_round_trip(tmp_path: Path) -> None:
         "http://169.254.1.1/",
         "http://224.0.0.1/",
         "http://0.0.0.0/",
+        "http://100.64.0.1/",
+        "http://[::1]/",
         "http://2130706433/",
         "http://0x7f000001/",
         "http://0177.0.0.1/",
@@ -53,6 +57,65 @@ def test_segment_jsonl_round_trip(tmp_path: Path) -> None:
 def test_private_or_malformed_urls_are_rejected(url: str) -> None:
     with pytest.raises(ValueError):
         validate_public_url(url)
+
+
+@pytest.mark.parametrize("url", ["http://user@example.com/", "http://user:pass@example.com/"])
+def test_credential_bearing_urls_are_rejected(url: str) -> None:
+    with pytest.raises(ValueError):
+        validate_public_url(url)
+
+
+@pytest.mark.parametrize(
+    ("record", "field"),
+    [
+        ("not an object", "record"),
+        (
+            {
+                "id": "seg-000001",
+                "locator": "[data-wt-segment='seg-000001']",
+                "semantic_type": "paragraph",
+                "heading_path": ["Overview", 1],
+                "source_text": "Text",
+                "protected": [],
+                "context_ids": [],
+                "target": True,
+            },
+            "Segment.heading_path[1]",
+        ),
+        (
+            {
+                "id": "seg-000001",
+                "locator": "[data-wt-segment='seg-000001']",
+                "semantic_type": "paragraph",
+                "heading_path": [],
+                "source_text": "Text",
+                "protected": [{"token": "⟦WT:0⟧", "kind": 1, "value": "<code>JWT</code>"}],
+                "context_ids": [],
+                "target": True,
+            },
+            "Segment.protected[0].kind",
+        ),
+        (
+            {
+                "id": "seg-000001",
+                "locator": "[data-wt-segment='seg-000001']",
+                "semantic_type": "paragraph",
+                "heading_path": [],
+                "source_text": "Text",
+                "protected": [],
+                "context_ids": [],
+                "target": "true",
+            },
+            "Segment.target",
+        ),
+    ],
+)
+def test_segment_jsonl_rejects_invalid_record_shapes(tmp_path: Path, record: object, field: str) -> None:
+    path = tmp_path / "segments.jsonl"
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(field)):
+        read_segments(path)
 
 
 def test_existing_output_directory_is_not_overwritten(tmp_path: Path) -> None:

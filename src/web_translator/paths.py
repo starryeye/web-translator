@@ -6,7 +6,7 @@ import ipaddress
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -22,6 +22,8 @@ def validate_public_url(url: str) -> httpx.URL:
 
     if parsed.scheme not in {"http", "https"} or not parsed.host:
         raise ValueError("URL must use HTTP(S) and include a host")
+    if "@" in urlsplit(url).netloc:
+        raise ValueError("URL userinfo is not allowed")
 
     host = parsed.host.rstrip(".").lower()
     if host == "localhost" or host.endswith(".localhost"):
@@ -31,13 +33,7 @@ def validate_public_url(url: str) -> httpx.URL:
     if address is None:
         return parsed
 
-    if (
-        address.is_loopback
-        or address.is_private
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_unspecified
-    ):
+    if not address.is_global or address.is_multicast:
         raise ValueError("non-public IP URLs are not allowed")
     return parsed
 

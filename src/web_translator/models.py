@@ -22,7 +22,7 @@ class ProtectedToken:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ProtectedToken:
-        return cls(token=data["token"], kind=data["kind"], value=data["value"])
+        return _protected_token_from_dict(data, "ProtectedToken")
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,15 +52,19 @@ class Segment:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Segment:
+        data = _require_mapping(data, "Segment")
         return cls(
-            id=data["id"],
-            locator=data["locator"],
-            semantic_type=data["semantic_type"],
-            heading_path=list(data["heading_path"]),
-            source_text=data["source_text"],
-            protected=[ProtectedToken.from_dict(token) for token in data["protected"]],
-            context_ids=list(data["context_ids"]),
-            target=data["target"],
+            id=_require_string(data, "id", "Segment"),
+            locator=_require_string(data, "locator", "Segment"),
+            semantic_type=_require_string(data, "semantic_type", "Segment"),
+            heading_path=_require_string_list(data, "heading_path", "Segment"),
+            source_text=_require_string(data, "source_text", "Segment"),
+            protected=[
+                _protected_token_from_dict(token, f"Segment.protected[{index}]")
+                for index, token in enumerate(_require_list(data, "protected", "Segment"))
+            ],
+            context_ids=_require_string_list(data, "context_ids", "Segment"),
+            target=_require_bool(data, "target", "Segment"),
         )
 
 
@@ -83,11 +87,18 @@ class Translation:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Translation:
+        data = _require_mapping(data, "Translation")
+        observations = _require_mapping_value(data, "glossary_observations", "Translation", default={})
         return cls(
-            segment_id=data["segment_id"],
-            text=data["text"],
-            notes=data.get("notes"),
-            glossary_observations=dict(data.get("glossary_observations", {})),
+            segment_id=_require_string(data, "segment_id", "Translation"),
+            text=_require_string(data, "text", "Translation"),
+            notes=_require_optional_string(data, "notes", "Translation"),
+            glossary_observations={
+                _require_string_value(key, f"Translation.glossary_observations key"): _require_string_value(
+                    value, f"Translation.glossary_observations[{key!r}]"
+                )
+                for key, value in observations.items()
+            },
         )
 
 
@@ -108,10 +119,11 @@ class RunPaths:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RunPaths:
+        data = _require_mapping(data, "RunPaths")
         return cls(
-            run_id=data["run_id"],
-            work_dir=Path(data["work_dir"]),
-            output_dir=Path(data["output_dir"]),
+            run_id=_require_string(data, "run_id", "RunPaths"),
+            work_dir=Path(_require_string(data, "work_dir", "RunPaths")),
+            output_dir=Path(_require_string(data, "output_dir", "RunPaths")),
         )
 
 
@@ -127,8 +139,85 @@ def write_segments(path: Path, segments: Iterable[Segment]) -> None:
 def read_segments(path: Path) -> list[Segment]:
     """Read UTF-8 JSON Lines segments written by :func:`write_segments`."""
     with path.open(encoding="utf-8") as stream:
-        return [
-            Segment.from_dict(json.loads(line))
-            for line in stream
-            if line.strip()
-        ]
+        segments: list[Segment] = []
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"segments JSONL line {line_number}: invalid JSON") from error
+            try:
+                segments.append(Segment.from_dict(record))
+            except ValueError as error:
+                raise ValueError(f"segments JSONL line {line_number}: {error}") from error
+        return segments
+
+
+def _protected_token_from_dict(data: object, context: str) -> ProtectedToken:
+    data = _require_mapping(data, context)
+    return ProtectedToken(
+        token=_require_string(data, "token", context),
+        kind=_require_string(data, "kind", context),
+        value=_require_string(data, "value", context),
+    )
+
+
+def _require_mapping(data: object, context: str) -> Mapping[str, Any]:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{context} record must be an object")
+    return data
+
+
+def _require_value(data: Mapping[str, Any], field: str, context: str) -> Any:
+    if field not in data:
+        raise ValueError(f"{context}.{field} is required")
+    return data[field]
+
+
+def _require_string(data: Mapping[str, Any], field: str, context: str) -> str:
+    return _require_string_value(_require_value(data, field, context), f"{context}.{field}")
+
+
+def _require_string_value(value: object, context: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{context} must be a string")
+    return value
+
+
+def _require_optional_string(data: Mapping[str, Any], field: str, context: str) -> str | None:
+    value = data.get(field)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{context}.{field} must be a string or null")
+    return value
+
+
+def _require_bool(data: Mapping[str, Any], field: str, context: str) -> bool:
+    value = _require_value(data, field, context)
+    if type(value) is not bool:
+        raise ValueError(f"{context}.{field} must be a boolean")
+    return value
+
+
+def _require_list(data: Mapping[str, Any], field: str, context: str) -> list[Any]:
+    value = _require_value(data, field, context)
+    if not isinstance(value, list):
+        raise ValueError(f"{context}.{field} must be an array")
+    return value
+
+
+def _require_string_list(data: Mapping[str, Any], field: str, context: str) -> list[str]:
+    values = _require_list(data, field, context)
+    return [
+        _require_string_value(value, f"{context}.{field}[{index}]")
+        for index, value in enumerate(values)
+    ]
+
+
+def _require_mapping_value(
+    data: Mapping[str, Any], field: str, context: str, *, default: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    value = data.get(field, default)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context}.{field} must be an object")
+    return value
