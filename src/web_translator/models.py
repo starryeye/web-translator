@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +125,56 @@ class RunPaths:
             work_dir=Path(_require_string(data, "work_dir", "RunPaths")),
             output_dir=Path(_require_string(data, "output_dir", "RunPaths")),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Finding:
+    """One deterministic QA observation."""
+
+    code: str
+    severity: Literal["required", "warning"]
+    message: str
+    evidence: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MasterReview:
+    """Semantic review evidence supplied by the master agent."""
+
+    unresolved_required: list[str]
+    retries: dict[str, int]
+    section_findings: dict[str, list[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class QAInputs:
+    """All deterministic evidence consumed by the QA gate."""
+
+    source_html: Path
+    output_html: Path
+    source_url: str
+    source_segment_ids: set[str]
+    translated_segment_ids: set[str]
+    critical_assets: list[Path]
+    optional_assets: list[Path]
+    screenshot_dir: Path
+    master_review: MasterReview
+    protected_tokens: dict[str, list[ProtectedToken]] = field(default_factory=dict)
+    translated_texts: dict[str, str] = field(default_factory=dict)
+    capture_metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class QAResult:
+    """The complete automated acceptance result and its evidence."""
+
+    passed: bool
+    required_findings: list[Finding]
+    warnings: list[Finding]
+    screenshots: list[Path]
+    source_url: str = ""
+    browser_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
+    capture_metadata: dict[str, object] = field(default_factory=dict)
 
 
 def write_segments(path: Path, segments: Iterable[Segment]) -> None:
