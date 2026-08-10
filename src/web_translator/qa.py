@@ -442,12 +442,19 @@ def _check_external_dependencies(
                 else:
                     critical_urls.add(resolved)
     for style in soup.find_all("style"):
-        imported, resources = _css_external_urls(style.get_text())
+        imported, resources, invalid_imported, invalid_resources = _css_external_urls(
+            style.get_text(), base_href=base_href
+        )
         critical_urls.update(imported)
         optional_urls.update(resources)
+        invalid_critical_urls.update(invalid_imported)
+        invalid_optional_urls.update(invalid_resources)
     for tag in soup.find_all(style=True):
-        _, resources = _css_external_urls(str(tag["style"]), declarations=True)
+        _, resources, _, invalid_resources = _css_external_urls(
+            str(tag["style"]), declarations=True, base_href=base_href
+        )
         optional_urls.update(resources)
+        invalid_optional_urls.update(invalid_resources)
     asset_root = inputs.output_html.parent.resolve(strict=False)
     for candidate in inputs.critical_assets:
         resolved = _asset_path(asset_root, candidate)
@@ -457,9 +464,11 @@ def _check_external_dependencies(
             css = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        imported, resources = _css_external_urls(css)
+        imported, resources, invalid_imported, invalid_resources = _css_external_urls(css)
         critical_urls.update(imported)
         optional_urls.update(resources)
+        invalid_critical_urls.update(invalid_imported)
+        invalid_optional_urls.update(invalid_resources)
     if critical_urls:
         required.append(
             _required(
@@ -499,10 +508,12 @@ def _srcset_urls(value: str) -> list[str]:
 
 
 def _css_external_urls(
-    css: str, *, declarations: bool = False
-) -> tuple[set[str], set[str]]:
+    css: str, *, declarations: bool = False, base_href: str | None = None
+) -> tuple[set[str], set[str], set[str], set[str]]:
     imported: set[str] = set()
     resources: set[str] = set()
+    invalid_imported: set[str] = set()
+    invalid_resources: set[str] = set()
     nodes = (
         tinycss2.parse_declaration_list(css, skip_comments=True, skip_whitespace=True)
         if declarations
@@ -512,31 +523,51 @@ def _css_external_urls(
         if isinstance(node, AtRule) and node.lower_at_keyword == "import":
             for token in node.prelude:
                 value = _css_url_value(token, allow_string=True)
-                if value is not None and _is_external_reference(value):
-                    imported.add(value)
-                    break
+                if value is None:
+                    continue
+                resolved, invalid = _resolved_dependency_reference(value, base_href)
+                if invalid:
+                    invalid_imported.add(value)
+                elif resolved is not None:
+                    imported.add(resolved)
+                break
             if node.content:
-                resources.update(_external_component_urls(node.content))
+                urls, invalid = _external_component_urls(node.content, base_href)
+                resources.update(urls)
+                invalid_resources.update(invalid)
             continue
         for attribute in ("prelude", "value", "content"):
             tokens = getattr(node, attribute, None)
             if tokens:
-                resources.update(_external_component_urls(tokens))
-    return imported, resources
+                urls, invalid = _external_component_urls(tokens, base_href)
+                resources.update(urls)
+                invalid_resources.update(invalid)
+    return imported, resources, invalid_imported, invalid_resources
 
 
-def _external_component_urls(tokens: Iterable[object]) -> set[str]:
+def _external_component_urls(
+    tokens: Iterable[object], base_href: str | None
+) -> tuple[set[str], set[str]]:
     urls: set[str] = set()
+    invalid_urls: set[str] = set()
     for token in tokens:
         value = _css_url_value(token, allow_string=False)
-        if value is not None and _is_external_reference(value):
-            urls.add(value)
+        if value is not None:
+            resolved, invalid = _resolved_dependency_reference(value, base_href)
+            if invalid:
+                invalid_urls.add(value)
+            elif resolved is not None:
+                urls.add(resolved)
         if isinstance(token, FunctionBlock):
-            urls.update(_external_component_urls(token.arguments))
+            nested_urls, nested_invalid = _external_component_urls(token.arguments, base_href)
+            urls.update(nested_urls)
+            invalid_urls.update(nested_invalid)
         content = getattr(token, "content", None)
         if content:
-            urls.update(_external_component_urls(content))
-    return urls
+            nested_urls, nested_invalid = _external_component_urls(content, base_href)
+            urls.update(nested_urls)
+            invalid_urls.update(nested_invalid)
+    return urls, invalid_urls
 
 
 def _css_url_value(token: object, *, allow_string: bool) -> str | None:
@@ -734,7 +765,6 @@ def _run_browser_checks(
                         # re-entering Chromium's close handshake from this callback.
 
                     context.route_web_socket("**/*", websocket_guard)
-                    page = context.new_page()
 
                     def guard(route: Route) -> None:
                         parsed = urlsplit(route.request.url)
@@ -746,7 +776,8 @@ def _run_browser_checks(
                         else:
                             route.continue_()
 
-                    page.route("**/*", guard)
+                    context.route("**/*", guard)
+                    page = context.new_page()
                     try:
                         response = page.goto(server.url, wait_until="networkidle", timeout=15_000)
                         if response is None or not response.ok:

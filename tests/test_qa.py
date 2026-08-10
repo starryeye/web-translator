@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
 
 from web_translator.models import (
     Finding,
@@ -568,6 +570,46 @@ def test_browser_blocks_localhost_different_port_and_websocket(tmp_path: Path) -
     }
 
 
+def test_browser_context_blocks_popup_navigation_to_other_loopback_server(
+    tmp_path: Path,
+) -> None:
+    hits: list[str] = []
+
+    class VictimHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"escaped")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    victim = ThreadingHTTPServer(("127.0.0.1", 0), VictimHandler)
+    thread = threading.Thread(target=victim.serve_forever, daemon=True)
+    thread.start()
+    escape_url = f"http://127.0.0.1:{victim.server_port}/escape"
+    script = f'<script>window.open("{escape_url}", "_blank")</script>'
+    try:
+        source, output = _write_pages(
+            tmp_path,
+            source_body=f'<main><p data-wt-segment="a">Hello</p>{script}</main>',
+            output_body=f"<main><p>안녕</p>{script}</main>",
+        )
+        result = run_qa(_inputs(source, output))
+    finally:
+        victim.shutdown()
+        victim.server_close()
+        thread.join(timeout=5)
+
+    assert hits == []
+    assert [finding.code for finding in result.required_findings] == [
+        "external-critical-dependency"
+    ]
+    assert result.required_findings[0].evidence == {"urls": [escape_url]}
+    assert set(result.browser_metrics) == {"desktop-1440x900", "narrow-390x844"}
+
+
 def test_same_url_requested_as_image_and_fetch_is_always_required(tmp_path: Path) -> None:
     url = "https://cdn.example/shared"
     script = f'<script>fetch("{url}").catch(() => {{}})</script>'
@@ -691,7 +733,7 @@ def test_markdown_report_escapes_active_markup_and_table_delimiters(tmp_path: Pa
     assert "<script>" not in text
     assert "<img" not in text
     assert "zone\\|bad" in text
-    assert "\\*\\*bold\\*\\*" in text
+    assert "| **bold** `" in text
 
 
 def test_report_rejects_destination_outside_qa_result_bundle(tmp_path: Path) -> None:
@@ -730,3 +772,103 @@ def test_manifest_canonicalizes_finding_and_screenshot_order(tmp_path: Path) -> 
     write_manifest(result_b, path_b)
 
     assert path_a.read_bytes() == path_b.read_bytes()
+
+
+def test_inline_css_dependencies_resolve_against_external_document_base(
+    tmp_path: Path,
+) -> None:
+    head = (
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'">'
+        '<base href="https://cdn.example/theme/">'
+        '<style>@import "main.css"; .hero{background:url("image.png")}</style>'
+    )
+    source, output = _write_pages(
+        tmp_path,
+        head=head,
+        source_body=(
+            '<main><p data-wt-segment="a" style="background:url(avatar.png)">Hello</p></main>'
+        ),
+        output_body='<main><p style="background:url(avatar.png)">안녕</p></main>',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "external-critical-dependency"
+    ]
+    assert result.required_findings[0].evidence == {
+        "urls": ["https://cdn.example/theme/main.css"]
+    }
+    assert [finding.code for finding in result.warnings] == [
+        "external-optional-dependency"
+    ]
+    assert result.warnings[0].evidence == {
+        "urls": [
+            "https://cdn.example/theme/avatar.png",
+            "https://cdn.example/theme/image.png",
+        ]
+    }
+    assert result.screenshots == []
+
+
+def test_malformed_css_dependencies_have_sorted_stable_findings(tmp_path: Path) -> None:
+    head = (
+        '<style>@import "http://[z-bad";'
+        '@import url("http://[a-bad");'
+        '.hero{background:url("http://[optional-z")}</style>'
+    )
+    source, output = _write_pages(
+        tmp_path,
+        head=head,
+        source_body=(
+            '<main><p data-wt-segment="a" '
+            'style="background:url(\'http://[optional-a\')">Hello</p></main>'
+        ),
+        output_body=(
+            '<main><p style="background:url(\'http://[optional-a\')">안녕</p></main>'
+        ),
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "invalid-critical-dependency-url"
+    ]
+    assert result.required_findings[0].evidence == {
+        "urls": ["http://[a-bad", "http://[z-bad"]
+    }
+    assert [finding.code for finding in result.warnings] == [
+        "invalid-optional-dependency-url"
+    ]
+    assert result.warnings[0].evidence == {
+        "urls": ["http://[optional-a", "http://[optional-z"]
+    }
+
+
+def test_report_wraps_all_source_values_in_inert_gfm_code_spans(tmp_path: Path) -> None:
+    attack = (
+        "~~strike~~ # heading\r\n- list\r> quote "
+        "<https://evil.example> [link](https://evil.example) "
+        "![image](https://evil.example/x) `code`"
+    )
+    result = QAResult(
+        False,
+        [Finding("# code", "required", attack, {"payload": attack})],
+        [],
+        [],
+        source_url=f"https://example.com/{attack}",
+    )
+    review = MasterReview([attack], {attack: 1}, {attack: [attack]})
+    path = tmp_path / "review.md"
+
+    write_review_report(result, review, path)
+
+    text = path.read_text("utf-8")
+    assert "\r" not in text
+    assert "<https://evil.example>" not in text
+    assert "![image]" in text
+    assert "~~strike~~" in text
+    # The one-backtick payload forces a two-backtick delimiter; all attack
+    # syntax remains inside inert code spans instead of becoming GFM structure.
+    assert "`` ~~strike~~ # heading - list &gt; quote" in text
+    assert "``" in text

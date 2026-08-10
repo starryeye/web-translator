@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import html
 import json
 import os
+from pathlib import Path
+import re
 import tempfile
 
 from web_translator.models import Finding, MasterReview, QAResult
@@ -118,7 +119,7 @@ def _finding_lines(findings: list[Finding], *, empty: str) -> list[str]:
             evidence = json.dumps(
                 finding.evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
             )
-            result.append(f"  - Evidence: <code>{_markdown(evidence)}</code>")
+            result.append(f"  - Evidence: {_markdown(evidence)}")
     return result
 
 
@@ -127,10 +128,11 @@ def _portable_path(path: Path) -> str:
 
 
 def _markdown(value: object) -> str:
-    escaped = html.escape(str(value), quote=False).replace("\n", " ")
-    for character in ("\\", "`", "*", "_", "[", "]", "|"):
-        escaped = escaped.replace(character, f"\\{character}")
-    return escaped
+    normalized = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    escaped = html.escape(normalized, quote=False).replace("|", r"\|")
+    longest_run = max((len(run) for run in re.findall(r"`+", escaped)), default=0)
+    delimiter = "`" * (longest_run + 1)
+    return f"{delimiter} {escaped} {delimiter}"
 
 
 def _atomic_write(path: Path, text: str) -> None:
