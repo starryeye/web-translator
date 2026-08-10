@@ -388,7 +388,9 @@ def test_inline_style_declaration_urls_are_captured(tmp_path: Path) -> None:
         }
     )
     result = capture_page("https://example.com/", tmp_path, transport=transport)
-    assert "image.png" not in result.source_html.read_text("utf-8")
+    rendered = result.source_html.read_text("utf-8")
+    assert "image.png" not in rendered
+    assert "; color:red" in rendered
     assert "https://example.com/image.png" in result.asset_map
 
 
@@ -471,3 +473,72 @@ def test_private_transport_adapter_has_explicit_version_bounds() -> None:
         _assert_transport_compatibility("0.29.0", "1.0.9")
     with pytest.raises(RuntimeError, match="httpcore"):
         _assert_transport_compatibility("0.28.1", "1.1.0")
+
+
+def test_loading_app_shell_is_rejected_as_javascript_only(tmp_path: Path) -> None:
+    html = '<div id="app">Loading...</div><script src="app.js"></script>'
+    transport = mock_transport({"https://example.com/": (200, html.encode(), "text/html")})
+    with pytest.raises(CaptureError, match="JavaScript-only"):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+@pytest.mark.parametrize(
+    ("html", "reason"),
+    [
+        ('<title>Sign in</title><form action="/login"><input name="email"></form>', "authentication"),
+        ('<title>Just a moment...</title><p>Checking your browser before accessing the site.</p>', "interstitial"),
+    ],
+)
+def test_auth_or_interstitial_without_password_is_rejected(
+    tmp_path: Path, html: str, reason: str
+) -> None:
+    transport = mock_transport({"https://example.com/": (200, html.encode(), "text/html")})
+    with pytest.raises(CaptureError, match=reason):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/json", "application/xml"])
+def test_generic_css_url_rejects_textual_content_family(tmp_path: Path, content_type: str) -> None:
+    html = '<link rel="stylesheet" href="main.css">'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/main.css": (200, b'.a{background:url("payload")}', "text/css"),
+            "https://example.com/payload": (200, b"not binary", content_type),
+        }
+    )
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+    assert result.missing_optional_assets == ["https://example.com/payload"]
+    css_path = tmp_path / result.asset_map["https://example.com/main.css"]
+    assert "https://example.com/payload" in css_path.read_text("utf-8")
+
+
+def test_srcset_preserves_comma_bearing_path_candidate(tmp_path: Path) -> None:
+    html = '<img srcset="image,variant.png 1x, next.png 2x">'
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        return httpx.Response(200, content=b"image", headers={"content-type": "image/png"})
+
+    result = capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+    assert "https://example.com/image,variant.png" in result.asset_map
+    assert "https://example.com/next.png" in result.asset_map
+
+
+def test_two_redirect_aliases_share_failed_destination_cache(tmp_path: Path) -> None:
+    html = '<img src="alias1.png"><img src="alias2.png">'
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        if request.url.path in {"/alias1.png", "/alias2.png"}:
+            return httpx.Response(302, headers={"location": "/real.png"})
+        return httpx.Response(404, headers={"content-type": "image/png"})
+
+    capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+    assert requested.count("https://example.com/real.png") == 1

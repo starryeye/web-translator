@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import posixpath
+import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -141,6 +142,8 @@ class _Capture:
                             and normalized_destination in self.asset_map
                         ):
                             return None, b"", normalized_destination
+                        if normalized_destination in self._failed_assets:
+                            raise CaptureError(f"cached asset failure: {normalized_destination}")
                         current = normalized_destination
                         continue
                     response.raise_for_status()
@@ -274,7 +277,7 @@ class _Capture:
             if node.type == "declaration":
                 value = self._render_component_values(node.value, base_url, None, 0)
                 important = " !important" if node.important else ""
-                rendered.append(f"{node.name}:{value}{important}")
+                rendered.append(f"{node.name}:{value}{important};")
             else:
                 rendered.append(node.serialize())
         return "".join(rendered)
@@ -472,35 +475,32 @@ def _read_limited(response: httpx.Response, limit: int, label: str) -> bytes:
 
 
 def _parse_srcset(value: str) -> list[tuple[str, str]]:
-    """Parse candidates without treating comma-bearing URL data as separators."""
-    segments: list[str] = []
-    start = 0
-    url_started = False
-    saw_descriptor_space = False
-    for index, character in enumerate(value):
-        if character.isspace():
-            if url_started:
-                saw_descriptor_space = True
-            continue
-        if character != ",":
-            url_started = True
-            continue
-        next_is_space = index + 1 < len(value) and value[index + 1].isspace()
-        prefix = value[start:index].lstrip().lower()
-        plain_url_separator = not saw_descriptor_space and not prefix.startswith("data:") and "?" not in prefix
-        if saw_descriptor_space or next_is_space or plain_url_separator:
-            segments.append(value[start:index].strip())
-            start = index + 1
-            url_started = False
-            saw_descriptor_space = False
-    segments.append(value[start:].strip())
-
+    """Follow the HTML candidate shape: URL token first, then descriptors."""
     candidates: list[tuple[str, str]] = []
-    for segment in segments:
-        if not segment:
+    position = 0
+    while position < len(value):
+        while position < len(value) and (value[position].isspace() or value[position] == ","):
+            position += 1
+        if position >= len(value):
+            break
+        url_start = position
+        while position < len(value) and not value[position].isspace():
+            position += 1
+        source = value[url_start:position]
+        if source.endswith(","):
+            source = source.rstrip(",")
+            if source:
+                candidates.append((source, ""))
             continue
-        parts = segment.split(None, 1)
-        candidates.append((parts[0], parts[1] if len(parts) == 2 else ""))
+        while position < len(value) and value[position].isspace():
+            position += 1
+        descriptor_start = position
+        while position < len(value) and value[position] != ",":
+            position += 1
+        descriptor = value[descriptor_start:position].strip()
+        if position < len(value):
+            position += 1
+        candidates.append((source, descriptor))
     return candidates
 
 
@@ -523,8 +523,15 @@ def _validate_asset_content(
         raise CaptureError(f"critical stylesheet returned {media_type or 'no content type'}")
     if expected_kind == "image" and not media_type.startswith("image/"):
         raise CaptureError(f"image asset returned {media_type or 'no content type'}")
-    if not stylesheet and expected_kind == "asset" and media_type in {"text/html", "application/xhtml+xml"}:
-        raise CaptureError(f"asset returned unsupported {media_type}")
+    if not stylesheet and expected_kind == "asset":
+        binary_application = media_type in {
+            "application/octet-stream",
+            "binary/octet-stream",
+            "application/font-woff",
+            "application/vnd.ms-fontobject",
+        } or media_type.startswith("application/x-font-")
+        if not (media_type.startswith(("image/", "font/")) or binary_application):
+            raise CaptureError(f"asset returned unsupported {media_type or 'no content type'}")
 
 
 def _validate_supported_html(html: str) -> None:
@@ -534,7 +541,26 @@ def _validate_supported_html(html: str) -> None:
     markup = str(soup).lower()
     if any(signal in markup for signal in ("g-recaptcha", "h-captcha", "hcaptcha", "recaptcha")):
         raise CaptureError("unsupported CAPTCHA page")
+    auth_pattern = re.compile(r"(?:log[ -]?in|sign[ -]?in|auth|session)", re.IGNORECASE)
+    auth_form = soup.find("form", action=auth_pattern) or soup.find(
+        "form", attrs={"id": auth_pattern}
+    ) or soup.find("form", attrs={"class": auth_pattern})
+    visible_text = soup.get_text(" ", strip=True)
+    if auth_form is not None or (soup.find("form") is not None and auth_pattern.search(visible_text)):
+        raise CaptureError("unsupported authentication page")
+    interstitial_signals = (
+        "just a moment",
+        "checking your browser",
+        "verify you are human",
+        "security check",
+    )
+    if any(signal in visible_text.lower() for signal in interstitial_signals):
+        raise CaptureError("unsupported interstitial page")
     had_script = soup.find("script") is not None
+    app_shell = soup.find(id=re.compile(r"^(?:app|root|__next|__nuxt)$", re.IGNORECASE))
+    placeholder = re.sub(r"[.\s]+", " ", app_shell.get_text(" ", strip=True).lower()).strip() if app_shell else ""
+    if had_script and app_shell is not None and placeholder in {"loading", "please wait", "initializing"}:
+        raise CaptureError("unsupported JavaScript-only page")
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
     if not soup.get_text(" ", strip=True) and had_script:
