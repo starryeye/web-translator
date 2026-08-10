@@ -1,0 +1,23 @@
+{
+  "name": "web-translator",
+  "version": "0.1.0",
+  "description": "Translate public static web pages into reviewed offline Korean HTML bundles.",
+  "author": {
+    "name": "starryeye"
+  },
+  "repository": "https://github.com/starryeye/web-translator",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Web Translator",
+    "shortDescription": "Translate a public web page into reviewed Korean HTML.",
+    "longDescription": "Preserves a public page's structure and assets while Codex agents translate it contextually, review it, and create an offline bundle.",
+    "developerName": "starryeye",
+    "category": "Productivity",
+    "capabilities": [
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Translate this public web page into an offline Korean HTML bundle."
+    ]
+  }
+}
