@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import socket
 from pathlib import Path
 
 import httpx
 import pytest
 
-from web_translator.capture import MAX_CSS_IMPORT_DEPTH, CaptureError, capture_page
+from web_translator.capture import (
+    MAX_CSS_IMPORT_DEPTH,
+    CaptureError,
+    _assert_transport_compatibility,
+    capture_page,
+)
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "site"
@@ -320,3 +326,148 @@ def test_data_url_srcset_candidate_does_not_hide_later_network_candidate(tmp_pat
     assert "data:image/svg+xml,%3Csvg/%3E 1x" in rendered
     assert "large.png" not in rendered
     assert "https://example.com/large.png" in result.asset_map
+
+
+def test_network_capable_caller_transport_is_rejected(tmp_path: Path) -> None:
+    transport = httpx.HTTPTransport()
+    try:
+        with pytest.raises(CaptureError, match="MockTransport"):
+            capture_page("https://example.com/", tmp_path, transport=transport)
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    ("html", "reason"),
+    [
+        ('<form><input type="password"></form>', "authentication"),
+        ('<div class="g-recaptcha">Verify</div>', "CAPTCHA"),
+        ('<div id="app"></div><script src="app.js"></script>', "JavaScript-only"),
+    ],
+)
+def test_unsupported_interactive_pages_are_rejected(tmp_path: Path, html: str, reason: str) -> None:
+    transport = mock_transport({"https://example.com/": (200, html.encode(), "text/html")})
+    with pytest.raises(CaptureError, match=reason):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+def test_wrong_type_stylesheet_is_fatal(tmp_path: Path) -> None:
+    html = '<link rel="stylesheet" href="main.css">'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/main.css": (200, b"<form>login</form>", "text/html"),
+        }
+    )
+    with pytest.raises(CaptureError, match="critical stylesheet"):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+@pytest.mark.parametrize(("content", "content_type"), [(b"", "image/png"), (b"login", "text/html")])
+def test_empty_or_wrong_type_image_warns_and_keeps_fallback(
+    tmp_path: Path, content: bytes, content_type: str
+) -> None:
+    html = '<img src="image.png">'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/image.png": (200, content, content_type),
+        }
+    )
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+    assert result.missing_optional_assets == ["https://example.com/image.png"]
+    assert 'src="https://example.com/image.png"' in result.source_html.read_text("utf-8")
+
+
+def test_inline_style_declaration_urls_are_captured(tmp_path: Path) -> None:
+    html = '<div style="background:url(image.png); color:red">Content</div>'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/image.png": (200, b"image", "image/png"),
+        }
+    )
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+    assert "image.png" not in result.source_html.read_text("utf-8")
+    assert "https://example.com/image.png" in result.asset_map
+
+
+def test_css_same_document_fragments_remain_local(tmp_path: Path) -> None:
+    html = '<style>.a{filter:url(#clip)}.b{mask:url("https://example.com/#mask")}</style><p>Content</p>'
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+
+    result = capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+    rendered = result.source_html.read_text("utf-8")
+    assert 'url("#clip")' in rendered
+    assert 'url("#mask")' in rendered
+    assert requested == ["https://example.com/"]
+
+
+def test_srcset_preserves_commas_and_captures_later_candidates(tmp_path: Path) -> None:
+    html = (
+        '<img srcset="image.png?crop=1,2 1x, other.png?crop=3,4 2x">'
+        '<img srcset="data:image/png;base64,AAA, next.png 2x">'
+    )
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        return httpx.Response(200, content=b"image", headers={"content-type": "image/png"})
+
+    result = capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+    assert "https://example.com/image.png?crop=1,2" in result.asset_map
+    assert "https://example.com/other.png?crop=3,4" in result.asset_map
+    assert "https://example.com/next.png" in result.asset_map
+    assert "data:image/png;base64,AAA" in result.source_html.read_text("utf-8")
+
+
+def test_failed_redirect_destination_is_requested_once(tmp_path: Path) -> None:
+    html = '<img src="alias.png"><img src="real.png">'
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        if request.url.path == "/alias.png":
+            return httpx.Response(302, headers={"location": "/real.png"})
+        return httpx.Response(404, headers={"content-type": "image/png"})
+
+    capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+    assert requested.count("https://example.com/real.png") == 1
+
+
+def test_existing_source_html_is_not_overwritten(tmp_path: Path) -> None:
+    source = tmp_path / "source.html"
+    source.write_text("keep", encoding="utf-8")
+    transport = mock_transport({"https://example.com/": (200, b"<p>new</p>", "text/html")})
+    with pytest.raises(CaptureError, match="already exists"):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+    assert source.read_text("utf-8") == "keep"
+
+
+def test_capture_requests_identity_and_rejects_encoded_response(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["accept-encoding"] == "identity"
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"<p>content</p>"),
+            headers={"content-type": "text/html", "content-encoding": "gzip"},
+        )
+
+    with pytest.raises(CaptureError, match="Content-Encoding"):
+        capture_page("https://example.com/", tmp_path, transport=httpx.MockTransport(handler))
+
+
+def test_private_transport_adapter_has_explicit_version_bounds() -> None:
+    _assert_transport_compatibility("0.28.1", "1.0.9")
+    with pytest.raises(RuntimeError, match="httpx"):
+        _assert_transport_compatibility("0.29.0", "1.0.9")
+    with pytest.raises(RuntimeError, match="httpcore"):
+        _assert_transport_compatibility("0.28.1", "1.1.0")

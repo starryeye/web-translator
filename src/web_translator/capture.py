@@ -46,6 +46,8 @@ def capture_page(
     transport: httpx.BaseTransport | None = None,
 ) -> CaptureResult:
     """Capture one public HTML page and rewrite its static dependencies offline."""
+    if transport is not None and type(transport) is not httpx.MockTransport:
+        raise CaptureError("transport injection accepts only non-network httpx.MockTransport instances")
     try:
         requested = validate_public_url(url)
     except ValueError as error:
@@ -53,6 +55,9 @@ def capture_page(
 
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    source_path = run_dir / "source.html"
+    if source_path.exists():
+        raise CaptureError(f"capture target already exists: {source_path}")
     hooks = {"request": [_validate_network_boundary]}
     selected_transport = transport if transport is not None else _PinnedHTTPTransport()
     with httpx.Client(
@@ -61,7 +66,7 @@ def capture_page(
         timeout=30.0,
         transport=selected_transport,
         trust_env=False,
-        headers={"user-agent": USER_AGENT},
+        headers={"user-agent": USER_AGENT, "accept-encoding": "identity"},
         event_hooks=hooks,
     ) as client:
         capture = _Capture(client, run_dir)
@@ -76,10 +81,13 @@ def capture_page(
             source_text = html_bytes.decode(encoding)
         except (LookupError, UnicodeDecodeError) as error:
             raise CaptureError(f"HTML response could not be decoded as {encoding}") from error
+        _validate_supported_html(source_text)
         rendered = capture.rewrite_html(source_text, final_url)
-        source_path = run_dir / "source.html"
         rendered_bytes = rendered.encode("utf-8")
-        atomic_write(source_path, rendered_bytes)
+        try:
+            atomic_write(source_path, rendered_bytes)
+        except FileExistsError as error:
+            raise CaptureError(f"capture target already exists: {source_path}") from error
         capture.fingerprints["source.html"] = sha256_bytes(rendered_bytes)
 
     return CaptureResult(
@@ -112,11 +120,12 @@ class _Capture:
         except (httpx.HTTPError, OSError) as error:
             raise CaptureError(f"failed to fetch {label}: {error}") from error
 
-    def fetch_asset(self, url: str) -> tuple[httpx.Response | None, bytes, str | None]:
+    def fetch_asset(self, url: str, visited: set[str]) -> tuple[httpx.Response | None, bytes, str | None]:
         """Fetch an asset while stopping a redirect before a completed cached target."""
         current = url
         try:
             for redirect_count in range(MAX_REDIRECTS + 1):
+                visited.add(current)
                 with self.client.stream("GET", current, follow_redirects=False) as response:
                     if response.has_redirect_location:
                         if redirect_count == MAX_REDIRECTS:
@@ -126,6 +135,7 @@ class _Capture:
                             normalized_destination = str(validate_public_url(urldefrag(destination)[0]))
                         except ValueError as error:
                             raise CaptureError(f"unsafe asset redirect URL: {destination}") from error
+                        visited.add(normalized_destination)
                         if (
                             normalized_destination in self._complete_assets
                             and normalized_destination in self.asset_map
@@ -155,17 +165,17 @@ class _Capture:
             if "stylesheet" in rel:
                 link["href"] = self.capture_asset(absolute, critical=True, css_depth=0)
             elif rel & {"icon", "apple-touch-icon", "mask-icon"}:
-                link["href"] = self.capture_asset(absolute, critical=False)
+                link["href"] = self.capture_asset(absolute, critical=False, expected_kind="image")
 
         for tag in soup.find_all(["img", "source"]):
             if tag.has_attr("src"):
                 absolute = self._absolute_reference(base_url, str(tag["src"]))
-                tag["src"] = self.capture_asset(absolute, critical=False)
+                tag["src"] = self.capture_asset(absolute, critical=False, expected_kind="image")
             if tag.has_attr("srcset"):
                 tag["srcset"] = self._rewrite_srcset(str(tag["srcset"]), base_url)
 
         for tag in soup.find_all(style=True):
-            tag["style"] = self.rewrite_css(str(tag["style"]), base_url, None, 0)
+            tag["style"] = self.rewrite_declarations(str(tag["style"]), base_url)
         for style in soup.find_all("style"):
             css = style.string if style.string is not None else style.get_text()
             style.string = self.rewrite_css(css, base_url, None, 0)
@@ -181,7 +191,14 @@ class _Capture:
 
         return str(soup)
 
-    def capture_asset(self, reference: str, *, critical: bool, css_depth: int | None = None) -> str:
+    def capture_asset(
+        self,
+        reference: str,
+        *,
+        critical: bool,
+        css_depth: int | None = None,
+        expected_kind: str = "asset",
+    ) -> str:
         if _is_non_network_reference(reference):
             return reference
         if css_depth is not None and css_depth > MAX_CSS_IMPORT_DEPTH:
@@ -207,20 +224,24 @@ class _Capture:
         provisional = local_asset_name(validated, "text/css" if css_depth is not None else None).as_posix()
         self.asset_map[normalized] = provisional
         aliases = {normalized}
+        visited = {normalized}
         try:
-            response, content, cached_target = self.fetch_asset(normalized)
+            response, content, cached_target = self.fetch_asset(normalized, visited)
             if cached_target is not None:
                 local_path = self.asset_map[cached_target]
-                self.asset_map[normalized] = local_path
-                self._complete_assets.add(normalized)
+                for alias in visited:
+                    self.asset_map[alias] = local_path
+                    self._complete_assets.add(alias)
                 return _with_fragment(local_path, fragment)
             assert response is not None
             content_type = response.headers.get("content-type")
+            _validate_asset_content(content, content_type, css_depth is not None, expected_kind)
             local_path = local_asset_name(validated, content_type).as_posix()
-            self.asset_map[normalized] = local_path
             final_asset_url = str(validate_public_url(str(response.url)))
-            self.asset_map[final_asset_url] = local_path
             aliases.add(final_asset_url)
+            aliases.update(visited)
+            for alias in aliases:
+                self.asset_map[alias] = local_path
             if css_depth is not None:
                 encoding = response.encoding or "utf-8"
                 try:
@@ -232,21 +253,31 @@ class _Capture:
             destination = self.run_dir / Path(local_path)
             atomic_write(destination, content)
             self.fingerprints[local_path] = sha256_bytes(content)
-            self._complete_assets.add(normalized)
-            self._complete_assets.add(final_asset_url)
+            self._complete_assets.update(aliases)
             return _with_fragment(local_path, fragment)
         except (CaptureError, OSError) as error:
             for alias in aliases:
                 self.asset_map.pop(alias, None)
             if critical:
                 raise CaptureError(f"critical stylesheet could not be captured: {normalized}: {error}") from error
-            self._failed_assets.add(normalized)
+            self._failed_assets.update(visited)
             self.missing_optional_assets.add(normalized)
             return reference
 
     def rewrite_css(self, css: str, base_url: str, css_local_path: str | None, depth: int) -> str:
         rules = tinycss2.parse_stylesheet(css, skip_comments=False, skip_whitespace=False)
         return "".join(self._render_css_rule(rule, base_url, css_local_path, depth) for rule in rules)
+
+    def rewrite_declarations(self, css: str, base_url: str) -> str:
+        rendered: list[str] = []
+        for node in tinycss2.parse_declaration_list(css, skip_comments=False, skip_whitespace=False):
+            if node.type == "declaration":
+                value = self._render_component_values(node.value, base_url, None, 0)
+                important = " !important" if node.important else ""
+                rendered.append(f"{node.name}:{value}{important}")
+            else:
+                rendered.append(node.serialize())
+        return "".join(rendered)
 
     def _render_css_rule(self, rule: object, base_url: str, css_local_path: str | None, depth: int) -> str:
         if not hasattr(rule, "type"):
@@ -292,6 +323,9 @@ class _Capture:
     def _render_component(self, token: object, base_url: str, css_local_path: str | None, depth: int) -> str:
         value = _css_url_value(token, allow_string=False)
         if value is not None:
+            local_fragment = _same_document_fragment(value, base_url)
+            if local_fragment is not None:
+                return f'url("{_css_escape(local_fragment)}")'
             absolute = self._absolute_reference(base_url, value)
             local = self.capture_asset(absolute, critical=False)
             return f'url("{_css_escape(self._css_relative(css_local_path, local))}")'
@@ -308,7 +342,7 @@ class _Capture:
         candidates: list[str] = []
         for source, descriptor in _parse_srcset(value):
             absolute = self._absolute_reference(base_url, source)
-            local = self.capture_asset(absolute, critical=False)
+            local = self.capture_asset(absolute, critical=False, expected_kind="image")
             candidates.append(" ".join(part for part in (local, descriptor) if part))
         return ", ".join(candidates)
 
@@ -394,11 +428,32 @@ class _PinnedHTTPTransport(httpx.HTTPTransport):
     """HTTP transport whose connection pool cannot re-resolve approved hosts."""
 
     def __init__(self) -> None:
+        _assert_transport_compatibility(httpx.__version__, httpcore.__version__)
         super().__init__(trust_env=False)
+        if not hasattr(self._pool, "_network_backend"):
+            raise RuntimeError("httpx/httpcore transport adapter is incompatible: missing network backend seam")
         self._pool._network_backend = _PinnedNetworkBackend()
 
 
+def _assert_transport_compatibility(httpx_version: str, httpcore_version: str) -> None:
+    if not ((0, 28) <= _major_minor(httpx_version) < (0, 29)):
+        raise RuntimeError(f"unsupported httpx version for pinned transport: {httpx_version}")
+    if not ((1, 0) <= _major_minor(httpcore_version) < (1, 1)):
+        raise RuntimeError(f"unsupported httpcore version for pinned transport: {httpcore_version}")
+
+
+def _major_minor(version: str) -> tuple[int, int]:
+    try:
+        major, minor, *_ = version.split(".")
+        return int(major), int(minor)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"invalid dependency version: {version}") from error
+
+
 def _read_limited(response: httpx.Response, limit: int, label: str) -> bytes:
+    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        raise CaptureError(f"{label} returned unsupported Content-Encoding: {content_encoding}")
     declared = response.headers.get("content-length")
     if declared is not None:
         try:
@@ -417,29 +472,73 @@ def _read_limited(response: httpx.Response, limit: int, label: str) -> bytes:
 
 
 def _parse_srcset(value: str) -> list[tuple[str, str]]:
-    """Parse URL/descriptor candidates, retaining commas inside data URLs."""
+    """Parse candidates without treating comma-bearing URL data as separators."""
+    segments: list[str] = []
+    start = 0
+    url_started = False
+    saw_descriptor_space = False
+    for index, character in enumerate(value):
+        if character.isspace():
+            if url_started:
+                saw_descriptor_space = True
+            continue
+        if character != ",":
+            url_started = True
+            continue
+        next_is_space = index + 1 < len(value) and value[index + 1].isspace()
+        prefix = value[start:index].lstrip().lower()
+        plain_url_separator = not saw_descriptor_space and not prefix.startswith("data:") and "?" not in prefix
+        if saw_descriptor_space or next_is_space or plain_url_separator:
+            segments.append(value[start:index].strip())
+            start = index + 1
+            url_started = False
+            saw_descriptor_space = False
+    segments.append(value[start:].strip())
+
     candidates: list[tuple[str, str]] = []
-    index = 0
-    while index < len(value):
-        while index < len(value) and (value[index].isspace() or value[index] == ","):
-            index += 1
-        if index >= len(value):
-            break
-        start = index
-        data_url = value[index : index + 5].lower() == "data:"
-        while index < len(value) and not value[index].isspace() and (data_url or value[index] != ","):
-            index += 1
-        source = value[start:index]
-        while index < len(value) and value[index].isspace():
-            index += 1
-        descriptor_start = index
-        while index < len(value) and value[index] != ",":
-            index += 1
-        descriptor = value[descriptor_start:index].strip()
-        candidates.append((source, descriptor))
-        if index < len(value):
-            index += 1
+    for segment in segments:
+        if not segment:
+            continue
+        parts = segment.split(None, 1)
+        candidates.append((parts[0], parts[1] if len(parts) == 2 else ""))
     return candidates
+
+
+def _same_document_fragment(reference: str, base_url: str) -> str | None:
+    if reference.startswith("#"):
+        return reference
+    absolute = urljoin(base_url, reference)
+    target, fragment = urldefrag(absolute)
+    current, _ = urldefrag(base_url)
+    return f"#{fragment}" if fragment and target == current else None
+
+
+def _validate_asset_content(
+    content: bytes, content_type: str | None, stylesheet: bool, expected_kind: str
+) -> None:
+    if not content:
+        raise CaptureError("asset response body is empty")
+    media_type = (content_type or "").partition(";")[0].strip().lower()
+    if stylesheet and media_type != "text/css":
+        raise CaptureError(f"critical stylesheet returned {media_type or 'no content type'}")
+    if expected_kind == "image" and not media_type.startswith("image/"):
+        raise CaptureError(f"image asset returned {media_type or 'no content type'}")
+    if not stylesheet and expected_kind == "asset" and media_type in {"text/html", "application/xhtml+xml"}:
+        raise CaptureError(f"asset returned unsupported {media_type}")
+
+
+def _validate_supported_html(html: str) -> None:
+    soup = BeautifulSoup(html, "lxml")
+    if soup.find("input", attrs={"type": lambda value: value and str(value).lower() == "password"}):
+        raise CaptureError("unsupported authentication page")
+    markup = str(soup).lower()
+    if any(signal in markup for signal in ("g-recaptcha", "h-captcha", "hcaptcha", "recaptcha")):
+        raise CaptureError("unsupported CAPTCHA page")
+    had_script = soup.find("script") is not None
+    for node in soup.find_all(["script", "style", "noscript"]):
+        node.decompose()
+    if not soup.get_text(" ", strip=True) and had_script:
+        raise CaptureError("unsupported JavaScript-only page")
 
 
 def _css_url_value(token: object, *, allow_string: bool = True) -> str | None:

@@ -48,7 +48,7 @@ def local_asset_name(url: httpx.URL, content_type: str | None) -> Path:
 
 
 def atomic_write(path: Path, content: bytes) -> None:
-    """Replace *path* atomically after fully writing and flushing a sibling file."""
+    """Publish *path* atomically without replacing an existing destination."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
     try:
@@ -57,7 +57,8 @@ def atomic_write(path: Path, content: bytes) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
+        os.link(temporary_name, path)
+        Path(temporary_name).unlink()
         temporary_name = None
     finally:
         if temporary_name is not None:

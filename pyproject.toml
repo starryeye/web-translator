@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Translate public static web pages into reviewed offline Korean HTML bundles."
 requires-python = ">=3.11"
 dependencies = [
-    "httpx",
+    "httpx>=0.28,<0.29",
+    "httpcore>=1.0,<1.1",
     "beautifulsoup4",
     "lxml",
     "tinycss2",
