@@ -7,7 +7,7 @@ import re
 
 from bs4 import BeautifulSoup, Tag
 
-from web_translator.models import ProtectedToken, Segment, write_segments
+from web_translator.models import Segment, write_segments
 from web_translator.protection import protect_fragment
 
 
@@ -52,33 +52,31 @@ def extract_segments(source_html: Path, segments_path: Path) -> list[Segment]:
     for marked in soup.select("[data-wt-segment]"):
         del marked["data-wt-segment"]
 
-    candidates = [
-        tag
-        for tag in soup.find_all(_ELIGIBLE_TAGS)
-        if isinstance(tag, Tag) and _is_candidate(tag)
-    ]
-    drafts: list[tuple[Tag, str, list[ProtectedToken], list[str], str]] = []
+    candidates = [tag for tag in soup.find_all(_ELIGIBLE_TAGS) if _is_candidate(tag)]
+    drafts: list[tuple[Tag, list[str], str]] = []
     heading_stack: list[str] = []
     for candidate in candidates:
-        fragment = candidate.decode_contents()
-        source_text, protected = protect_fragment(fragment)
         name = candidate.name.lower()
         if _is_heading(name):
             level = int(name[1])
             heading_stack[level - 1 :] = []
-        if _has_translatable_text(source_text):
+        own_text, _ = protect_fragment(_fragment_without_eligible_descendants(candidate))
+        if _has_translatable_text(own_text):
             semantic_type = "heading" if _is_heading(name) else _SEMANTIC_TYPES[name]
-            drafts.append((candidate, source_text, protected, list(heading_stack), semantic_type))
+            drafts.append((candidate, list(heading_stack), semantic_type))
         if _is_heading(name):
             while len(heading_stack) < level - 1:
                 heading_stack.append("")
             heading_stack.append(candidate.get_text(" ", strip=True))
 
     ids = [f"seg-{index:06d}" for index in range(1, len(drafts) + 1)]
-    segments: list[Segment] = []
-    for index, (candidate, source_text, protected, heading_path, semantic_type) in enumerate(drafts):
-        segment_id = ids[index]
+    for segment_id, (candidate, _, _) in zip(ids, drafts, strict=True):
         candidate["data-wt-segment"] = segment_id
+
+    segments: list[Segment] = []
+    for index, (candidate, heading_path, semantic_type) in enumerate(drafts):
+        segment_id = ids[index]
+        source_text, protected = protect_fragment(candidate.decode_contents())
         context_ids = ids[max(0, index - 1) : index] + ids[index + 1 : index + 2]
         segments.append(
             Segment(
@@ -105,9 +103,14 @@ def _is_candidate(tag: Tag) -> bool:
         parent_name = parent.name.lower()
         if parent_name in _EXCLUDED_TAGS or _translate_disabled(parent):
             return False
-        if parent_name in _ELIGIBLE_TAGS:
-            return False
     return not _translate_disabled(tag)
+
+
+def _fragment_without_eligible_descendants(tag: Tag) -> str:
+    fragment = BeautifulSoup(tag.decode_contents(), "html.parser")
+    for descendant in fragment.find_all(_ELIGIBLE_TAGS):
+        descendant.decompose()
+    return str(fragment)
 
 
 def _translate_disabled(tag: Tag) -> bool:
