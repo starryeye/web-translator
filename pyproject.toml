@@ -31,3 +31,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+markers = [
+    "live: opt-in network compatibility tests for changing upstream pages",
+]
