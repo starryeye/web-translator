@@ -7,11 +7,13 @@ from pathlib import Path
 
 import httpx
 import pytest
+from tinycss2.ast import ParseError
 
 from web_translator.capture import (
     MAX_CSS_IMPORT_DEPTH,
     CaptureError,
     _assert_transport_compatibility,
+    _serialize_css_parse_error,
     capture_page,
 )
 
@@ -392,6 +394,102 @@ def test_inline_style_declaration_urls_are_captured(tmp_path: Path) -> None:
     assert "image.png" not in rendered
     assert "; color:red" in rendered
     assert "https://example.com/image.png" in result.asset_map
+
+
+def test_external_stylesheet_drops_only_invalid_trailing_rule(tmp_path: Path) -> None:
+    html = '<link rel="stylesheet" href="main.css"><p>Content</p>'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/main.css": (
+                200,
+                b'.ok{background:url("image.png")}}',
+                "text/css",
+            ),
+            "https://example.com/image.png": (200, b"image", "image/png"),
+        }
+    )
+
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+
+    css_path = tmp_path / result.asset_map["https://example.com/main.css"]
+    rewritten = css_path.read_text("utf-8")
+    assert rewritten.count("{") == rewritten.count("}") == 1
+    assert rewritten.startswith(".ok{background:")
+    assert "image.png" not in rewritten
+    image_path = result.asset_map["https://example.com/image.png"]
+    assert f'url("{Path(image_path).name}")' in rewritten
+
+
+def test_entirely_invalid_external_stylesheet_fails_closed(tmp_path: Path) -> None:
+    html = '<link rel="stylesheet" href="main.css"><p>Content</p>'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/main.css": (200, b"}", "text/css"),
+        }
+    )
+
+    with pytest.raises(CaptureError, match="no valid rules after CSS error recovery"):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+def test_inline_stylesheet_drops_only_invalid_trailing_rule(tmp_path: Path) -> None:
+    html = "<style>.ok{color:red}}</style><p>Content</p>"
+    transport = mock_transport(
+        {"https://example.com/": (200, html.encode(), "text/html")}
+    )
+
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+
+    rendered = result.source_html.read_text("utf-8")
+    assert ".ok{color:red}" in rendered
+    assert ".ok{color:red}}" not in rendered
+
+
+def test_tokenizer_parse_error_keeps_defined_css_recovery(tmp_path: Path) -> None:
+    html = "<style>.ok{background:url(foo bar)}</style><p>Content</p>"
+    transport = mock_transport(
+        {"https://example.com/": (200, html.encode(), "text/html")}
+    )
+
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+
+    rendered = result.source_html.read_text("utf-8")
+    assert "url([bad url])" in rendered
+
+
+def test_unserializable_parse_error_becomes_location_rich_capture_error() -> None:
+    error = ParseError(7, 11, "future-error", "No defined serialization")
+
+    with pytest.raises(
+        CaptureError,
+        match=r"component at 7:11: future-error: No defined serialization",
+    ):
+        _serialize_css_parse_error(error, "component")
+
+
+def test_inline_style_drops_invalid_declaration_without_fetching_its_url(
+    tmp_path: Path,
+) -> None:
+    html = (
+        '<p style="color:red; background url(https://assets.example/hidden.png)">'
+        "Content</p>"
+    )
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+
+    result = capture_page(
+        "https://example.com/", tmp_path, transport=httpx.MockTransport(handler)
+    )
+
+    rendered = result.source_html.read_text("utf-8")
+    assert 'style="color:red; "' in rendered
+    assert "hidden.png" not in rendered
+    assert requested == ["https://example.com/"]
 
 
 def test_css_same_document_fragments_remain_local(tmp_path: Path) -> None:

@@ -14,7 +14,7 @@ import httpx
 import httpcore
 import tinycss2
 from bs4 import BeautifulSoup
-from tinycss2.ast import AtRule, FunctionBlock, StringToken, URLToken
+from tinycss2.ast import AtRule, FunctionBlock, ParseError, StringToken, URLToken
 
 from web_translator.assets import atomic_write, local_asset_name, sha256_bytes
 from web_translator.paths import validate_public_url
@@ -290,7 +290,23 @@ class _Capture:
 
     def rewrite_css(self, css: str, base_url: str, css_local_path: str | None, depth: int) -> str:
         rules = tinycss2.parse_stylesheet(css, skip_comments=False, skip_whitespace=False)
-        return "".join(self._render_css_rule(rule, base_url, css_local_path, depth) for rule in rules)
+        discarded_error = any(
+            isinstance(rule, ParseError)
+            and _is_discardable_css_parse_error(rule, "stylesheet")
+            for rule in rules
+        )
+        valid_rule = any(
+            getattr(rule, "type", None) in {"at-rule", "qualified-rule"}
+            for rule in rules
+        )
+        if css_local_path is not None and discarded_error and not valid_rule:
+            raise CaptureError(
+                "critical stylesheet contains no valid rules after CSS error recovery"
+            )
+        return "".join(
+            self._render_css_rule(rule, base_url, css_local_path, depth)
+            for rule in rules
+        )
 
     def rewrite_declarations(self, css: str, base_url: str) -> str:
         rendered: list[str] = []
@@ -299,11 +315,15 @@ class _Capture:
                 value = self._render_component_values(node.value, base_url, None, 0)
                 important = " !important" if node.important else ""
                 rendered.append(f"{node.name}:{value}{important};")
+            elif isinstance(node, ParseError):
+                rendered.append(_serialize_css_parse_error(node, "declaration"))
             else:
                 rendered.append(node.serialize())
         return "".join(rendered)
 
     def _render_css_rule(self, rule: object, base_url: str, css_local_path: str | None, depth: int) -> str:
+        if isinstance(rule, ParseError):
+            return _serialize_css_parse_error(rule, "stylesheet")
         if not hasattr(rule, "type"):
             return str(rule)
         if rule.type == "at-rule":
@@ -345,6 +365,8 @@ class _Capture:
         return "".join(self._render_component(token, base_url, css_local_path, depth) for token in tokens)
 
     def _render_component(self, token: object, base_url: str, css_local_path: str | None, depth: int) -> str:
+        if isinstance(token, ParseError):
+            return _serialize_css_parse_error(token, "component")
         value = _css_url_value(token, allow_string=False)
         if value is not None:
             local_fragment = _same_document_fragment(value, base_url)
@@ -640,3 +662,33 @@ def _with_fragment(path: str, fragment: str) -> str:
 
 def _css_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\a ")
+
+
+def _serialize_css_parse_error(error: ParseError, context: str) -> str:
+    """Apply CSS error recovery only where tinycss2 identifies an invalid unit."""
+    if _is_discardable_css_parse_error(error, context):
+        return ""
+    try:
+        return error.serialize()
+    except TypeError as serialization_error:
+        raise CaptureError(
+            "unsupported CSS parse error "
+            f"in {context} at {error.source_line}:{error.source_column}: "
+            f"{error.kind}: {error.message}"
+        ) from serialization_error
+
+
+def _is_discardable_css_parse_error(error: ParseError, context: str) -> bool:
+    return (
+        context == "stylesheet"
+        and error.kind == "invalid"
+        and error.message == "EOF reached before {} block for a qualified rule."
+    ) or (
+        context == "declaration"
+        and error.kind == "invalid"
+        and (
+            error.message.startswith("Expected <ident> for declaration name, got ")
+            or error.message.startswith("Expected ':' after declaration name, got ")
+            or error.message == "Declaration contains {} block"
+        )
+    )
