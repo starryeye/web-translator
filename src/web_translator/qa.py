@@ -177,7 +177,8 @@ def _check_tokens(
             continue
         source_fragment = source_element.decode_contents()
         output_fragment = output_element.decode_contents()
-        source_expectations: Counter[tuple[str, str]] = Counter()
+        value_expectations: Counter[str] = Counter()
+        kinds_by_value: dict[str, set[str]] = {}
         output_expectations: Counter[tuple[str, str, str | None]] = Counter()
         for token in tokens:
             if token.kind == "tag":
@@ -186,17 +187,22 @@ def _check_tokens(
             if not normalized:
                 changed.add(segment_id)
                 break
-            source_expectations[(normalized, token.kind)] += 1
+            value_expectations[normalized] += 1
+            kinds_by_value.setdefault(normalized, set()).add(token.kind)
             guard = _following_token_guard(text, token.token, tokens)
             output_expectations[(normalized, token.kind, guard)] += 1
         if segment_id in changed:
             continue
         if any(
-            _exact_fragment_count(source_fragment, value, kind) != count
-            for (value, kind), count in source_expectations.items()
+            _exact_fragment_count_across_kinds(
+                source_fragment, value, kinds_by_value[value]
+            ) != count
+            for value, count in value_expectations.items()
         ) or any(
-            _exact_fragment_count(output_fragment, value, kind) != count
-            for (value, kind), count in source_expectations.items()
+            _exact_fragment_count_across_kinds(
+                output_fragment, value, kinds_by_value[value]
+            ) != count
+            for value, count in value_expectations.items()
         ) or any(
             _guarded_fragment_count(output_fragment, value, kind, guard) != count
             for (value, kind, guard), count in output_expectations.items()
@@ -231,7 +237,19 @@ def _normalized_fragment(value: str) -> str:
     return BeautifulSoup(value, "html.parser").decode_contents()
 
 
-def _exact_fragment_count(fragment: str, value: str, kind: str) -> int:
+def _exact_fragment_count_across_kinds(
+    fragment: str, value: str, kinds: Iterable[str]
+) -> int:
+    return len(
+        {
+            match.span()
+            for kind in kinds
+            for match in re.finditer(_exact_fragment_pattern(value, kind), fragment)
+        }
+    )
+
+
+def _exact_fragment_pattern(value: str, kind: str) -> str:
     lexical = kind in {"command", "identifier", "keyword", "url"}
     prefix = (
         r"(?<![A-Za-z0-9_])"
@@ -246,7 +264,7 @@ def _exact_fragment_count(fragment: str, value: str, kind: str) -> int:
             if lexical or (value[-1].isascii() and value[-1].isalnum())
             else ""
         )
-    return len(re.findall(prefix + re.escape(value) + suffix, fragment))
+    return prefix + re.escape(value) + suffix
 
 
 def _guarded_fragment_count(

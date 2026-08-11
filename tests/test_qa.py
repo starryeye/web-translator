@@ -292,6 +292,34 @@ def test_protected_keyword_rejects_an_extra_complete_value_with_a_different_boun
     assert result.required_findings[0].evidence["changed_segments"] == ["a"]
 
 
+def test_protected_value_shared_by_keyword_and_identifier_counts_once_per_occurrence(
+    tmp_path: Path,
+) -> None:
+    identifier_token = "⟦WT:000001⟧"
+    source, output = _write_pages(
+        tmp_path,
+        source_body='<main><p data-wt-segment="a">MUST MUST</p></main>',
+        output_body='<main><p>MUST MUST</p></main>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [
+                    ProtectedToken(TOKEN, "keyword", "MUST"),
+                    ProtectedToken(identifier_token, "identifier", "MUST"),
+                ]
+            },
+            translated_texts={"a": f"{TOKEN} {identifier_token}"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
 def test_qa_detects_structural_change_and_unresolved_internal_anchor(tmp_path: Path) -> None:
     source, output = _write_pages(
         tmp_path,
