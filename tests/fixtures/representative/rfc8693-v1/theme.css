@@ -1,0 +1,4 @@
+body { color: #111827; font: 16px/1.55 serif; margin: auto; max-width: 64rem; padding: 1rem; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #4b5563; padding: .4rem; text-align: left; }
+pre { max-width: 100%; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }

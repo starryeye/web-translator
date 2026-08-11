@@ -70,11 +70,11 @@ checks prove structure; only the master can approve meaning. Read
    Normalize first-use glossary placement document-wide: retain each English technical
    term everywhere and allow its Korean gloss only at the earliest eligible occurrence.
    Write `review.json` with `retries` exactly covering every planned zone and mapping to
-   integers from 0 through 2. `section_findings` values are string arrays, and
-   section_findings must exactly cover every planned zone. Each array contains all six
-   dimension-labelled `pass` or `required-fix` verdict/evidence entries and preserves
-   prior attempt findings. `unresolved_required` is a string array containing exactly
-   every unresolved required item:
+   integers from 0 through 2. section_findings must exactly cover every planned zone.
+   Each value is an array of six objects with exactly `dimension`, `verdict`, and
+   non-empty `evidence`; use each canonical dimension exactly once. A verdict is only
+   `pass` or `required-fix`. `unresolved_required` is a sorted, unique string array
+   containing exactly every `zone-ID:dimension` whose verdict is `required-fix`:
 
    ```json
    {
@@ -82,12 +82,12 @@ checks prove structure; only the master can approve meaning. Read
      "retries": {"zone-001": 1},
      "section_findings": {
        "zone-001": [
-         "semantic fidelity | pass | evidence: claims and actors match segments seg-000001..seg-000009",
-         "qualification preservation | pass | evidence: conditions and normative force remain exact",
-         "naturalness | pass | evidence: coherent professional Korean in section context",
-         "terminology | pass | evidence: canonical English terms remain consistent",
-         "boundary consistency | pass | evidence: both neighbor transitions and referents agree",
-         "protected content | pass | evidence: validator passed and identifiers remain exact"
+         {"dimension":"semantic_fidelity","verdict":"pass","evidence":"Claims and actors match segments seg-000001..seg-000009."},
+         {"dimension":"qualification_preservation","verdict":"pass","evidence":"Conditions and normative force remain exact."},
+         {"dimension":"naturalness","verdict":"pass","evidence":"Korean is coherent professional prose in section context."},
+         {"dimension":"terminology","verdict":"pass","evidence":"Canonical English terms remain consistent."},
+         {"dimension":"boundary_consistency","verdict":"pass","evidence":"Both neighbor transitions and referents agree."},
+         {"dimension":"protected_content","verdict":"pass","evidence":"Validator passed and identifiers remain exact."}
        ]
      }
    }

@@ -215,7 +215,7 @@ def test_first_use_matches_terms_across_inline_tag_tokens() -> None:
     assert normalized[1].text == "Spring AI 재사용"
 
 
-@pytest.mark.parametrize("token_kind", ["code", "url", "identifier"])
+@pytest.mark.parametrize("token_kind", ["code", "url", "identifier", "location"])
 def test_first_use_does_not_match_across_opaque_token(token_kind: str) -> None:
     records = [
         translation("a", f"Spring {TOKEN}AI code"),
@@ -416,6 +416,154 @@ def test_assembly_translates_nested_markers_after_parent_replacement(
     assert items[0].get_text(" ", strip=True) == "외부 앞 내부 항목 외부 뒤"
     assert items[1].get_text(" ", strip=True) == "내부 항목"
 
+
+def test_assembly_restores_translated_accessibility_attributes_with_escaping(
+    tmp_path: Path,
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<img src="diagram.png" alt="Configure OAuth securely" '
+        'aria-label="OAuth diagram" title="Token exchange">',
+    )
+    extracted = extract_segments(source, source.parent / "segments.jsonl")
+    assert len(extracted) == 1
+    item = extracted[0]
+    translated_text = (
+        item.source_text
+        .replace("Configure OAuth securely", 'OAuth 안내 "quoted" & safe')
+        .replace("OAuth diagram", "OAuth 구성 다이어그램")
+        .replace("Token exchange", "Token 교환")
+    )
+
+    output = assemble_page(
+        source,
+        {item.id: item},
+        {item.id: translation(item.id, translated_text)},
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    image = BeautifulSoup(output.read_text("utf-8"), "lxml").img
+    assert image["alt"] == 'OAuth 안내 "quoted" & safe'
+    assert image["aria-label"] == "OAuth 구성 다이어그램"
+    assert image["title"] == "Token 교환"
+    assert image["src"] == "diagram.png"
+    assert not any(name.lower().startswith("on") for name in image.attrs)
+    assert "data-wt-segment" not in image.attrs
+
+
+def test_assembly_handles_nested_content_and_attribute_locations_in_order(
+    tmp_path: Path,
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<p>Review the <img src="flow.png" alt="OAuth flow"> carefully.</p>',
+    )
+    extracted = extract_segments(source, source.parent / "segments.jsonl")
+    segments = {item.id: item for item in extracted}
+    translations = {
+        item.id: translation(
+            item.id,
+            item.source_text
+            .replace("Review the ", "다음 ")
+            .replace(" carefully.", " 주의 깊게 확인하세요.")
+            .replace("OAuth flow", "OAuth 흐름"),
+        )
+        for item in extracted
+    }
+
+    output = assemble_page(
+        source,
+        segments,
+        translations,
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    paragraph = BeautifulSoup(output.read_text("utf-8"), "lxml").p
+    assert paragraph.get_text() == "다음  주의 깊게 확인하세요."
+    assert paragraph.img["alt"] == "OAuth 흐름"
+    assert paragraph.img["src"] == "flow.png"
+
+
+def test_assembly_rejects_changed_attribute_location_tokens_and_bad_locator(
+    tmp_path: Path,
+) -> None:
+    source = write_source(tmp_path, '<img src="x.png" alt="Readable diagram">')
+    extracted = extract_segments(source, source.parent / "segments.jsonl")
+    item = extracted[0]
+
+    with pytest.raises(AssemblyError, match="cannot restore"):
+        assemble_page(
+            source,
+            {item.id: item},
+            {
+                item.id: translation(
+                    item.id,
+                    item.source_text.replace(item.protected[0].token, ""),
+                )
+            },
+            {},
+            tmp_path / "missing-token",
+            "https://example.com/",
+        )
+
+    bad_locator = Segment(
+        id=item.id,
+        locator="img[alt]",
+        semantic_type=item.semantic_type,
+        heading_path=item.heading_path,
+        source_text=item.source_text,
+        protected=item.protected,
+        context_ids=item.context_ids,
+        target=True,
+    )
+    with pytest.raises(AssemblyError, match="locator"):
+        assemble_page(
+            source,
+            {item.id: bad_locator},
+            {item.id: translation(item.id, item.source_text)},
+            {},
+            tmp_path / "bad-locator",
+            "https://example.com/",
+        )
+
+
+@pytest.mark.parametrize("attribute", ["href", "onclick"])
+def test_assembly_rejects_url_and_executable_attribute_locations(
+    tmp_path: Path, attribute: str
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<a href="/safe" data-wt-segment="seg-000001">Safe link</a>',
+    )
+    boundary = ProtectedToken(
+        TOKEN,
+        "location",
+        f"<!--wt-location:attribute:{attribute}-->",
+    )
+    located = Segment(
+        id="seg-000001",
+        locator="[data-wt-segment='seg-000001']",
+        semantic_type="located:attributes",
+        heading_path=[],
+        source_text=f"{TOKEN}safe",
+        protected=[boundary],
+        context_ids=[],
+        target=True,
+    )
+
+    with pytest.raises(AssemblyError, match="unsafe translated attribute"):
+        assemble_page(
+            source,
+            {located.id: located},
+            {located.id: translation(located.id, f"{TOKEN}javascript:alert(1)")},
+            {},
+            tmp_path / f"unsafe-{attribute}",
+            "https://example.com/",
+        )
 
 def test_assembly_copies_assets_and_adds_offline_csp_and_attribution(
     tmp_path: Path,

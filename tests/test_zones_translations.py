@@ -66,7 +66,7 @@ def write_zone_result(path: Path, records: list[object]) -> None:
     )
 
 
-def test_zones_pack_complete_sections_and_include_read_only_neighbors() -> None:
+def test_zones_pack_complete_sections_without_exceeding_the_total_bound() -> None:
     segments = [
         segment("seg-000001", "A" * 7_000, semantic_type="heading"),
         segment("seg-000002", "B" * 7_000, semantic_type="heading"),
@@ -77,7 +77,7 @@ def test_zones_pack_complete_sections_and_include_read_only_neighbors() -> None:
 
     assert len(zones) == 2
     assert set(zones[0].target_ids).isdisjoint(zones[1].target_ids)
-    assert zones[1].context_before_ids[-1] == zones[0].target_ids[-1]
+    assert zones[1].context_before_ids == []
     assert zones[1].target_ids == ["seg-000002", "seg-000003"]
 
 
@@ -92,7 +92,7 @@ def test_zone_count_changes_when_complete_sections_fit_the_limit() -> None:
     assert len(build_zones(segments, max_chars=10_000)) == 1
 
 
-def test_zone_keeps_a_complete_oversized_section_together() -> None:
+def test_zone_splits_an_oversized_section_at_segment_boundaries() -> None:
     segments = [
         segment("seg-000001", "Large", semantic_type="heading"),
         segment("seg-000002", "A" * 8_000, heading_path=["Large"]),
@@ -102,20 +102,108 @@ def test_zone_keeps_a_complete_oversized_section_together() -> None:
 
     zones = build_zones(segments, max_chars=12_000)
 
-    assert zones[0].target_ids == ["seg-000001", "seg-000002", "seg-000003"]
-    assert zones[1].target_ids == ["seg-000004"]
+    assert [zone.target_ids for zone in zones] == [
+        ["seg-000001", "seg-000002"],
+        ["seg-000003", "seg-000004"],
+    ]
+    assert all(
+        sum(len(segments[int(identifier[-6:]) - 1].source_text) for identifier in zone.target_ids)
+        <= 12_000
+        for zone in zones
+    )
+
+
+def test_zone_bounds_a_million_character_splittable_section() -> None:
+    segments = [segment("seg-000001", "Long section", semantic_type="heading")]
+    segments.extend(
+        segment(f"seg-{index:06d}", "X" * 12_000, heading_path=["Long section"])
+        for index in range(2, 102)
+    )
+
+    zones = build_zones(segments, max_chars=12_000)
+    by_id = {item.id: item for item in segments}
+
+    assert [identifier for zone in zones for identifier in zone.target_ids] == [
+        item.id for item in segments
+    ]
+    assert len(zones) == 101
+    assert all(
+        sum(len(by_id[identifier].source_text) for identifier in zone.target_ids)
+        <= 12_000
+        for zone in zones
+    )
 
 
 def test_zone_context_is_bounded_to_two_neighbors_on_each_side() -> None:
     segments = [
-        segment(f"seg-{index:06d}", str(index), semantic_type="heading")
-        for index in range(1, 6)
+        segment("ctx-000001", "1", target=False),
+        segment("ctx-000002", "2", target=False),
+        segment("seg-000003", "3", semantic_type="heading"),
+        segment("ctx-000004", "4", target=False),
+        segment("ctx-000005", "5", target=False),
     ]
 
-    zones = build_zones(segments, max_chars=1)
+    zones = build_zones(segments, max_chars=5)
 
-    assert zones[2].context_before_ids == ["seg-000001", "seg-000002"]
-    assert zones[2].context_after_ids == ["seg-000004", "seg-000005"]
+    assert zones[0].context_before_ids == ["ctx-000001", "ctx-000002"]
+    assert zones[0].context_after_ids == ["ctx-000004", "ctx-000005"]
+
+
+def test_zone_character_bound_includes_neighbor_context() -> None:
+    segments = [
+        segment(f"seg-{index:06d}", "X" * 4, semantic_type="heading")
+        for index in range(1, 5)
+    ]
+
+    zones = build_zones(segments, max_chars=8)
+    by_id = {item.id: item for item in segments}
+
+    assert all(
+        sum(
+            len(by_id[segment_id].source_text)
+            for segment_id in (
+                zone.context_before_ids + zone.target_ids + zone.context_after_ids
+            )
+        )
+        <= 8
+        for zone in zones
+    )
+
+
+def test_zone_keeps_each_table_row_atomic_while_splitting_a_large_table() -> None:
+    segments = [
+        segment("seg-000001", "A" * 3, semantic_type="table_header:row:000001"),
+        segment("seg-000002", "B" * 3, semantic_type="table_cell:row:000001"),
+        segment("seg-000003", "C" * 3, semantic_type="table_header:row:000002"),
+        segment("seg-000004", "D" * 3, semantic_type="table_cell:row:000002"),
+    ]
+
+    zones = build_zones(segments, max_chars=6)
+
+    assert [zone.target_ids for zone in zones] == [
+        ["seg-000001", "seg-000002"],
+        ["seg-000003", "seg-000004"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("segments", "message"),
+    [
+        ([segment("seg-000001", "X" * 7)], "seg-000001"),
+        (
+            [
+                segment("seg-000001", "A" * 4, semantic_type="table_header:row:000001"),
+                segment("seg-000002", "B" * 4, semantic_type="table_cell:row:000001"),
+            ],
+            "table row",
+        ),
+    ],
+)
+def test_zone_rejects_an_indivisible_item_larger_than_the_hard_bound(
+    segments: list[Segment], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_zones(segments, max_chars=6)
 
 
 def test_zone_partition_contains_only_every_target_once() -> None:

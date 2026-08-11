@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import ipaddress
 import posixpath
 import re
 import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import urldefrag, urljoin
+from urllib.parse import unquote_to_bytes, urldefrag, urljoin
 
 import httpx
 import httpcore
@@ -24,11 +28,94 @@ MAX_REDIRECTS = 5
 MAX_HTML_BYTES = 10 * 1024 * 1024
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_CSS_IMPORT_DEPTH = 5
+MAX_DATA_CSS_BYTES = 256 * 1024
+MAX_UNIQUE_REQUESTS = 256
+MAX_TOTAL_REDIRECTS = 32
+MAX_TOTAL_DOWNLOADED_BYTES = 128 * 1024 * 1024
+MAX_TOTAL_EMITTED_BYTES = 128 * 1024 * 1024
+MAX_CAPTURE_SECONDS = 120.0
 USER_AGENT = "web-translator/0.1 (+https://github.com/starryeye/web-translator)"
 
 
 class CaptureError(RuntimeError):
     """The source page or a critical offline dependency could not be captured."""
+
+
+class _CaptureBudgetError(CaptureError):
+    """A whole-run capture resource budget was exhausted."""
+
+
+class _CaptureBudget:
+    def __init__(self) -> None:
+        self.deadline = time.monotonic() + MAX_CAPTURE_SECONDS
+        self.request_urls: set[str] = set()
+        self.redirects = 0
+        self.downloaded_bytes = 0
+        self.emitted_bytes = 0
+
+    def check_deadline(self) -> None:
+        if time.monotonic() > self.deadline:
+            raise _CaptureBudgetError("capture resource budget exceeded: deadline")
+
+    def before_request(self, request: httpx.Request) -> None:
+        self.check_deadline()
+        url = str(request.url)
+        if url not in self.request_urls:
+            if len(self.request_urls) >= MAX_UNIQUE_REQUESTS:
+                raise _CaptureBudgetError(
+                    "capture resource budget exceeded: unique requests"
+                )
+            self.request_urls.add(url)
+
+    def after_response(self, response: httpx.Response) -> None:
+        self.check_deadline()
+        if response.has_redirect_location:
+            if self.redirects >= MAX_TOTAL_REDIRECTS:
+                raise _CaptureBudgetError(
+                    "capture resource budget exceeded: redirects"
+                )
+            self.redirects += 1
+            if response.is_stream_consumed:
+                self.add_downloaded(len(response.content))
+            else:
+                response.stream = _BudgetedResponseStream(response.stream, self)
+
+    def add_downloaded(self, size: int) -> None:
+        self.check_deadline()
+        if self.downloaded_bytes + size > MAX_TOTAL_DOWNLOADED_BYTES:
+            raise _CaptureBudgetError(
+                "capture resource budget exceeded: downloaded bytes"
+            )
+        self.downloaded_bytes += size
+
+    def add_emitted(self, size: int) -> None:
+        self.check_deadline()
+        if self.emitted_bytes + size > MAX_TOTAL_EMITTED_BYTES:
+            raise _CaptureBudgetError(
+                "capture resource budget exceeded: emitted bytes"
+            )
+        self.emitted_bytes += size
+
+    def request_timeout(self) -> float:
+        self.check_deadline()
+        remaining = self.deadline - time.monotonic()
+        return min(30.0, max(0.001, remaining))
+
+
+class _BudgetedResponseStream(httpx.SyncByteStream):
+    def __init__(
+        self, stream: httpx.SyncByteStream, budget: _CaptureBudget
+    ) -> None:
+        self.stream = stream
+        self.budget = budget
+
+    def __iter__(self):
+        for chunk in self.stream:
+            self.budget.add_downloaded(len(chunk))
+            yield chunk
+
+    def close(self) -> None:
+        self.stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +148,11 @@ def capture_page(
     source_path = run_dir / "source.html"
     if source_path.exists():
         raise CaptureError(f"capture target already exists: {source_path}")
-    hooks = {"request": [_validate_network_boundary]}
+    budget = _CaptureBudget()
+    hooks = {
+        "request": [_validate_network_boundary, budget.before_request],
+        "response": [budget.after_response],
+    }
     selected_transport = transport if transport is not None else _PinnedHTTPTransport()
     with httpx.Client(
         follow_redirects=True,
@@ -72,7 +163,7 @@ def capture_page(
         headers={"user-agent": USER_AGENT, "accept-encoding": "identity"},
         event_hooks=hooks,
     ) as client:
-        capture = _Capture(client, run_dir)
+        capture = _Capture(client, run_dir, budget)
         response, html_bytes = capture.fetch(str(requested), MAX_HTML_BYTES, "HTML document")
         media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
         if media_type != "text/html":
@@ -87,6 +178,7 @@ def capture_page(
         _validate_supported_html(source_text)
         rendered = capture.rewrite_html(source_text, final_url)
         rendered_bytes = rendered.encode("utf-8")
+        budget.add_emitted(len(rendered_bytes))
         try:
             atomic_write(source_path, rendered_bytes)
         except FileExistsError as error:
@@ -106,9 +198,12 @@ def capture_page(
 
 
 class _Capture:
-    def __init__(self, client: httpx.Client, run_dir: Path) -> None:
+    def __init__(
+        self, client: httpx.Client, run_dir: Path, budget: _CaptureBudget
+    ) -> None:
         self.client = client
         self.run_dir = run_dir
+        self.budget = budget
         self.asset_map: dict[str, str] = {}
         self.fingerprints: dict[str, str] = {}
         self.missing_optional_assets: set[str] = set()
@@ -119,9 +214,11 @@ class _Capture:
 
     def fetch(self, url: str, limit: int, label: str) -> tuple[httpx.Response, bytes]:
         try:
-            with self.client.stream("GET", url) as response:
+            with self.client.stream(
+                "GET", url, timeout=self.budget.request_timeout()
+            ) as response:
                 response.raise_for_status()
-                return response, _read_limited(response, limit, label)
+                return response, _read_limited(response, limit, label, self.budget)
         except CaptureError:
             raise
         except (httpx.HTTPError, OSError) as error:
@@ -133,7 +230,12 @@ class _Capture:
         try:
             for redirect_count in range(MAX_REDIRECTS + 1):
                 visited.add(current)
-                with self.client.stream("GET", current, follow_redirects=False) as response:
+                with self.client.stream(
+                    "GET",
+                    current,
+                    follow_redirects=False,
+                    timeout=self.budget.request_timeout(),
+                ) as response:
                     if response.has_redirect_location:
                         if redirect_count == MAX_REDIRECTS:
                             raise CaptureError(f"asset redirect limit exceeded: {url}")
@@ -153,7 +255,9 @@ class _Capture:
                         current = normalized_destination
                         continue
                     response.raise_for_status()
-                    content = _read_limited(response, MAX_ASSET_BYTES, f"asset {url}")
+                    content = _read_limited(
+                        response, MAX_ASSET_BYTES, f"asset {url}", self.budget
+                    )
                     return response, content, None
         except CaptureError:
             raise
@@ -170,10 +274,15 @@ class _Capture:
 
         for link in soup.find_all("link", href=True):
             rel = {str(value).lower() for value in link.get("rel", [])}
-            absolute = self._absolute_reference(base_url, str(link["href"]))
             if "stylesheet" in rel:
-                link["href"] = self.capture_asset(absolute, critical=True, css_depth=0)
+                link["href"] = self.capture_asset(
+                    str(link["href"]),
+                    critical=True,
+                    css_depth=0,
+                    base_url=base_url,
+                )
             elif rel & {"icon", "apple-touch-icon", "mask-icon"}:
+                absolute = self._absolute_reference(base_url, str(link["href"]))
                 link["href"] = self.capture_asset(absolute, critical=False, expected_kind="image")
 
         for tag in soup.find_all(["img", "source"]):
@@ -207,11 +316,21 @@ class _Capture:
         critical: bool,
         css_depth: int | None = None,
         expected_kind: str = "asset",
+        base_url: str | None = None,
     ) -> str:
-        if _is_non_network_reference(reference):
+        stripped = reference.strip()
+        if critical and css_depth is not None and stripped.lower().startswith("data:"):
+            return self._capture_data_stylesheet(stripped, base_url, css_depth)
+        if critical and css_depth is not None and _is_non_network_reference(stripped):
+            raise CaptureError(
+                f"critical stylesheet uses unsupported non-network reference: {reference}"
+            )
+        if _is_non_network_reference(stripped):
             return reference
         if css_depth is not None and css_depth > MAX_CSS_IMPORT_DEPTH:
             raise CaptureError(f"critical stylesheet exceeds import depth {MAX_CSS_IMPORT_DEPTH}: {reference}")
+        if base_url is not None:
+            reference = self._absolute_reference(base_url, reference)
         try:
             fetch_url, fragment = urldefrag(reference)
             validated = validate_public_url(fetch_url)
@@ -262,6 +381,7 @@ class _Capture:
                 css = self.rewrite_css(css, final_asset_url, local_path, css_depth)
                 content = css.encode("utf-8")
             destination = self.run_dir / Path(local_path)
+            self.budget.add_emitted(len(content))
             atomic_write(destination, content)
             self.fingerprints[local_path] = sha256_bytes(content)
             self._complete_assets.update(aliases)
@@ -270,11 +390,51 @@ class _Capture:
         except (CaptureError, OSError) as error:
             for alias in aliases:
                 self.asset_map.pop(alias, None)
+            if isinstance(error, _CaptureBudgetError):
+                raise
             if critical:
                 raise CaptureError(f"critical stylesheet could not be captured: {normalized}: {error}") from error
             self._failed_assets.update(visited)
             self.missing_optional_assets.add(normalized)
             return reference
+
+    def _capture_data_stylesheet(
+        self, reference: str, base_url: str | None, css_depth: int
+    ) -> str:
+        if css_depth > MAX_CSS_IMPORT_DEPTH:
+            raise CaptureError(
+                f"critical stylesheet exceeds import depth {MAX_CSS_IMPORT_DEPTH}: {reference}"
+            )
+        existing = self.asset_map.get(reference)
+        if existing is not None:
+            self._classify_asset(existing, True)
+            return existing
+        content = _decode_data_stylesheet(reference)
+        digest = hashlib.sha256(reference.encode("utf-8")).hexdigest()[:16]
+        local_path = f"assets/{digest}.css"
+        self.asset_map[reference] = local_path
+        try:
+            try:
+                css = content.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise CaptureError(
+                    "critical data stylesheet is not valid UTF-8"
+                ) from error
+            rewritten = self.rewrite_css(
+                css,
+                base_url or reference,
+                local_path,
+                css_depth,
+            ).encode("utf-8")
+            self.budget.add_emitted(len(rewritten))
+            atomic_write(self.run_dir / Path(local_path), rewritten)
+            self.fingerprints[local_path] = sha256_bytes(rewritten)
+            self._complete_assets.add(reference)
+            self._classify_asset(local_path, True)
+            return local_path
+        except (CaptureError, OSError):
+            self.asset_map.pop(reference, None)
+            raise
 
     def _classify_asset(self, local_path: str, critical: bool) -> None:
         if critical:
@@ -353,8 +513,12 @@ class _Capture:
             if import_url is None:
                 rendered.append(self._render_component(token, base_url, css_local_path, depth))
                 continue
-            absolute = self._absolute_reference(base_url, import_url)
-            local = self.capture_asset(absolute, critical=True, css_depth=depth + 1)
+            local = self.capture_asset(
+                import_url,
+                critical=True,
+                css_depth=depth + 1,
+                base_url=base_url,
+            )
             rendered.append(f'url("{_css_escape(self._css_relative(css_local_path, local))}")')
             replaced = True
         return "".join(rendered)
@@ -496,7 +660,12 @@ def _major_minor(version: str) -> tuple[int, int]:
         raise RuntimeError(f"invalid dependency version: {version}") from error
 
 
-def _read_limited(response: httpx.Response, limit: int, label: str) -> bytes:
+def _read_limited(
+    response: httpx.Response,
+    limit: int,
+    label: str,
+    budget: _CaptureBudget,
+) -> bytes:
     content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
     if content_encoding not in {"", "identity"}:
         raise CaptureError(f"{label} returned unsupported Content-Encoding: {content_encoding}")
@@ -513,8 +682,54 @@ def _read_limited(response: httpx.Response, limit: int, label: str) -> bytes:
         size += len(chunk)
         if size > limit:
             raise CaptureError(f"{label} exceeds the {limit}-byte size limit")
+        budget.add_downloaded(len(chunk))
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _decode_data_stylesheet(reference: str) -> bytes:
+    if len(reference.encode("utf-8")) > MAX_DATA_CSS_BYTES:
+        raise CaptureError(
+            f"critical data stylesheet exceeds the {MAX_DATA_CSS_BYTES}-byte size limit"
+        )
+    header, separator, payload = reference.partition(",")
+    if not separator:
+        raise CaptureError("critical stylesheet data URI is malformed")
+    if not reference.startswith("data:"):
+        raise CaptureError("critical stylesheet data URI must use canonical data: syntax")
+    metadata = header[5:].split(";")
+    if not metadata or metadata[0] != "text/css":
+        raise CaptureError("critical stylesheet data URI must use text/css")
+    charset = "utf-8"
+    options = metadata[1:]
+    is_base64 = bool(options and options[-1] == "base64")
+    if is_base64:
+        options = options[:-1]
+    if options not in ([], ["charset=utf-8"], ["charset=us-ascii"]):
+        raise CaptureError("critical stylesheet data URI has unsupported parameters")
+    if options:
+        charset = options[0].partition("=")[2]
+    if re.search(r"%(?![0-9a-fA-F]{2})", payload):
+        raise CaptureError("critical stylesheet data URI has malformed percent encoding")
+    encoded = unquote_to_bytes(payload)
+    if is_base64:
+        try:
+            encoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise CaptureError("critical stylesheet data URI has malformed base64") from error
+    if len(encoded) > MAX_DATA_CSS_BYTES:
+        raise CaptureError(
+            f"critical data stylesheet exceeds the {MAX_DATA_CSS_BYTES}-byte size limit"
+        )
+    try:
+        text = encoded.decode(charset)
+    except (LookupError, UnicodeDecodeError) as error:
+        raise CaptureError(
+            f"critical stylesheet data URI cannot be decoded as {charset}"
+        ) from error
+    if not text:
+        raise CaptureError("critical stylesheet data URI is empty")
+    return text.encode("utf-8")
 
 
 def _parse_srcset(value: str) -> list[tuple[str, str]]:

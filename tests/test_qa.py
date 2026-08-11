@@ -5,6 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
 
+import pytest
+
 from web_translator.models import (
     Finding,
     MasterReview,
@@ -25,6 +27,7 @@ def _write_pages(
     source_body: str = '<main><p data-wt-segment="a">Hello</p></main>',
     output_body: str = "<main><p>안녕하세요</p></main>",
     head: str = "",
+    output_head: str | None = None,
 ) -> tuple[Path, Path]:
     work = root / "작업 공간"
     output = root / "번역 결과"
@@ -37,7 +40,7 @@ def _write_pages(
         encoding="utf-8",
     )
     index.write_text(
-        f"<!doctype html><html><head>{head}</head><body>{output_body}"
+        f"<!doctype html><html><head>{head if output_head is None else output_head}</head><body>{output_body}"
         '<footer data-wt-attribution="source">source</footer></body></html>',
         encoding="utf-8",
     )
@@ -105,6 +108,170 @@ def test_qa_detects_changed_protected_token_multiset_and_leaked_placeholder(
         "changed_segments": ["a"],
         "leaked_placeholders": [TOKEN],
     }
+
+
+def test_location_tokens_are_transparent_metadata_but_keep_placeholder_integrity(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" placeholder="Enter token"></main>'
+        ),
+        output_body='<main><input placeholder="토큰 입력"></main>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [
+                    ProtectedToken(
+                        TOKEN,
+                        "location",
+                        "<!--wt-location:attribute:placeholder-->",
+                    )
+                ]
+            },
+            translated_texts={"a": f"{TOKEN}토큰 입력"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
+def test_location_aware_attribute_protected_values_are_checked_in_attributes(
+    tmp_path: Path,
+) -> None:
+    identifier_token = TOKEN.replace("000000", "000001")
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" placeholder="OAuth token"></main>'
+        ),
+        output_body='<main><input placeholder="OAuth 토큰"></main>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [
+                    ProtectedToken(
+                        TOKEN,
+                        "location",
+                        "<!--wt-location:attribute:placeholder-->",
+                    ),
+                    ProtectedToken(identifier_token, "identifier", "OAuth"),
+                ]
+            },
+            translated_texts={"a": f"{TOKEN}{identifier_token} 토큰"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
+def test_location_aware_attribute_rejects_changed_protected_values(
+    tmp_path: Path,
+) -> None:
+    identifier_token = TOKEN.replace("000000", "000001")
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" placeholder="OAuth token"></main>'
+        ),
+        output_body='<main><input placeholder="OIDC 토큰"></main>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [
+                    ProtectedToken(
+                        TOKEN,
+                        "location",
+                        "<!--wt-location:attribute:placeholder-->",
+                    ),
+                    ProtectedToken(identifier_token, "identifier", "OAuth"),
+                ]
+            },
+            translated_texts={"a": f"{TOKEN}{identifier_token} 토큰"},
+        )
+    )
+
+    assert [finding.code for finding in result.required_findings] == [
+        "protected-token-integrity"
+    ]
+
+
+def test_protected_token_integrity_locates_marked_title_in_document_head(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body="<main>Body</main>",
+        output_body="<main>본문</main>",
+        head='<title data-wt-segment="a">OAuth Guide</title>',
+        output_head="<title>OAuth 가이드</title>",
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [ProtectedToken(TOKEN, "identifier", "OAuth")]
+            },
+            translated_texts={"a": f"{TOKEN} 가이드"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
+@pytest.mark.parametrize(
+    "source_head",
+    [
+        "<title>OAuth Guide</title>",
+        (
+            '<title data-wt-segment="a">OAuth Guide</title>'
+            '<meta data-wt-segment="a" content="OAuth">'
+        ),
+    ],
+)
+def test_protected_token_integrity_rejects_missing_or_duplicate_source_markers(
+    tmp_path: Path, source_head: str
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body="<main>Body</main>",
+        output_body="<main>본문</main>",
+        head=source_head,
+        output_head="<title>OAuth 가이드</title>",
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [ProtectedToken(TOKEN, "identifier", "OAuth")]
+            },
+            translated_texts={"a": f"{TOKEN} 가이드"},
+        )
+    )
+
+    assert [finding.code for finding in result.required_findings] == [
+        "protected-token-integrity"
+    ]
 
 
 def test_qa_detects_protected_value_changed_after_placeholder_restoration(
@@ -361,6 +528,74 @@ def test_nested_attribution_marker_cannot_hide_a_structural_change(tmp_path: Pat
     ]
 
 
+def test_structural_signature_allows_only_marked_translatable_attribute_values(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" alt="Configure OAuth" '
+            'aria-label="Configuration" aria-description="Security diagram" '
+            'title="Token exchange" placeholder="Enter token" data-state="ready"></main>'
+        ),
+        output_body=(
+            '<main><input alt="OAuth 설정" aria-label="설정" '
+            'aria-description="보안 다이어그램" title="토큰 교환" '
+            'placeholder="토큰 입력" data-state="ready"></main>'
+        ),
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
+@pytest.mark.parametrize(
+    "output_attribute",
+    [
+        'aria-label="설정"',
+        'data-alt="OAuth 설정" aria-label="설정"',
+    ],
+)
+def test_structural_signature_still_requires_translatable_attribute_presence_and_name(
+    tmp_path: Path, output_attribute: str
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" alt="Configure OAuth" '
+            'aria-label="Configuration"></main>'
+        ),
+        output_body=f"<main><input {output_attribute}></main>",
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "structural-signature"
+    ]
+
+
+def test_structural_signature_rejects_nontranslatable_attribute_value_changes(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><input data-wt-segment="a" alt="Configure OAuth" '
+            'data-state="ready"></main>'
+        ),
+        output_body='<main><input alt="OAuth 설정" data-state="changed"></main>',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "structural-signature"
+    ]
+
+
 def test_same_document_path_anchor_is_resolved_and_malformed_href_does_not_crash(
     tmp_path: Path,
 ) -> None:
@@ -527,6 +762,54 @@ def test_malformed_critical_dependency_url_is_a_stable_required_finding(
     }
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "data:text/css,body%7Bcolor%3Ared%7D",
+        "blob:https://example.com/theme",
+        "#theme",
+        "file:///C:/theme.css",
+        "javascript:alert(1)",
+    ],
+)
+def test_qa_fails_closed_for_every_unsupported_critical_stylesheet_scheme(
+    tmp_path: Path, reference: str
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head=f'<link rel="stylesheet" href="{reference}">',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "unsupported-critical-dependency-scheme"
+    ]
+    assert result.required_findings[0].evidence == {"urls": [reference]}
+    assert result.screenshots == []
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["data:text/css,p%7Bcolor%3Ared%7D", "blob:https://example.com/import", "#theme"],
+)
+def test_qa_fails_closed_for_unsupported_critical_css_import_scheme(
+    tmp_path: Path, reference: str
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head=f'<style>@import url("{reference}");</style>',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "unsupported-critical-dependency-scheme"
+    ]
+    assert result.required_findings[0].evidence == {"urls": [reference]}
+    assert result.screenshots == []
+
+
 def test_qa_rejects_asset_path_escape_and_records_optional_missing_asset(
     tmp_path: Path,
 ) -> None:
@@ -620,6 +903,51 @@ def test_browser_qa_uses_two_viewports_and_writes_screenshots_under_work_dir(
             "horizontalOverflow": False,
         },
     }
+
+
+def test_browser_qa_requires_each_critical_stylesheet_to_load_and_be_accessible(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head=(
+            '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
+            'style-src \'none\'">'
+            '<link rel="stylesheet" href="assets/theme.css">'
+        ),
+    )
+    asset = output.parent / "assets" / "theme.css"
+    asset.parent.mkdir()
+    asset.write_bytes(b"body { color: red }")
+
+    result = run_qa(
+        _inputs(source, output, critical_assets=[Path("assets/theme.css")])
+    )
+
+    assert result.passed is False
+    assert [finding.code for finding in result.required_findings] == [
+        "critical-stylesheet-unavailable"
+    ]
+    assert set(result.required_findings[0].evidence["viewports"]) == {
+        "desktop-1440x900",
+        "narrow-390x844",
+    }
+
+
+def test_browser_qa_requires_local_stylesheet_imports_to_load(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head='<style>@import url("assets/missing.css");</style>',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert result.passed is False
+    assert [finding.code for finding in result.required_findings] == [
+        "critical-stylesheet-unavailable"
+    ]
 
 
 def test_browser_setup_failure_is_recorded_instead_of_escaping(tmp_path: Path) -> None:

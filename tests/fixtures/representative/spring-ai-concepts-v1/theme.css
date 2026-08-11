@@ -1,0 +1,5 @@
+body { color: #172033; font: 16px/1.6 sans-serif; margin: auto; max-width: 72rem; }
+main { min-width: 0; padding: 1rem; }
+table { border-collapse: collapse; width: 100%; }
+td, th { border: 1px solid #667085; padding: .4rem; text-align: left; }
+pre { max-width: 100%; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }

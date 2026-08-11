@@ -19,16 +19,52 @@ from playwright.sync_api import Route, WebSocketRoute, sync_playwright
 import tinycss2
 from tinycss2.ast import AtRule, FunctionBlock, StringToken, URLToken
 
+from web_translator.extract import TRANSLATABLE_ATTRIBUTES
 from web_translator.models import Finding, ProtectedToken, QAInputs, QAResult
 
 
 _TOKEN_PATTERN = re.compile(r"⟦WT:\d{6}⟧")
 _VIEWPORTS = (("desktop-1440x900", 1440, 900), ("narrow-390x844", 390, 844))
-_BROWSER_METRICS = """({
-  horizontalOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
-  brokenImages: [...document.images].filter(img => !img.complete || img.naturalWidth === 0).map(img => img.src),
-  clippedText: [...document.querySelectorAll('main *')].filter(el => el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX === 'hidden').length
-})"""
+_BROWSER_METRICS = """(() => {
+  const stylesheetFailures = [];
+  const visited = new Set();
+  function inspectStylesheet(sheet, href) {
+    if (!sheet) {
+      stylesheetFailures.push({href, reason: 'not-loaded'});
+      return;
+    }
+    if (visited.has(sheet)) return;
+    visited.add(sheet);
+    let rules;
+    try {
+      rules = sheet.cssRules;
+    } catch (error) {
+      stylesheetFailures.push({href, reason: 'rules-inaccessible'});
+      return;
+    }
+    for (const rule of rules) {
+      if (rule.type === CSSRule.IMPORT_RULE) {
+        const importedHref = rule.href || href;
+        if (!rule.styleSheet) {
+          stylesheetFailures.push({href: importedHref, reason: 'import-not-loaded'});
+        } else {
+          inspectStylesheet(rule.styleSheet, importedHref);
+        }
+      }
+    }
+  }
+  for (const owner of document.querySelectorAll('link[rel~="stylesheet"], style')) {
+    const href = owner.getAttribute('href') || '<inline-style>';
+    const sheet = [...document.styleSheets].find(item => item.ownerNode === owner);
+    inspectStylesheet(sheet, href);
+  }
+  return {
+    horizontalOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+    brokenImages: [...document.images].filter(img => !img.complete || img.naturalWidth === 0).map(img => img.src),
+    clippedText: [...document.querySelectorAll('main *')].filter(el => el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX === 'hidden').length,
+    stylesheetFailures
+  };
+})()"""
 _URL_ATTRIBUTES = {
     "a": ("href",),
     "audio": ("src",),
@@ -170,20 +206,34 @@ def _check_tokens(
         if text is None or not _has_exact_tokens(text, tokens):
             changed.add(segment_id)
             continue
-        source_element = source_soup.find(attrs={"data-wt-segment": segment_id})
+        source_elements = source_soup.find_all(
+            attrs={"data-wt-segment": segment_id}
+        )
+        if len(source_elements) != 1:
+            changed.add(segment_id)
+            continue
+        source_element = source_elements[0]
         output_element = _corresponding_output_element(
-            source_soup.body, output_soup.body, source_element
+            source_soup.html, output_soup.html, source_element
         )
         if not isinstance(source_element, Tag) or output_element is None:
             changed.add(segment_id)
             continue
-        source_fragment = source_element.decode_contents()
-        output_fragment = output_element.decode_contents()
+        source_fragment = _protected_fragment(source_element, tokens)
+        output_fragment = _protected_fragment(output_element, tokens)
+        if source_fragment is None or output_fragment is None:
+            changed.add(segment_id)
+            continue
         value_expectations: Counter[str] = Counter()
         kinds_by_value: dict[str, set[str]] = {}
         output_expectations: Counter[tuple[str, str, str | None]] = Counter()
+        semantic_text = text
+        guard_tokens = [token for token in tokens if token.kind != "location"]
         for token in tokens:
-            if token.kind == "tag":
+            if token.kind == "location":
+                semantic_text = semantic_text.replace(token.token, "")
+        for token in tokens:
+            if token.kind in {"tag", "location"}:
                 continue
             normalized = _normalized_fragment(token.value)
             if not normalized:
@@ -191,7 +241,9 @@ def _check_tokens(
                 break
             value_expectations[normalized] += 1
             kinds_by_value.setdefault(normalized, set()).add(token.kind)
-            guard = _following_token_guard(text, token.token, tokens)
+            guard = _following_token_guard(
+                semantic_text, token.token, guard_tokens
+            )
             output_expectations[(normalized, token.kind, guard)] += 1
         if segment_id in changed:
             continue
@@ -231,6 +283,29 @@ def _has_exact_tokens(text: str, tokens: Iterable[ProtectedToken]) -> bool:
         return False
     actual = _TOKEN_PATTERN.findall(text)
     return sorted(actual) == sorted(expected) and all(text.count(token) == 1 for token in expected)
+
+
+def _protected_fragment(
+    element: Tag, tokens: Iterable[ProtectedToken]
+) -> str | None:
+    locations = [token.value for token in tokens if token.kind == "location"]
+    if not locations:
+        return element.decode_contents()
+    parts: list[str] = []
+    for marker in locations:
+        if marker == "<!--wt-location:content-->":
+            parts.append(element.decode_contents())
+            continue
+        match = re.fullmatch(
+            r"<!--wt-location:attribute:([a-z][a-z0-9-]*)-->", marker
+        )
+        if match is None or match.group(1) not in TRANSLATABLE_ATTRIBUTES:
+            return None
+        value = element.get(match.group(1))
+        if value is None or isinstance(value, list):
+            return None
+        parts.append(str(value))
+    return "".join(parts)
 
 
 def _normalized_fragment(value: str) -> str:
@@ -311,20 +386,20 @@ def _following_token_guard(
 
 
 def _corresponding_output_element(
-    source_body: Tag | None, output_body: Tag | None, source_element: Tag | None
+    source_root: Tag | None, output_root: Tag | None, source_element: Tag | None
 ) -> Tag | None:
-    if source_body is None or output_body is None or source_element is None:
+    if source_root is None or output_root is None or source_element is None:
         return None
     indices: list[int] = []
     current = source_element
-    while current is not source_body:
+    while current is not source_root:
         parent = current.parent
         if not isinstance(parent, Tag):
             return None
         siblings = [child for child in parent.children if isinstance(child, Tag)]
         indices.append(siblings.index(current))
         current = parent
-    candidate = output_body
+    candidate = output_root
     for index in reversed(indices):
         children = [
             child
@@ -349,8 +424,17 @@ def _check_structure(
             )
         )
         return
-    source_signature = _tag_signature(source.body, ignore_attribution_children=False)
-    output_signature = _tag_signature(output.body, ignore_attribution_children=True)
+    translated_attribute_paths = _marked_translatable_attribute_paths(source.body)
+    source_signature = _tag_signature(
+        source.body,
+        ignore_attribution_children=False,
+        translated_attribute_paths=translated_attribute_paths,
+    )
+    output_signature = _tag_signature(
+        output.body,
+        ignore_attribution_children=True,
+        translated_attribute_paths=translated_attribute_paths,
+    )
     if source_signature != output_signature:
         findings.append(
             _required(
@@ -365,23 +449,69 @@ def _check_structure(
 
 
 def _tag_signature(
-    tag: Tag, *, ignore_attribution_children: bool = False
+    tag: Tag,
+    *,
+    ignore_attribution_children: bool = False,
+    translated_attribute_paths: dict[tuple[int, ...], frozenset[str]] | None = None,
+    path: tuple[int, ...] = (),
 ) -> tuple[object, ...]:
-    children = []
-    for child in tag.children:
-        if not isinstance(child, Tag):
-            continue
-        if ignore_attribution_children and child.has_attr("data-wt-attribution"):
-            continue
-        children.append(_tag_signature(child))
+    child_tags = [
+        child
+        for child in tag.children
+        if isinstance(child, Tag)
+        and not (
+            ignore_attribution_children and child.has_attr("data-wt-attribution")
+        )
+    ]
+    children = [
+        _tag_signature(
+            child,
+            ignore_attribution_children=False,
+            translated_attribute_paths=translated_attribute_paths,
+            path=path + (index,),
+        )
+        for index, child in enumerate(child_tags)
+    ]
+    normalized_names = (
+        translated_attribute_paths.get(path, frozenset())
+        if translated_attribute_paths is not None
+        else frozenset()
+    )
     attributes = tuple(
         sorted(
-            (name.lower(), tuple(value) if isinstance(value, list) else str(value))
+            (
+                name.lower(),
+                "<translated-attribute>"
+                if name.lower() in normalized_names
+                else tuple(value)
+                if isinstance(value, list)
+                else str(value),
+            )
             for name, value in tag.attrs.items()
             if name.lower() != "data-wt-segment"
         )
     )
     return (tag.name.lower(), attributes, tuple(children))
+
+
+def _marked_translatable_attribute_paths(
+    root: Tag,
+) -> dict[tuple[int, ...], frozenset[str]]:
+    paths: dict[tuple[int, ...], frozenset[str]] = {}
+
+    def visit(tag: Tag, path: tuple[int, ...]) -> None:
+        if tag.has_attr("data-wt-segment"):
+            translated = frozenset(
+                name for name in TRANSLATABLE_ATTRIBUTES if tag.has_attr(name)
+            )
+            if translated:
+                paths[path] = translated
+        children = [child for child in tag.children if isinstance(child, Tag)]
+        for index, child in enumerate(children):
+            visit(child, path + (index,))
+
+    visit(root, ())
+    return paths
 
 
 def _check_anchors(
@@ -427,6 +557,7 @@ def _check_external_dependencies(
     optional_urls: set[str] = set()
     invalid_critical_urls: set[str] = set()
     invalid_optional_urls: set[str] = set()
+    unsupported_critical_urls: set[str] = set()
     base_href: str | None = None
     base_tag = soup.find("base", href=True)
     if isinstance(base_tag, Tag):
@@ -451,7 +582,15 @@ def _check_external_dependencies(
                 continue
             values = _srcset_urls(str(raw_value)) if attribute == "srcset" else [str(raw_value)]
             for value in values:
-                resolved, invalid = _resolved_dependency_reference(value, base_href)
+                if classification == "critical":
+                    resolved, invalid, unsupported = _critical_dependency_reference(
+                        value, base_href
+                    )
+                    if unsupported:
+                        unsupported_critical_urls.add(value)
+                        continue
+                else:
+                    resolved, invalid = _resolved_dependency_reference(value, base_href)
                 if invalid:
                     if classification == "critical":
                         invalid_critical_urls.add(value)
@@ -465,15 +604,20 @@ def _check_external_dependencies(
                 else:
                     critical_urls.add(resolved)
     for style in soup.find_all("style"):
-        imported, resources, invalid_imported, invalid_resources = _css_external_urls(
-            style.get_text(), base_href=base_href
-        )
+        (
+            imported,
+            resources,
+            invalid_imported,
+            invalid_resources,
+            unsupported_imported,
+        ) = _css_external_urls(style.get_text(), base_href=base_href)
         critical_urls.update(imported)
         optional_urls.update(resources)
         invalid_critical_urls.update(invalid_imported)
         invalid_optional_urls.update(invalid_resources)
+        unsupported_critical_urls.update(unsupported_imported)
     for tag in soup.find_all(style=True):
-        _, resources, _, invalid_resources = _css_external_urls(
+        _, resources, _, invalid_resources, _ = _css_external_urls(
             str(tag["style"]), declarations=True, base_href=base_href
         )
         optional_urls.update(resources)
@@ -487,11 +631,18 @@ def _check_external_dependencies(
             css = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        imported, resources, invalid_imported, invalid_resources = _css_external_urls(css)
+        (
+            imported,
+            resources,
+            invalid_imported,
+            invalid_resources,
+            unsupported_imported,
+        ) = _css_external_urls(css)
         critical_urls.update(imported)
         optional_urls.update(resources)
         invalid_critical_urls.update(invalid_imported)
         invalid_optional_urls.update(invalid_resources)
+        unsupported_critical_urls.update(unsupported_imported)
     if critical_urls:
         required.append(
             _required(
@@ -506,6 +657,14 @@ def _check_external_dependencies(
                 "invalid-critical-dependency-url",
                 "A critical dependency contains a malformed URL.",
                 {"urls": sorted(invalid_critical_urls)},
+            )
+        )
+    if unsupported_critical_urls:
+        required.append(
+            _required(
+                "unsupported-critical-dependency-scheme",
+                "A critical dependency uses a scheme that cannot be loaded offline.",
+                {"urls": sorted(unsupported_critical_urls)},
             )
         )
     if optional_urls:
@@ -532,11 +691,12 @@ def _srcset_urls(value: str) -> list[str]:
 
 def _css_external_urls(
     css: str, *, declarations: bool = False, base_href: str | None = None
-) -> tuple[set[str], set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
     imported: set[str] = set()
     resources: set[str] = set()
     invalid_imported: set[str] = set()
     invalid_resources: set[str] = set()
+    unsupported_imported: set[str] = set()
     nodes = (
         tinycss2.parse_declaration_list(css, skip_comments=True, skip_whitespace=True)
         if declarations
@@ -548,9 +708,13 @@ def _css_external_urls(
                 value = _css_url_value(token, allow_string=True)
                 if value is None:
                     continue
-                resolved, invalid = _resolved_dependency_reference(value, base_href)
+                resolved, invalid, unsupported = _critical_dependency_reference(
+                    value, base_href
+                )
                 if invalid:
                     invalid_imported.add(value)
+                elif unsupported:
+                    unsupported_imported.add(value)
                 elif resolved is not None:
                     imported.add(resolved)
                 break
@@ -565,7 +729,13 @@ def _css_external_urls(
                 urls, invalid = _external_component_urls(tokens, base_href)
                 resources.update(urls)
                 invalid_resources.update(invalid)
-    return imported, resources, invalid_imported, invalid_resources
+    return (
+        imported,
+        resources,
+        invalid_imported,
+        invalid_resources,
+        unsupported_imported,
+    )
 
 
 def _external_component_urls(
@@ -639,6 +809,31 @@ def _resolved_dependency_reference(
     except ValueError:
         return None, True
     return (resolved, False) if _is_external_reference(resolved) else (None, False)
+
+
+def _critical_dependency_reference(
+    value: str, base_href: str | None
+) -> tuple[str | None, bool, bool]:
+    parsed = _safe_urlsplit(value)
+    if parsed is None:
+        return None, True, False
+    if parsed.scheme.lower() in {"http", "https"} or (
+        not parsed.scheme and parsed.netloc
+    ):
+        return value, False, False
+    if parsed.scheme or parsed.netloc or value.startswith("#"):
+        return None, False, True
+    if base_href is None:
+        return None, False, False
+    try:
+        resolved = urljoin(base_href, value)
+    except ValueError:
+        return None, True, False
+    return (
+        (resolved, False, False)
+        if _is_external_reference(resolved)
+        else (None, False, False)
+    )
 
 
 def _link_dependency_class(tag: Tag) -> str | None:
@@ -763,6 +958,7 @@ def _run_browser_checks(
     warnings: list[Finding] = []
     screenshots: list[Path] = []
     metrics: dict[str, dict[str, object]] = {}
+    stylesheet_failures: dict[str, list[dict[str, str]]] = {}
     blocked: dict[str, set[str]] = {}
     server: _LoopbackServer | None = None
     try:
@@ -802,11 +998,58 @@ def _run_browser_checks(
                     context.route("**/*", guard)
                     page = context.new_page()
                     try:
+                        stylesheet_network_failures: list[dict[str, str]] = []
+
+                        def observe_response(response: Any) -> None:
+                            if (
+                                response.request.resource_type == "stylesheet"
+                                and not response.ok
+                            ):
+                                stylesheet_network_failures.append(
+                                    {
+                                        "href": response.url,
+                                        "reason": f"http-{response.status}",
+                                    }
+                                )
+
+                        def observe_request_failure(request: Any) -> None:
+                            if request.resource_type == "stylesheet":
+                                stylesheet_network_failures.append(
+                                    {
+                                        "href": request.url,
+                                        "reason": str(request.failure or "request-failed"),
+                                    }
+                                )
+
+                        page.on("response", observe_response)
+                        page.on("requestfailed", observe_request_failure)
                         response = page.goto(server.url, wait_until="networkidle", timeout=15_000)
                         if response is None or not response.ok:
                             status = None if response is None else response.status
                             raise RuntimeError(f"loopback page returned status {status}")
                         observed = page.evaluate(_BROWSER_METRICS)
+                        viewport_stylesheet_failures = [
+                            {
+                                "href": str(item["href"]),
+                                "reason": str(item["reason"]),
+                            }
+                            for item in observed["stylesheetFailures"]
+                        ]
+                        viewport_stylesheet_failures.extend(
+                            stylesheet_network_failures
+                        )
+                        if viewport_stylesheet_failures:
+                            unique_stylesheet_failures = sorted(
+                                {
+                                    (item["href"], item["reason"])
+                                    for item in viewport_stylesheet_failures
+                                },
+                                key=lambda item: item,
+                            )
+                            stylesheet_failures[label] = [
+                                {"href": href, "reason": reason}
+                                for href, reason in unique_stylesheet_failures
+                            ]
                         normalized = {
                             "brokenImages": sorted(str(item) for item in observed["brokenImages"]),
                             "clippedText": int(observed["clippedText"]),
@@ -872,6 +1115,14 @@ def _run_browser_checks(
                 "viewport-broken-images",
                 "One or more optional images did not render offline.",
                 {"viewports": broken},
+            )
+        )
+    if stylesheet_failures:
+        required.append(
+            _required(
+                "critical-stylesheet-unavailable",
+                "One or more critical stylesheets did not load or expose accessible rules.",
+                {"viewports": stylesheet_failures},
             )
         )
 

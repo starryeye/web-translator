@@ -1,0 +1,11 @@
+[
+  {"contains": "RFC 8693 OAuth 2.0 Token Exchange", "translation": "RFC 8693 OAuth 2.0 Token Exchange"},
+  {"contains": "allows a client", "translation": "Token Exchange를 사용하면 클라이언트가 Security Token Service에 보안 토큰을 요청할 수 있습니다."},
+  {"contains": "Token Exchange Request", "translation": "2. Token Exchange 요청"},
+  {"contains": "authenticate when required", "translation": "권한 부여 서버가 요구할 때 클라이언트는 {protected_0} 인증해야 합니다."},
+  {"contains": "Parameter", "translation": "매개변수"},
+  {"contains": "Meaning", "translation": "의미"},
+  {"contains": "subject_token", "translation": "subject_token"},
+  {"contains": "represented subject", "translation": "표현되는 주체를 식별합니다."},
+  {"contains": "defines the request", "translation": "{protected_0}Section 2{protected_1}에서는 요청과 그 보안 요구사항을 정의합니다."}
+]

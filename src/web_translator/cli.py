@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -12,17 +15,25 @@ import re
 import sys
 import tempfile
 from typing import Any
+from urllib.parse import unquote_to_bytes
 
+from langdetect import DetectorFactory, PROFILES_DIRECTORY
+from langdetect.lang_detect_exception import LangDetectException
+
+from web_translator import __version__
 from web_translator.assemble import AssemblyError, assemble_page
 from web_translator.assets import atomic_write
-from web_translator.capture import CaptureError, capture_page
+from web_translator.capture import MAX_DATA_CSS_BYTES, CaptureError, capture_page
 from web_translator.extract import ExtractionError, extract_segments
 from web_translator.models import (
     MasterReview,
+    ManifestAsset,
+    ManifestProvenance,
     QAInputs,
     QAResult,
     Segment,
     SegmentContractError,
+    SemanticReviewFinding,
     read_segments,
 )
 from web_translator.paths import validate_public_url
@@ -39,6 +50,29 @@ EXIT_ASSEMBLY_FAILURE = 5
 EXIT_QA_FAILURE = 6
 _REPARSE_POINT = 0x400
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_UTC_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_CAPTURE_FIELDS = {
+    "asset_map",
+    "captured_at",
+    "critical_assets",
+    "final_url",
+    "fingerprints",
+    "missing_optional_assets",
+    "optional_assets",
+    "requested_url",
+}
+_REVIEW_DIMENSIONS = (
+    "semantic_fidelity",
+    "qualification_preservation",
+    "naturalness",
+    "terminology",
+    "boundary_consistency",
+    "protected_content",
+)
+_REVIEW_FINDING_FIELDS = {"dimension", "verdict", "evidence"}
+_TARGET_LANGUAGE = "ko"
+_TERMINOLOGY_POLICY_ID = "english-technical-first-use-ko-gloss"
+_TERMINOLOGY_POLICY_VERSION = "1.0"
 
 
 class CLIContractError(ValueError):
@@ -167,6 +201,7 @@ def _capture_command(args: argparse.Namespace) -> None:
     result = capture_page(url, args.run_dir)
     payload = {
         "asset_map": result.asset_map,
+        "captured_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "critical_assets": result.critical_assets,
         "final_url": result.final_url,
         "fingerprints": result.fingerprints,
@@ -304,7 +339,15 @@ def _qa_command(args: argparse.Namespace) -> None:
             capture_metadata=dict(capture),
         )
     )
-    _publish_qa_evidence(result, review, args.output_dir)
+    provenance = _build_manifest_provenance(
+        result=result,
+        capture=capture,
+        segments=segments,
+        zones=zones,
+        translated_segment_ids=set(translations),
+        review=review,
+    )
+    _publish_qa_evidence(result, review, args.output_dir, provenance)
     if not result.passed:
         codes = ", ".join(finding.code for finding in result.required_findings)
         raise QAFailure(f"required QA checks failed: {codes or 'unknown finding'}")
@@ -362,6 +405,15 @@ def _read_zones(run_dir: Path) -> list[Zone]:
 def _read_capture(run_dir: Path) -> dict[str, Any]:
     path = run_dir / "capture.json"
     data = _read_json_object(path)
+    if set(data) != _CAPTURE_FIELDS:
+        raise CLIContractError(f"capture metadata fields must be exactly {sorted(_CAPTURE_FIELDS)}: {path}")
+    captured_at = _string(data, "captured_at", path)
+    if _UTC_TIMESTAMP_PATTERN.fullmatch(captured_at) is None:
+        raise CLIContractError(f"capture timestamp must be ISO-8601 UTC seconds ending in Z: {path}")
+    try:
+        datetime.fromisoformat(captured_at.removesuffix("Z") + "+00:00")
+    except ValueError as error:
+        raise CLIContractError(f"capture timestamp must be valid ISO-8601 UTC: {path}") from error
     requested_url = _string(data, "requested_url", path)
     final_url = _string(data, "final_url", path)
     try:
@@ -371,12 +423,7 @@ def _read_capture(run_dir: Path) -> dict[str, Any]:
         raise CLIContractError(f"invalid capture metadata {path}: {error}") from error
     asset_map = _string_mapping(data, "asset_map", path)
     for asset_url, local_path in asset_map.items():
-        try:
-            validate_public_url(asset_url)
-        except ValueError as error:
-            raise CLIContractError(
-                f"capture asset URL must be public HTTP(S): {asset_url}"
-            ) from error
+        _validate_capture_asset_url(asset_url)
         _validate_asset_path(local_path, path)
     asset_paths = set(asset_map.values())
     critical_assets = _string_list(data, "critical_assets", path)
@@ -404,12 +451,68 @@ def _read_capture(run_dir: Path) -> dict[str, Any]:
     return {
         "asset_map": asset_map,
         "critical_assets": critical_assets,
+        "captured_at": captured_at,
         "final_url": final_url,
         "fingerprints": fingerprints,
         "missing_optional_assets": _string_list(data, "missing_optional_assets", path),
         "optional_assets": optional_assets,
         "requested_url": requested_url,
     }
+
+
+def _validate_capture_asset_url(asset_url: str) -> None:
+    """Accept public HTTP(S), or a narrowly-defined, bounded CSS data URL."""
+    if not asset_url.startswith("data:"):
+        try:
+            validate_public_url(asset_url)
+        except ValueError as error:
+            raise CLIContractError(
+                f"capture asset URL must be public HTTP(S) or strict data:text/css: {asset_url}"
+            ) from error
+        return
+
+    if len(asset_url.encode("utf-8")) > MAX_DATA_CSS_BYTES:
+        raise CLIContractError(
+            f"capture asset URL exceeds the capture size limit: {asset_url[:80]}"
+        )
+
+    try:
+        metadata, encoded = asset_url[5:].split(",", 1)
+    except ValueError as error:
+        raise CLIContractError(
+            f"capture asset URL must be strict data:text/css: {asset_url}"
+        ) from error
+    parameters = metadata.split(";")
+    if not parameters or parameters[0] != "text/css":
+        raise CLIContractError(
+            f"capture asset URL must be strict data:text/css: {asset_url}"
+        )
+    options = parameters[1:]
+    base64_encoded = bool(options and options[-1] == "base64")
+    if base64_encoded:
+        options = options[:-1]
+    if options not in ([], ["charset=utf-8"], ["charset=us-ascii"]):
+        raise CLIContractError(
+            f"capture asset URL must be strict data:text/css: {asset_url}"
+        )
+    charset = options[0].partition("=")[2] if options else "utf-8"
+    try:
+        if re.search(r"%(?![0-9A-Fa-f]{2})", encoded):
+            raise ValueError("invalid percent escape")
+        payload = unquote_to_bytes(encoded)
+        if base64_encoded:
+            payload = base64.b64decode(payload, validate=True)
+        decoded = payload.decode(charset)
+        if not decoded:
+            raise ValueError("empty CSS payload")
+    except (binascii.Error, UnicodeDecodeError, ValueError) as error:
+        raise CLIContractError(
+            f"capture asset URL must be strict data:text/css: {asset_url}"
+        ) from error
+    if len(payload) > MAX_DATA_CSS_BYTES:
+        raise CLIContractError(
+            f"capture asset URL exceeds the capture size limit: {asset_url[:80]}"
+        )
 
 
 def _read_glossary(path: Path) -> dict[str, str]:
@@ -419,10 +522,118 @@ def _read_glossary(path: Path) -> dict[str, str]:
     return dict(data)  # type: ignore[return-value]
 
 
+def _build_manifest_provenance(
+    *,
+    result: QAResult,
+    capture: Mapping[str, object],
+    segments: Sequence[Segment],
+    zones: Sequence[Zone],
+    translated_segment_ids: set[str],
+    review: MasterReview,
+) -> ManifestProvenance:
+    """Cross-check persisted artifacts before emitting typed manifest provenance."""
+    captured_at = capture.get("captured_at")
+    if not isinstance(captured_at, str) or not captured_at.endswith("Z"):
+        raise CLIContractError("capture timestamp must be an ISO-8601 UTC value ending in Z")
+    try:
+        parsed_time = datetime.fromisoformat(captured_at.removesuffix("Z") + "+00:00")
+    except ValueError as error:
+        raise CLIContractError("capture timestamp must be valid ISO-8601 UTC") from error
+    if parsed_time.utcoffset() != UTC.utcoffset(parsed_time):
+        raise CLIContractError("capture timestamp must be UTC")
+
+    requested_url = capture.get("requested_url")
+    final_url = capture.get("final_url")
+    if not isinstance(requested_url, str) or not isinstance(final_url, str):
+        raise CLIContractError("capture provenance URLs must be strings")
+    if final_url != result.source_url:
+        raise CLIContractError("manifest final URL must match QA source URL")
+
+    target_ids = {segment.id for segment in segments if segment.target}
+    zone_target_ids = [segment_id for zone in zones for segment_id in zone.target_ids]
+    if len(zone_target_ids) != len(set(zone_target_ids)) or set(zone_target_ids) != target_ids:
+        raise CLIContractError("manifest zone coverage must exactly cover target segments once")
+    if translated_segment_ids != target_ids:
+        raise CLIContractError("manifest translation coverage must exactly cover target segments")
+    if set(review.retries) != {zone.id for zone in zones}:
+        raise CLIContractError("manifest retries must exactly cover zones")
+
+    asset_map = capture.get("asset_map")
+    fingerprints = capture.get("fingerprints")
+    critical_assets = capture.get("critical_assets")
+    optional_assets = capture.get("optional_assets")
+    missing_optional = capture.get("missing_optional_assets")
+    if not isinstance(asset_map, Mapping) or not isinstance(fingerprints, Mapping):
+        raise CLIContractError("manifest asset provenance must be mappings")
+    if not isinstance(critical_assets, list) or not isinstance(optional_assets, list):
+        raise CLIContractError("manifest asset classifications must be arrays")
+    if not isinstance(missing_optional, list) or any(
+        not isinstance(item, str) for item in missing_optional
+    ):
+        raise CLIContractError("manifest missing optional assets must be a string array")
+    critical_set = set(critical_assets)
+    optional_set = set(optional_assets)
+    if critical_set & optional_set or critical_set | optional_set != set(asset_map.values()):
+        raise CLIContractError("manifest asset classifications must exactly cover assets")
+    assets: list[ManifestAsset] = []
+    for source, local_path in sorted(asset_map.items()):
+        if not isinstance(source, str) or not isinstance(local_path, str):
+            raise CLIContractError("manifest asset provenance keys and paths must be strings")
+        digest = fingerprints.get(local_path)
+        if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+            raise CLIContractError("manifest asset fingerprint is missing or invalid")
+        assets.append(
+            ManifestAsset(
+                source=source,
+                local_path=local_path,
+                sha256=digest,
+                classification="critical" if local_path in critical_set else "optional",
+            )
+        )
+
+    return ManifestProvenance(
+        captured_at=captured_at,
+        requested_url=requested_url,
+        final_url=final_url,
+        source_language=_detect_source_language(segments),
+        target_language=_TARGET_LANGUAGE,
+        terminology_policy_id=_TERMINOLOGY_POLICY_ID,
+        terminology_policy_version=_TERMINOLOGY_POLICY_VERSION,
+        tool_version=__version__,
+        segment_count=len(segments),
+        target_segment_count=len(target_ids),
+        translated_segment_count=len(translated_segment_ids),
+        zone_count=len(zones),
+        assets=assets,
+        missing_optional_assets=list(missing_optional),
+        retries=dict(sorted(review.retries.items())),
+    )
+
+
+def _detect_source_language(segments: Sequence[Segment]) -> str:
+    """Detect source language deterministically without mutating langdetect globals."""
+    text = "\n".join(segment.source_text for segment in segments if segment.target)
+    text = text[:100_000]
+    if not text.strip() or re.search(r"[^\W\d_]", text, flags=re.UNICODE) is None:
+        return "und"
+    try:
+        factory = DetectorFactory()
+        factory.load_profile(PROFILES_DIRECTORY)
+        factory.set_seed(0)
+        detector = factory.create()
+        detector.append(text)
+        return detector.detect()
+    except (LangDetectException, OSError, UnicodeError):
+        return "und"
+
+
 def _read_review(path: Path, zones: Sequence[Zone]) -> MasterReview:
     data = _read_json_object(path)
+    if set(data) != {"unresolved_required", "retries", "section_findings"}:
+        raise CLIContractError(f"review fields must be exactly unresolved_required, retries, section_findings: {path}")
     retries_raw = _mapping(data, "retries", path)
     findings_raw = _mapping(data, "section_findings", path)
+    zone_ids = {zone.id for zone in zones}
     retries: dict[str, int] = {}
     for key, value in retries_raw.items():
         if not isinstance(key, str) or type(value) is not int or not 0 <= value <= 2:
@@ -430,31 +641,83 @@ def _read_review(path: Path, zones: Sequence[Zone]) -> MasterReview:
                 f"review retries must map strings to integers from 0 through 2: {path}"
             )
         retries[key] = value
-    section_findings: dict[str, list[str]] = {}
-    for key, value in findings_raw.items():
-        if (
-            not isinstance(key, str)
-            or not isinstance(value, list)
-            or any(not isinstance(item, str) for item in value)
-        ):
-            raise CLIContractError(
-                f"review section findings must map strings to string arrays: {path}"
-            )
-        section_findings[key] = list(value)
-    zone_ids = {zone.id for zone in zones}
     if set(retries) != zone_ids:
         raise CLIContractError(
             f"review retries must exactly cover planned zones: {path}"
         )
-    foreign_findings = sorted(set(section_findings) - zone_ids)
+    foreign_findings = sorted(set(findings_raw) - zone_ids)
     if foreign_findings:
         raise CLIContractError(
             f"review section findings contain foreign zones: {', '.join(foreign_findings)}"
         )
+    if set(findings_raw) != zone_ids:
+        raise CLIContractError(
+            f"review section findings must exactly cover planned zones: {path}"
+        )
+    semantic_findings: dict[str, list[SemanticReviewFinding]] = {}
+    section_findings: dict[str, list[str]] = {}
+    for key, value in findings_raw.items():
+        if not isinstance(key, str) or not isinstance(value, list):
+            raise CLIContractError(
+                f"review section findings must map zone IDs to finding arrays: {path}"
+            )
+        typed: list[SemanticReviewFinding] = []
+        seen: set[str] = set()
+        for index, item in enumerate(value):
+            if not isinstance(item, Mapping) or set(item) != _REVIEW_FINDING_FIELDS:
+                raise CLIContractError(
+                    f"review finding fields must be exactly dimension, verdict, evidence: {path}:{key}[{index}]"
+                )
+            dimension = item["dimension"]
+            if not isinstance(dimension, str) or dimension not in _REVIEW_DIMENSIONS:
+                raise CLIContractError(
+                    f"unknown review dimension at {path}:{key}[{index}]"
+                )
+            verdict = item["verdict"]
+            if verdict not in {"pass", "required-fix"}:
+                raise CLIContractError(
+                    f"review verdict must be 'pass' or 'required-fix': {path}:{key}[{index}]"
+                )
+            evidence = item["evidence"]
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise CLIContractError(
+                    f"review evidence must be a non-empty string: {path}:{key}[{index}]"
+                )
+            seen.add(dimension)
+            typed.append(
+                SemanticReviewFinding(
+                    dimension=dimension,  # type: ignore[arg-type]
+                    verdict=verdict,  # type: ignore[arg-type]
+                    evidence=evidence.strip(),
+                )
+            )
+        if len(typed) != len(_REVIEW_DIMENSIONS) or seen != set(_REVIEW_DIMENSIONS):
+            raise CLIContractError(
+                f"review findings for {key} must contain each canonical dimension exactly once: {path}"
+            )
+        semantic_findings[key] = typed
+        section_findings[key] = [
+            f"{finding.dimension} | {finding.verdict} | evidence: {finding.evidence}"
+            for finding in typed
+        ]
+    unresolved = _string_list(data, "unresolved_required", path)
+    if unresolved != sorted(set(unresolved)):
+        raise CLIContractError(f"review unresolved_required must be sorted and unique: {path}")
+    expected_unresolved = sorted(
+        f"{zone_id}:{finding.dimension}"
+        for zone_id, findings in semantic_findings.items()
+        for finding in findings
+        if finding.verdict == "required-fix"
+    )
+    if unresolved != expected_unresolved:
+        raise CLIContractError(
+            f"review unresolved_required must exactly match required-fix findings: {path}"
+        )
     return MasterReview(
-        unresolved_required=_string_list(data, "unresolved_required", path),
+        unresolved_required=unresolved,
         retries=retries,
         section_findings=section_findings,
+        semantic_findings=semantic_findings,
     )
 
 
@@ -524,7 +787,10 @@ def _validate_qa_output_path(output_dir: Path) -> None:
 
 
 def _publish_qa_evidence(
-    result: QAResult, review: MasterReview, output_dir: Path
+    result: QAResult,
+    review: MasterReview,
+    output_dir: Path,
+    provenance: ManifestProvenance | None = None,
 ) -> None:
     """Publish report first and manifest last, rolling the pair back on failure."""
     manifest = output_dir / "manifest.json"
@@ -544,7 +810,7 @@ def _publish_qa_evidence(
             temporary = Path(temporary_name)
             temporary_manifest = temporary / "manifest.json"
             temporary_report = temporary / "review-report.md"
-            write_manifest(result, temporary_manifest)
+            write_manifest(result, temporary_manifest, provenance)
             write_review_report(result, review, temporary_report)
             try:
                 os.replace(temporary_report, report)

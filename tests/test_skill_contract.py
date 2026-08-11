@@ -124,13 +124,16 @@ def test_skill_resolves_one_interpreter_and_persists_review_evidence() -> None:
     assert '"retries": {"zone-001": 1}' in skill
     assert '"section_findings": {' in skill
     for dimension in (
-        "semantic fidelity",
-        "qualification preservation",
+        "semantic_fidelity",
+        "qualification_preservation",
         "naturalness",
         "terminology",
-        "boundary consistency",
-        "protected content",
+        "boundary_consistency",
+        "protected_content",
     ):
-        assert f'"{dimension} | pass | evidence:' in skill
+        assert f'"dimension":"{dimension}","verdict":"pass","evidence":' in skill
+    assert "non-empty `evidence`" in skill
+    assert "sorted, unique string array" in skill
+    assert "`zone-ID:dimension`" in skill
     assert '.\\.venv\\Scripts\\python.exe -m web_translator capture' in readme
     assert "assets/ (when captured)" in readme

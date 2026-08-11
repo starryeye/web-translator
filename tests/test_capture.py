@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import gzip
 import socket
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 from tinycss2.ast import ParseError
 
+import web_translator.capture as capture_module
 from web_translator.capture import (
     MAX_CSS_IMPORT_DEPTH,
     CaptureError,
@@ -655,3 +658,360 @@ def test_static_content_with_auth_or_challenge_phrases_is_accepted(tmp_path: Pat
     transport = mock_transport({"https://example.com/": (200, html.encode(), "text/html")})
     result = capture_page("https://example.com/", tmp_path, transport=transport)
     assert result.source_html.is_file()
+
+
+@pytest.mark.parametrize(
+    "data_uri",
+    [
+        (
+            "data:text/css;charset=utf-8,"
+            ".hero%7Bbackground-image%3Aurl%28%22https%3A%2F%2Fexample.com%2Fbg.svg%22%29%7D"
+        ),
+        "data:text/css;base64,"
+        + base64.b64encode(
+            b'.hero{background-image:url("https://example.com/bg.svg")}'
+        ).decode("ascii"),
+    ],
+)
+def test_data_css_is_materialized_rewritten_fingerprinted_and_critical(
+    tmp_path: Path, data_uri: str
+) -> None:
+    html = f'<link rel="stylesheet" href="{data_uri}"><main>Docs</main>'
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/bg.svg": (200, b"<svg/>", "image/svg+xml"),
+        }
+    )
+
+    result = capture_page("https://example.com/", tmp_path, transport=transport)
+
+    local_path = result.asset_map[data_uri]
+    css_path = tmp_path / local_path
+    rendered_html = result.source_html.read_text("utf-8")
+    rendered_css = css_path.read_text("utf-8")
+    assert local_path.startswith("assets/") and local_path.endswith(".css")
+    assert data_uri not in rendered_html
+    assert f'href="{local_path}"' in rendered_html
+    assert "https://example.com/bg.svg" not in rendered_css
+    assert 'url("' in rendered_css
+    assert result.critical_assets == [local_path]
+    assert local_path not in result.optional_assets
+    assert result.fingerprints[local_path] == hashlib.sha256(css_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "blob:https://example.com/theme",
+        "#theme",
+        "data:text/plain,body%7Bcolor%3Ared%7D",
+        "data:text/css;base64,%%%",
+        "data:text/css,body%ZZ",
+        "DATA:text/css,body%7Bcolor%3Ared%7D",
+        "data:TEXT/CSS,body%7Bcolor%3Ared%7D",
+        "data:text/css;charset=utf8,body%7Bcolor%3Ared%7D",
+        "data:text/css;base64;charset=utf-8,Ym9keXt9",
+    ],
+)
+def test_unsupported_non_network_critical_stylesheet_fails_closed(
+    tmp_path: Path, reference: str
+) -> None:
+    html = f'<link rel="stylesheet" href="{reference}"><main>Docs</main>'
+    transport = mock_transport(
+        {"https://example.com/": (200, html.encode(), "text/html")}
+    )
+
+    with pytest.raises(CaptureError, match="critical stylesheet"):
+        capture_page("https://example.com/", tmp_path, transport=transport)
+
+
+def test_data_css_size_limit_is_enforced_before_metadata_or_file_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_uri = "data:text/css,body%7Bcolor%3Ared%7D"
+    html = f'<link rel="stylesheet" href="{data_uri}"><main>Docs</main>'
+    monkeypatch.setattr(capture_module, "MAX_DATA_CSS_BYTES", 8, raising=False)
+
+    with pytest.raises(CaptureError, match="data stylesheet exceeds"):
+        capture_page(
+            "https://example.com/",
+            tmp_path,
+            transport=mock_transport(
+                {"https://example.com/": (200, html.encode(), "text/html")}
+            ),
+        )
+
+    assert not list((tmp_path / "assets").glob("*.css")) if (tmp_path / "assets").exists() else True
+
+
+def test_unique_request_budget_allows_exact_boundary_and_stops_before_overage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = '<main>Docs</main><img src="/one.png"><img src="/two.png">'
+    hits: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        return httpx.Response(200, content=b"x", headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(capture_module, "MAX_UNIQUE_REQUESTS", 3, raising=False)
+    capture_page(
+        "https://example.com/",
+        tmp_path / "exact",
+        transport=httpx.MockTransport(handler),
+    )
+    assert len(hits) == 3
+
+    hits.clear()
+    monkeypatch.setattr(capture_module, "MAX_UNIQUE_REQUESTS", 2, raising=False)
+    with pytest.raises(CaptureError, match="resource budget exceeded: unique requests"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=httpx.MockTransport(handler),
+        )
+    assert len(hits) == 2
+
+
+def test_redirect_budget_allows_exact_boundary_and_optional_overage_is_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = '<main>Docs</main><img src="/one"><img src="/two">'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/":
+            return httpx.Response(200, text=html, headers={"content-type": "text/html"})
+        if path in {"/one", "/two"}:
+            return httpx.Response(302, headers={"location": path + ".png"})
+        return httpx.Response(200, content=b"x", headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(capture_module, "MAX_TOTAL_REDIRECTS", 2, raising=False)
+    capture_page(
+        "https://example.com/",
+        tmp_path / "exact",
+        transport=httpx.MockTransport(handler),
+    )
+
+    monkeypatch.setattr(capture_module, "MAX_TOTAL_REDIRECTS", 1, raising=False)
+    with pytest.raises(CaptureError, match="resource budget exceeded: redirects"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+def test_redirect_response_bodies_count_toward_cumulative_download_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = '<main>Docs</main><img src="/image">'
+    total = len(html.encode()) + len(b"redirect-body") + len(b"image")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/":
+            return httpx.Response(
+                200, content=html.encode(), headers={"content-type": "text/html"}
+            )
+        if request.url.path == "/image":
+            return httpx.Response(
+                302, content=b"redirect-body", headers={"location": "/image.png"}
+            )
+        return httpx.Response(
+            200, content=b"image", headers={"content-type": "image/png"}
+        )
+
+    monkeypatch.setattr(
+        capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total, raising=False
+    )
+    capture_page(
+        "https://example.com/",
+        tmp_path / "exact",
+        transport=httpx.MockTransport(handler),
+    )
+
+    monkeypatch.setattr(
+        capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total - 1, raising=False
+    )
+    with pytest.raises(CaptureError, match="resource budget exceeded: downloaded bytes"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+def test_streamed_initial_redirect_body_is_charged_without_breaking_follow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = "<main>Docs</main>"
+    redirect_body = b"redirect-body"
+    total = len(redirect_body) + len(html.encode())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(
+                302,
+                headers={"location": "/final"},
+                stream=httpx.ByteStream(redirect_body),
+            )
+        return httpx.Response(
+            200, content=html.encode(), headers={"content-type": "text/html"}
+        )
+
+    monkeypatch.setattr(
+        capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total, raising=False
+    )
+    capture_page(
+        "https://example.com/start",
+        tmp_path / "exact",
+        transport=httpx.MockTransport(handler),
+    )
+
+    monkeypatch.setattr(
+        capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total - 1, raising=False
+    )
+    with pytest.raises(CaptureError, match="resource budget exceeded: downloaded bytes"):
+        capture_page(
+            "https://example.com/start",
+            tmp_path / "over",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+def test_cumulative_download_budget_allows_exact_bytes_and_rejects_next_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = '<main>Docs</main><img src="/one.png"><img src="/two.png">'
+    total = len(html.encode()) + 2
+    transport = mock_transport(
+        {
+            "https://example.com/": (200, html.encode(), "text/html"),
+            "https://example.com/one.png": (200, b"1", "image/png"),
+            "https://example.com/two.png": (200, b"2", "image/png"),
+        }
+    )
+
+    monkeypatch.setattr(capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total, raising=False)
+    capture_page("https://example.com/", tmp_path / "exact", transport=transport)
+
+    monkeypatch.setattr(capture_module, "MAX_TOTAL_DOWNLOADED_BYTES", total - 1, raising=False)
+    with pytest.raises(CaptureError, match="resource budget exceeded: downloaded bytes"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=mock_transport(
+                {
+                    "https://example.com/": (200, html.encode(), "text/html"),
+                    "https://example.com/one.png": (200, b"1", "image/png"),
+                    "https://example.com/two.png": (200, b"2", "image/png"),
+                }
+            ),
+        )
+
+
+def test_emitted_byte_budget_allows_exact_render_and_rejects_next_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = "<p>Hello</p>"
+    rendered = "<html><body><p>Hello</p></body></html>"
+    transport = mock_transport(
+        {"https://example.com/": (200, html.encode(), "text/html")}
+    )
+
+    monkeypatch.setattr(
+        capture_module, "MAX_TOTAL_EMITTED_BYTES", len(rendered.encode()), raising=False
+    )
+    exact = capture_page("https://example.com/", tmp_path / "exact", transport=transport)
+    assert exact.source_html.read_text("utf-8") == rendered
+
+    monkeypatch.setattr(
+        capture_module,
+        "MAX_TOTAL_EMITTED_BYTES",
+        len(rendered.encode()) - 1,
+        raising=False,
+    )
+    with pytest.raises(CaptureError, match="resource budget exceeded: emitted bytes"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=mock_transport(
+                {"https://example.com/": (200, html.encode(), "text/html")}
+            ),
+        )
+
+
+@pytest.mark.parametrize("finished_at, succeeds", [(1.0, True), (1.001, False)])
+def test_capture_deadline_has_a_stable_monotonic_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    finished_at: float,
+    succeeds: bool,
+) -> None:
+    now = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        now[0] = finished_at
+        return httpx.Response(
+            200, text="<main>Docs</main>", headers={"content-type": "text/html"}
+        )
+
+    monkeypatch.setattr(capture_module, "MAX_CAPTURE_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    if succeeds:
+        capture_page(
+            "https://example.com/",
+            tmp_path,
+            transport=httpx.MockTransport(handler),
+        )
+    else:
+        with pytest.raises(CaptureError, match="resource budget exceeded: deadline"):
+            capture_page(
+                "https://example.com/",
+                tmp_path,
+                transport=httpx.MockTransport(handler),
+            )
+
+
+def test_nested_css_duplicate_aliases_charge_one_unique_request_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = '<link rel="stylesheet" href="/main.css"><main>Docs</main>'
+    main_css = b'@import url("child.css");@import url("child.css");'
+    hits: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        if request.url.path == "/":
+            return httpx.Response(200, content=html.encode(), headers={"content-type": "text/html"})
+        if request.url.path == "/main.css":
+            return httpx.Response(200, content=main_css, headers={"content-type": "text/css"})
+        return httpx.Response(200, content=b"p{}", headers={"content-type": "text/css"})
+
+    monkeypatch.setattr(capture_module, "MAX_UNIQUE_REQUESTS", 3, raising=False)
+    capture_page(
+        "https://example.com/",
+        tmp_path,
+        transport=httpx.MockTransport(handler),
+    )
+    assert hits == [
+        "https://example.com/",
+        "https://example.com/main.css",
+        "https://example.com/child.css",
+    ]
+
+    hits.clear()
+    monkeypatch.setattr(capture_module, "MAX_UNIQUE_REQUESTS", 2, raising=False)
+    with pytest.raises(CaptureError, match="resource budget exceeded: unique requests"):
+        capture_page(
+            "https://example.com/",
+            tmp_path / "over",
+            transport=httpx.MockTransport(handler),
+        )
+    assert hits == [
+        "https://example.com/",
+        "https://example.com/main.css",
+    ]

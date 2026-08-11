@@ -9,12 +9,25 @@ from pathlib import Path
 import re
 import tempfile
 
-from web_translator.models import Finding, MasterReview, QAResult
+from web_translator import __version__
+from web_translator.models import (
+    Finding,
+    ManifestAsset,
+    ManifestProvenance,
+    MasterReview,
+    QAResult,
+)
 
 
-def write_manifest(result: QAResult, path: Path) -> None:
+def write_manifest(
+    result: QAResult,
+    path: Path,
+    provenance: ManifestProvenance | None = None,
+) -> None:
     """Write canonical JSON evidence for one QA run."""
+    provenance = provenance or _fallback_provenance(result)
     payload = {
+        **provenance.to_dict(),
         "browser_metrics": result.browser_metrics,
         "capture_metadata": result.capture_metadata,
         "qa_status": "passed" if result.passed else "failed",
@@ -29,6 +42,53 @@ def write_manifest(result: QAResult, path: Path) -> None:
     }
     serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     _atomic_write(Path(path), serialized)
+
+
+def _fallback_provenance(result: QAResult) -> ManifestProvenance:
+    """Keep the evidence writer usable for isolated QA unit results."""
+    capture = result.capture_metadata
+    asset_map = capture.get("asset_map", {})
+    fingerprints = capture.get("fingerprints", {})
+    critical = set(capture.get("critical_assets", []))
+    assets: list[ManifestAsset] = []
+    if isinstance(asset_map, dict) and isinstance(fingerprints, dict):
+        for source, local_path in sorted(asset_map.items()):
+            if not isinstance(source, str) or not isinstance(local_path, str):
+                continue
+            digest = fingerprints.get(local_path, "")
+            if not isinstance(digest, str):
+                digest = ""
+            assets.append(
+                ManifestAsset(
+                    source=source,
+                    local_path=local_path,
+                    sha256=digest,
+                    classification="critical" if local_path in critical else "optional",
+                )
+            )
+    return ManifestProvenance(
+        captured_at=str(capture.get("captured_at", "")),
+        requested_url=str(capture.get("requested_url", result.source_url)),
+        final_url=str(capture.get("final_url", result.source_url)),
+        source_language="und",
+        target_language="ko",
+        terminology_policy_id="english-technical-first-use-ko-gloss",
+        terminology_policy_version="1.0",
+        tool_version=__version__,
+        segment_count=0,
+        target_segment_count=0,
+        translated_segment_count=0,
+        zone_count=0,
+        assets=assets,
+        missing_optional_assets=[
+            item
+            for item in capture.get("missing_optional_assets", [])
+            if isinstance(item, str)
+        ]
+        if isinstance(capture.get("missing_optional_assets", []), list)
+        else [],
+        retries={},
+    )
 
 
 def write_review_report(result: QAResult, review: MasterReview, path: Path) -> None:

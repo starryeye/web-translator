@@ -4,7 +4,11 @@ import re
 from bs4 import BeautifulSoup
 import pytest
 
-from web_translator.extract import extract_segments
+from web_translator.extract import (
+    TRANSLATABLE_ATTRIBUTES,
+    ExtractionError,
+    extract_segments,
+)
 from web_translator.models import read_segments
 from web_translator.protection import ProtectionError, protect_fragment, restore_tokens
 
@@ -573,7 +577,7 @@ def test_nested_list_items_are_independent_non_overlapping_segments(tmp_path: Pa
     ]
 
 
-def test_nested_table_cells_keep_their_own_semantic_types_and_locators(tmp_path: Path) -> None:
+def test_nested_table_cells_keep_typed_row_groups_and_locators(tmp_path: Path) -> None:
     source = write_html(
         tmp_path,
         """
@@ -586,9 +590,9 @@ def test_nested_table_cells_keep_their_own_semantic_types_and_locators(tmp_path:
     segments = extract_segments(source, tmp_path / "segments.jsonl")
 
     assert [segment.semantic_type for segment in segments] == [
-        "table_cell",
-        "table_header",
-        "table_cell",
+        "table_cell:row:000001",
+        "table_header:row:000002",
+        "table_cell:row:000002",
     ]
     assert "Inner heading" not in segments[0].source_text
     assert "Inner cell" not in segments[0].source_text
@@ -678,3 +682,194 @@ def test_protected_only_heading_still_establishes_following_context(tmp_path: Pa
     assert len(segments) == 1
     assert segments[0].semantic_type == "paragraph"
     assert segments[0].heading_path == ["API"]
+
+
+def test_extracts_standalone_links_buttons_and_unwrapped_visible_prose(
+    tmp_path: Path,
+) -> None:
+    source = write_html(
+        tmp_path,
+        """
+        <main>
+          <a href="/guide">Read the security guide</a>
+          <button type="button">Continue securely</button>
+          <div>Before <span>the contextual explanation</span> after.</div>
+        </main>
+        """,
+    )
+
+    segments = extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert [segment.semantic_type for segment in segments] == [
+        "link",
+        "button",
+        "prose",
+    ]
+    assert "Read the security guide" in segments[0].source_text
+    assert "Continue securely" in segments[1].source_text
+    assert "Before " in segments[2].source_text
+    assert "the contextual explanation" in segments[2].source_text
+    assert " after." in segments[2].source_text
+    assert any(
+        token.kind == "tag" and token.value.startswith("<span")
+        for token in segments[2].protected
+    )
+    assert restore_tokens(segments[2].source_text, segments[2].protected) == (
+        "Before <span>the contextual explanation</span> after."
+    )
+
+
+def test_extracts_accessibility_attributes_as_one_location_aware_segment(
+    tmp_path: Path,
+) -> None:
+    source = write_html(
+        tmp_path,
+        """
+        <img src="diagram.png"
+             alt="Configure OAuth securely"
+             aria-label="OAuth configuration diagram"
+             title="Security token exchange">
+        """,
+    )
+
+    segments = extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.semantic_type == "located:attributes"
+    assert segment.locator == "[data-wt-segment='seg-000001']"
+    for phrase in (
+        "Configure OAuth securely",
+        "OAuth configuration diagram",
+        "Security token exchange",
+    ):
+        assert phrase in segment.source_text
+    assert {
+        token.value
+        for token in segment.protected
+        if token.kind == "location"
+    } >= {
+        "<!--wt-location:attribute:alt-->",
+        "<!--wt-location:attribute:aria-label-->",
+        "<!--wt-location:attribute:title-->",
+    }
+
+
+def test_translatable_attribute_contract_is_exact_and_excludes_urls() -> None:
+    assert TRANSLATABLE_ATTRIBUTES == (
+        "alt",
+        "aria-label",
+        "aria-description",
+        "title",
+        "placeholder",
+    )
+
+
+def test_extracts_zero_target_eligible_body_text_instead_of_succeeding_empty(
+    tmp_path: Path,
+) -> None:
+    source = write_html(tmp_path, "<html><body>Readable standalone prose.</body></html>")
+
+    segments = extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert len(segments) == 1
+    assert segments[0].source_text == "Readable standalone prose."
+
+
+def test_accessibility_extraction_retains_exclusions_and_protected_values(
+    tmp_path: Path,
+) -> None:
+    source = write_html(
+        tmp_path,
+        """
+        <script>Visible words must not be translated</script>
+        <style>.label::after { content: "Not prose"; }</style>
+        <code>grant_type MUST stay exact</code>
+        <div id="oauth-client" data-state="ready">
+          Review MUST at https://example.com/spec with <var>grant_type</var>.
+        </div>
+        """,
+    )
+
+    segments = extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert len(segments) == 1
+    assert "Review " in segments[0].source_text
+    assert "https://example.com/spec" not in segments[0].source_text
+    assert "grant_type" not in segments[0].source_text
+    assert {token.kind for token in segments[0].protected} >= {
+        "url",
+        "keyword",
+        "code",
+    }
+    marked = BeautifulSoup(source.read_text(encoding="utf-8"), "lxml")
+    assert marked.div["id"] == "oauth-client"
+    assert marked.div["data-state"] == "ready"
+    assert not marked.script.has_attr("data-wt-segment")
+    assert not marked.style.has_attr("data-wt-segment")
+    assert not marked.code.has_attr("data-wt-segment")
+
+
+def test_authored_reserved_marker_fails_closed_without_mutating_css_hook(
+    tmp_path: Path,
+) -> None:
+    original = (
+        '<style>[data-wt-segment="hero"] { display: grid; }</style>'
+        '<div data-wt-segment="hero">Readable hero introduction.</div>'
+    )
+    source = write_html(tmp_path, original)
+    manifest = tmp_path / "segments.jsonl"
+
+    with pytest.raises(ExtractionError, match="reserved.*data-wt-segment"):
+        extract_segments(source, manifest)
+
+    assert source.read_text(encoding="utf-8") == original
+    assert not manifest.exists()
+
+
+def test_reserved_marker_css_selector_alone_fails_before_markers_activate_it(
+    tmp_path: Path,
+) -> None:
+    original = (
+        "<style>[data-wt-segment] { visibility: hidden; }</style>"
+        "<p>Readable introduction.</p>"
+    )
+    source = write_html(tmp_path, original)
+    manifest = tmp_path / "segments.jsonl"
+
+    with pytest.raises(ExtractionError, match="reserved.*data-wt-segment"):
+        extract_segments(source, manifest)
+
+    assert source.read_text(encoding="utf-8") == original
+    assert not manifest.exists()
+
+
+def test_authored_reserved_marker_attribute_fails_without_stylesheet(
+    tmp_path: Path,
+) -> None:
+    original = '<div data-wt-segment="hero">Readable hero introduction.</div>'
+    source = write_html(tmp_path, original)
+
+    with pytest.raises(ExtractionError, match="reserved.*data-wt-segment"):
+        extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_table_cells_record_typed_row_atomicity(
+    tmp_path: Path,
+) -> None:
+    source = write_html(
+        tmp_path,
+        "<table><tr><th>First heading</th><td>First value</td></tr>"
+        "<tr><th>Second heading</th><td>Second value</td></tr></table>",
+    )
+
+    segments = extract_segments(source, tmp_path / "segments.jsonl")
+
+    assert [segment.semantic_type for segment in segments] == [
+        "table_header:row:000001",
+        "table_cell:row:000001",
+        "table_header:row:000002",
+        "table_cell:row:000002",
+    ]

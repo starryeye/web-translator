@@ -12,6 +12,7 @@ import tempfile
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from web_translator.extract import TRANSLATABLE_ATTRIBUTES
 from web_translator.models import Segment, Translation
 from web_translator.paths import validate_public_url
 from web_translator.protection import ProtectionError, restore_tokens
@@ -45,6 +46,9 @@ _EXECUTABLE_TAGS = {
     "style",
 }
 _URL_ATTRIBUTES = {"action", "formaction", "href", "src", "xlink:href"}
+_LOCATION_COMMENT_RE = re.compile(
+    r"<!--wt-location:(?:attribute:(?P<attribute>[a-z][a-z0-9-]*)|(?P<content>content))-->"
+)
 _REPARSE_POINT = 0x400
 
 
@@ -108,14 +112,18 @@ def assemble_page(
             restored = restore_tokens(record.text, segment.protected)
         except ProtectionError as error:
             raise AssemblyError(f"cannot restore {segment_id}: {error}") from error
-        fragment = BeautifulSoup(restored, "html.parser")
-        _reject_executable_fragment(fragment, segment_id)
-        if _shape(element) != _shape(fragment):
-            raise AssemblyError(f"translated fragment shape changed for {segment_id}")
-        replacement = list(fragment.contents)
-        element.clear()
-        for child in replacement:
-            element.append(child.extract())
+        if segment.semantic_type.startswith("located:"):
+            attributes, content = _parse_location_payload(restored, segment)
+            for attribute, value in attributes.items():
+                if not element.has_attr(attribute):
+                    raise AssemblyError(
+                        f"translated attribute location is missing from {segment_id}: {attribute}"
+                    )
+                element[attribute] = value
+            if content is not None:
+                _replace_element_content(element, content, segment_id)
+        else:
+            _replace_element_content(element, restored, segment_id)
         del element["data-wt-segment"]
 
     if soup.select_one("[data-wt-segment]") is not None:
@@ -148,8 +156,82 @@ def _validate_segments(segments: Mapping[str, Segment]) -> dict[str, Segment]:
             raise AssemblyError(f"segment key does not match record ID: {key}")
         if not value.target:
             raise AssemblyError(f"non-target segment cannot be assembled: {key}")
+        expected_locator = f"[data-wt-segment='{value.id}']"
+        if value.locator != expected_locator:
+            raise AssemblyError(
+                f"segment locator must exactly match its DOM marker: {key}"
+            )
+        location_tokens = [
+            token
+            for token in value.protected
+            if token.kind == "location"
+            and _LOCATION_COMMENT_RE.fullmatch(token.value) is not None
+        ]
+        if value.semantic_type.startswith("located:") != bool(location_tokens):
+            raise AssemblyError(
+                f"segment semantic type and location tokens disagree: {key}"
+            )
         result[key] = value
     return result
+
+
+def _parse_location_payload(
+    restored: str, segment: Segment
+) -> tuple[dict[str, str], str | None]:
+    matches = list(_LOCATION_COMMENT_RE.finditer(restored))
+    expected = [
+        token.value
+        for token in segment.protected
+        if token.kind == "location"
+        and _LOCATION_COMMENT_RE.fullmatch(token.value) is not None
+    ]
+    actual = [match.group() for match in matches]
+    if not matches or matches[0].start() != 0 or actual != expected:
+        raise AssemblyError(
+            f"translated location boundaries changed for {segment.id}"
+        )
+
+    attributes: dict[str, str] = {}
+    content: str | None = None
+    saw_content = False
+    for index, match in enumerate(matches):
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(restored)
+        value = restored[match.end() : value_end]
+        attribute = match.group("attribute")
+        if attribute is not None:
+            if saw_content:
+                raise AssemblyError(
+                    f"attribute location follows content in {segment.id}: {attribute}"
+                )
+            if attribute not in TRANSLATABLE_ATTRIBUTES:
+                raise AssemblyError(
+                    f"unsafe translated attribute location in {segment.id}: {attribute}"
+                )
+            if attribute in attributes:
+                raise AssemblyError(
+                    f"duplicate translated attribute location in {segment.id}: {attribute}"
+                )
+            attributes[attribute] = value
+            continue
+        if saw_content:
+            raise AssemblyError(f"duplicate content location in {segment.id}")
+        saw_content = True
+        content = value
+
+    if not attributes:
+        raise AssemblyError(f"located segment has no translated attributes: {segment.id}")
+    return attributes, content
+
+
+def _replace_element_content(element: Tag, restored: str, segment_id: str) -> None:
+    fragment = BeautifulSoup(restored, "html.parser")
+    _reject_executable_fragment(fragment, segment_id)
+    if _shape(element) != _shape(fragment):
+        raise AssemblyError(f"translated fragment shape changed for {segment_id}")
+    replacement = list(fragment.contents)
+    element.clear()
+    for child in replacement:
+        element.append(child.extract())
 
 
 def _validate_translations(

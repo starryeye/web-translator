@@ -18,3 +18,10 @@ Record findings under the zone ID and preserve findings from all attempts. A zon
 only when all six dimensions pass. Any `required-fix` triggers a same-agent retry, then
 deterministic validation before another semantic review. After two retries, leave the
 finding unresolved and fail the run.
+
+Persist each zone as an array of exactly six finding objects. Every object has exactly
+`dimension`, `verdict`, and non-empty `evidence`. Use the canonical dimension IDs
+`semantic_fidelity`, `qualification_preservation`, `naturalness`, `terminology`,
+`boundary_consistency`, and `protected_content` exactly once per zone. The sorted unique
+`unresolved_required` array must equal all `zone-ID:dimension` pairs whose verdict is
+`required-fix`; missing, duplicate, invented, or unreported findings fail the contract.

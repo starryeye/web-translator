@@ -142,12 +142,31 @@ class Finding:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticReviewFinding:
+    """One typed master-review verdict with written semantic evidence."""
+
+    dimension: Literal[
+        "semantic_fidelity",
+        "qualification_preservation",
+        "naturalness",
+        "terminology",
+        "boundary_consistency",
+        "protected_content",
+    ]
+    verdict: Literal["pass", "required-fix"]
+    evidence: str
+
+
+@dataclass(frozen=True, slots=True)
 class MasterReview:
     """Semantic review evidence supplied by the master agent."""
 
     unresolved_required: list[str]
     retries: dict[str, int]
     section_findings: dict[str, list[str]]
+    semantic_findings: dict[str, list[SemanticReviewFinding]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +198,75 @@ class QAResult:
     source_url: str = ""
     browser_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     capture_metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestAsset:
+    """One captured asset with source provenance and integrity evidence."""
+
+    source: str
+    local_path: str
+    sha256: str
+    classification: Literal["critical", "optional"]
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "classification": self.classification,
+            "local_path": self.local_path,
+            "sha256": self.sha256,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestProvenance:
+    """Typed, cross-validated provenance for one completed translation run."""
+
+    captured_at: str
+    requested_url: str
+    final_url: str
+    source_language: str
+    target_language: str
+    terminology_policy_id: str
+    terminology_policy_version: str
+    tool_version: str
+    segment_count: int
+    target_segment_count: int
+    translated_segment_count: int
+    zone_count: int
+    assets: list[ManifestAsset]
+    missing_optional_assets: list[str]
+    retries: dict[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "assets": {
+                "captured": [asset.to_dict() for asset in self.assets],
+                "missing_optional": list(self.missing_optional_assets),
+            },
+            "capture": {
+                "captured_at": self.captured_at,
+                "final_url": self.final_url,
+                "requested_url": self.requested_url,
+            },
+            "coverage": {
+                "segments": self.segment_count,
+                "target_segments": self.target_segment_count,
+                "translated_segments": self.translated_segment_count,
+                "zones": self.zone_count,
+            },
+            "languages": {
+                "source": self.source_language,
+                "target": self.target_language,
+            },
+            "retries": dict(self.retries),
+            "schema_version": "1.0",
+            "terminology_policy": {
+                "id": self.terminology_policy_id,
+                "version": self.terminology_policy_version,
+            },
+            "tool": {"name": "web-translator", "version": self.tool_version},
+        }
 
 
 def write_segments(path: Path, segments: Iterable[Segment]) -> None:

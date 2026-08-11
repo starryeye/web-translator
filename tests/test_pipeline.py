@@ -7,11 +7,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import threading
+from urllib.parse import urljoin
 
 import pytest
 import httpx
+from bs4 import BeautifulSoup
 
 import web_translator.capture as capture_module
 import web_translator.cli as cli_module
@@ -21,6 +24,7 @@ from web_translator.models import MasterReview, QAResult
 
 
 TRANSLATED_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "translated"
+REPRESENTATIVE_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "representative"
 FIXTURE_HTML = b"""<!doctype html>
 <html>
   <head>
@@ -42,6 +46,25 @@ FIXTURE_SVG = (
     b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
     b'<circle cx="10" cy="10" r="8"/></svg>'
 )
+REVIEW_DIMENSIONS = (
+    "semantic_fidelity",
+    "qualification_preservation",
+    "naturalness",
+    "terminology",
+    "boundary_consistency",
+    "protected_content",
+)
+
+
+def reviewed_zone_findings() -> list[dict[str, str]]:
+    return [
+        {
+            "dimension": dimension,
+            "verdict": "pass",
+            "evidence": f"Fixture reviewer compared {dimension} with the source and approved it.",
+        }
+        for dimension in REVIEW_DIMENSIONS
+    ]
 
 
 @dataclass(frozen=True)
@@ -89,18 +112,55 @@ def fixture_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[FixtureServer]:
 
 def copy_reviewed_fixture_translations(run_dir: Path) -> None:
     shutil.copy2(TRANSLATED_FIXTURE_DIR / "glossary.json", run_dir / "glossary.json")
+    reviewed = [
+        json.loads(line)
+        for line in (TRANSLATED_FIXTURE_DIR / "zone-001.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    segments = [
+        json.loads(line)
+        for line in (run_dir / "segments.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    translated: list[dict[str, object]] = []
+    for segment in segments:
+        if not segment["target"]:
+            continue
+        if segment["semantic_type"] == "located:attributes":
+            token = segment["protected"][0]["token"]
+            translated.append(
+                {
+                    "segment_id": segment["id"],
+                    "text": f"{token}픽스처 로고",
+                    "notes": None,
+                    "glossary_observations": {},
+                }
+            )
+            continue
+        if segment["semantic_type"] == "heading":
+            template = reviewed[0]
+        elif "before retrying" in segment["source_text"]:
+            template = reviewed[1]
+        else:
+            template = reviewed[2]
+        translated.append({**template, "segment_id": segment["id"]})
     translations = run_dir / "translations"
     translations.mkdir()
-    shutil.copy2(
-        TRANSLATED_FIXTURE_DIR / "zone-001.jsonl",
-        translations / "zone-001.jsonl",
+    (translations / "zone-001.jsonl").write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in translated
+        ),
+        encoding="utf-8",
     )
     (run_dir / "review.json").write_text(
         json.dumps(
             {
                 "unresolved_required": [],
                 "retries": {"zone-001": 0},
-                "section_findings": {},
+                "section_findings": {"zone-001": reviewed_zone_findings()},
             },
             ensure_ascii=False,
         )
@@ -154,6 +214,64 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
     assert output.err == ""
     assert (output_dir / "index.html").exists()
     manifest = json.loads((output_dir / "manifest.json").read_text("utf-8"))
+    assert set(manifest) == {
+        "assets",
+        "browser_metrics",
+        "capture",
+        "capture_metadata",
+        "coverage",
+        "languages",
+        "qa_status",
+        "required_findings",
+        "retries",
+        "schema_version",
+        "screenshots",
+        "source_url",
+        "terminology_policy",
+        "tool",
+        "warnings",
+    }
+    assert manifest["schema_version"] == "1.0"
+    assert manifest["tool"] == {"name": "web-translator", "version": "0.1.0"}
+    assert manifest["capture"] == {
+        "captured_at": capture["captured_at"],
+        "final_url": capture["final_url"],
+        "requested_url": capture["requested_url"],
+    }
+    assert manifest["capture"]["captured_at"].endswith("Z")
+    assert manifest["languages"] == {"source": "en", "target": "ko"}
+    assert manifest["terminology_policy"] == {
+        "id": "english-technical-first-use-ko-gloss",
+        "version": "1.0",
+    }
+    persisted_segments = [
+        json.loads(line)
+        for line in (run_dir / "segments.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    zone_files = sorted((run_dir / "zones").glob("zone-*.json"))
+    assert manifest["coverage"] == {
+        "segments": len(persisted_segments),
+        "target_segments": sum(segment["target"] for segment in persisted_segments),
+        "translated_segments": sum(segment["target"] for segment in persisted_segments),
+        "zones": len(zone_files),
+    }
+    assert manifest["retries"] == {"zone-001": 0}
+    expected_assets = [
+        {
+            "classification": (
+                "critical" if local_path in capture["critical_assets"] else "optional"
+            ),
+            "local_path": local_path,
+            "sha256": capture["fingerprints"][local_path],
+            "source": source,
+        }
+        for source, local_path in sorted(capture["asset_map"].items())
+    ]
+    assert manifest["assets"] == {
+        "captured": expected_assets,
+        "missing_optional": capture["missing_optional_assets"],
+    }
     assert manifest["qa_status"] == "passed"
     assert set(manifest["browser_metrics"]) == {
         "desktop-1440x900",
@@ -175,6 +293,171 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
     assert translated_html.count("Token Exchange(토큰 교환)") == 1
     assert "MUST" in translated_html
     assert "<code>git status</code> 명령을 실행한 뒤" in translated_html
+
+
+def materialize_representative_snapshot(snapshot_dir: Path, run_dir: Path) -> dict[str, object]:
+    metadata = json.loads((snapshot_dir / "snapshot.json").read_text("utf-8"))
+    run_dir.mkdir(parents=True)
+    source = run_dir / "source.html"
+    shutil.copy2(snapshot_dir / "index.html", source)
+    assets = run_dir / "assets"
+    assets.mkdir()
+    css = assets / "theme.css"
+    shutil.copy2(snapshot_dir / "theme.css", css)
+    asset_source = urljoin(str(metadata["final_url"]), "theme.css")
+    capture = {
+        "asset_map": {asset_source: "assets/theme.css"},
+        "captured_at": metadata["captured_at"],
+        "critical_assets": ["assets/theme.css"],
+        "final_url": metadata["final_url"],
+        "fingerprints": {
+            "assets/theme.css": hashlib.sha256(css.read_bytes()).hexdigest(),
+            "source.html": hashlib.sha256(source.read_bytes()).hexdigest(),
+        },
+        "missing_optional_assets": [],
+        "optional_assets": [],
+        "requested_url": metadata["final_url"],
+    }
+    (run_dir / "capture.json").write_text(
+        json.dumps(capture, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return metadata
+
+
+def write_snapshot_translations_and_review(snapshot_dir: Path, run_dir: Path) -> None:
+    rules = json.loads((snapshot_dir / "translations.json").read_text("utf-8"))
+    segments = {
+        record["id"]: record
+        for record in (
+            json.loads(line)
+            for line in (run_dir / "segments.jsonl").read_text("utf-8").splitlines()
+            if line.strip()
+        )
+    }
+    zones = [
+        json.loads(path.read_text("utf-8"))
+        for path in sorted((run_dir / "zones").glob("zone-*.json"))
+    ]
+    translations = run_dir / "translations"
+    translations.mkdir()
+    for zone in zones:
+        records: list[dict[str, object]] = []
+        for segment_id in zone["target_ids"]:
+            segment = segments[segment_id]
+            matches = [rule for rule in rules if rule["contains"] in segment["source_text"]]
+            assert matches, f"snapshot lacks a translation rule for {segment['source_text']!r}"
+            rule = max(matches, key=lambda item: len(item["contains"]))
+            text = rule["translation"]
+            for index, protected in enumerate(segment["protected"]):
+                text = text.replace(f"{{protected_{index}}}", protected["token"])
+            assert "{protected_" not in text
+            records.append(
+                {
+                    "segment_id": segment_id,
+                    "text": text,
+                    "notes": None,
+                    "glossary_observations": {},
+                }
+            )
+        (translations / f"{zone['id']}.jsonl").write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+    shutil.copy2(snapshot_dir / "glossary.json", run_dir / "glossary.json")
+    review = {
+        "unresolved_required": [],
+        "retries": {zone["id"]: 0 for zone in zones},
+        "section_findings": {
+            zone["id"]: [
+                {
+                    "dimension": dimension,
+                    "verdict": "pass",
+                    "evidence": (
+                        f"Snapshot reviewer compared {dimension} for every target in "
+                        f"{zone['id']} with its source and neighboring section context."
+                    ),
+                }
+                for dimension in REVIEW_DIMENSIONS
+            ]
+            for zone in zones
+        },
+    }
+    (run_dir / "review.json").write_text(
+        json.dumps(review, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("snapshot_name", "expected_phrases", "glosses"),
+    [
+        (
+            "spring-ai-concepts-v1",
+            ["이식 가능한 인터페이스", "공급자별 선택 사항", "지시와 문맥"],
+            {"Spring AI": "스프링 AI", "Model API": "모델 API"},
+        ),
+        (
+            "rfc8693-v1",
+            ["보안 토큰을 요청", "권한 부여 서버", "보안 요구사항을 정의"],
+            {"Token Exchange": "토큰 교환", "Security Token Service": "보안 토큰 서비스"},
+        ),
+    ],
+)
+def test_versioned_representative_snapshot_runs_complete_reviewed_pipeline(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    snapshot_name: str,
+    expected_phrases: list[str],
+    glosses: dict[str, str],
+) -> None:
+    snapshot_dir = REPRESENTATIVE_FIXTURE_DIR / snapshot_name
+    run_dir = tmp_path / "대표 문서 작업" / snapshot_name / "run"
+    output_dir = tmp_path / "대표 문서 작업" / snapshot_name / "translated-pages"
+    metadata = materialize_representative_snapshot(snapshot_dir, run_dir)
+
+    assert main(["extract", "--run-dir", str(run_dir)]) == 0
+    assert main(["plan-zones", "--run-dir", str(run_dir), "--max-chars", "240"]) == 0
+    write_snapshot_translations_and_review(snapshot_dir, run_dir)
+    assert main(["validate-translations", "--run-dir", str(run_dir)]) == 0
+    assert main(["assemble", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
+    assert main(["qa", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
+
+    translated_html = (output_dir / "index.html").read_text("utf-8")
+    assert re.search(r"[가-힣]", translated_html)
+    assert all(phrase in translated_html for phrase in expected_phrases)
+    for term, gloss in glosses.items():
+        assert translated_html.count(term) >= 1
+        assert translated_html.count(f"{term}({gloss})") == 1
+    assert "theme.css" in translated_html
+    translated_soup = BeautifulSoup(translated_html, "html.parser")
+    for element in translated_soup.find_all(True):
+        for attribute in ("href", "src"):
+            value = element.get(attribute)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                assert element.name == "a"
+                assert element.find_parent(attrs={"data-wt-attribution": "source"})
+
+    manifest = json.loads((output_dir / "manifest.json").read_text("utf-8"))
+    assert manifest["qa_status"] == "passed"
+    assert manifest["capture"]["final_url"] == metadata["final_url"]
+    assert manifest["languages"] == {"source": "en", "target": "ko"}
+    assert manifest["coverage"]["zones"] >= 2
+    assert manifest["coverage"]["target_segments"] == manifest["coverage"][
+        "translated_segments"
+    ]
+    assert set(manifest["browser_metrics"]) == {
+        "desktop-1440x900",
+        "narrow-390x844",
+    }
+    assert {Path(path).name for path in manifest["screenshots"]} == {
+        "desktop-1440x900.png",
+        "narrow-390x844.png",
+    }
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert all(json.loads(line)["status"] == "ok" for line in output.out.splitlines())
 
 
 def assert_error_status(
@@ -392,6 +675,7 @@ def write_empty_run_contract(run_dir: Path) -> None:
             {
                 "requested_url": "https://fixture.example/",
                 "final_url": "https://fixture.example/",
+                "captured_at": "2026-08-12T00:00:00Z",
                 "asset_map": {},
                 "critical_assets": [],
                 "fingerprints": {
@@ -687,9 +971,10 @@ def test_extract_atomically_replaces_hardlink_without_modifying_other_name(
     os.link(outside, run_dir / "source.html")
     (run_dir / "capture.json").write_text(
         json.dumps(
-            {
-                "asset_map": {},
-                "critical_assets": [],
+                {
+                    "asset_map": {},
+                    "captured_at": "2026-08-12T00:00:00Z",
+                    "critical_assets": [],
                 "final_url": "https://fixture.example/",
                 "fingerprints": {
                     "source.html": hashlib.sha256(original.encode()).hexdigest()

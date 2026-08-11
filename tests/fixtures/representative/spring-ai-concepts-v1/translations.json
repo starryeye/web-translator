@@ -1,0 +1,11 @@
+[
+  {"contains": "Spring AI Concepts", "translation": "Spring AI 개념"},
+  {"contains": "Concepts navigation", "translation": "개념 탐색"},
+  {"contains": "connects application code", "translation": "Spring AI는 이식 가능한 인터페이스를 통해 애플리케이션 코드를 생성형 모델과 연결합니다."},
+  {"contains": "Model API", "translation": "Model API"},
+  {"contains": "stable abstraction", "translation": "Model API는 공급자별 선택 사항을 그대로 보존하면서 안정적인 추상화를 제공합니다."},
+  {"contains": "Concept", "translation": "개념"},
+  {"contains": "Purpose", "translation": "목적"},
+  {"contains": "Prompt", "translation": "Prompt"},
+  {"contains": "Supplies instructions", "translation": "지시와 문맥을 제공합니다."}
+]
