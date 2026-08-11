@@ -10,6 +10,10 @@ from types import MappingProxyType
 from web_translator.models import Segment
 
 
+class ZoneContractError(ValueError):
+    """Segments or zone parameters violate the planning contract."""
+
+
 @dataclass(frozen=True, slots=True)
 class Zone:
     """One immutable translation assignment plus read-only neighbor context."""
@@ -27,18 +31,20 @@ class Zone:
     def __post_init__(self) -> None:
         """Detach token expectations from caller-owned mutable containers."""
         if not isinstance(self.expected_tokens, Mapping):
-            raise ValueError("Zone.expected_tokens must be a mapping")
+            raise ZoneContractError("Zone.expected_tokens must be a mapping")
         normalized: dict[str, tuple[str, ...]] = {}
         for segment_id, tokens in self.expected_tokens.items():
             if not isinstance(segment_id, str):
-                raise ValueError("Zone.expected_tokens keys must be strings")
+                raise ZoneContractError("Zone.expected_tokens keys must be strings")
             if not isinstance(tokens, (list, tuple)) or any(
                 not isinstance(token, str) for token in tokens
             ):
-                raise ValueError("Zone.expected_tokens values must be string sequences")
+                raise ZoneContractError(
+                    "Zone.expected_tokens values must be string sequences"
+                )
             normalized[segment_id] = tuple(tokens)
         if set(normalized) != set(self.target_ids):
-            raise ValueError(
+            raise ZoneContractError(
                 "Zone.expected_tokens must exactly cover the target IDs"
             )
         object.__setattr__(self, "expected_tokens", MappingProxyType(normalized))
@@ -53,7 +59,7 @@ def build_zones(
     it, because a section may contain an indivisible table or prose block.
     """
     if type(max_chars) is not int or max_chars <= 0:
-        raise ValueError("max_chars must be a positive integer")
+        raise ZoneContractError("max_chars must be a positive integer")
 
     ordered = list(segments)
     ids = [item.id for item in ordered]
@@ -61,11 +67,11 @@ def build_zones(
         segment_id for segment_id, count in Counter(ids).items() if count > 1
     )
     if duplicates:
-        raise ValueError(f"duplicate segment IDs: {', '.join(duplicates)}")
+        raise ZoneContractError(f"duplicate segment IDs: {', '.join(duplicates)}")
     if any(not isinstance(item.id, str) for item in ordered):
-        raise ValueError("segment IDs must be strings")
+        raise ZoneContractError("segment IDs must be strings")
     if any(not isinstance(item.source_text, str) for item in ordered):
-        raise ValueError("segment source_text must be a string")
+        raise ZoneContractError("segment source_text must be a string")
 
     sections: list[list[int]] = []
     current: list[int] = []
@@ -126,5 +132,5 @@ def build_zones(
     assigned = [segment_id for zone in zones for segment_id in zone.target_ids]
     expected = [item.id for item in ordered if item.target]
     if assigned != expected or len(assigned) != len(set(assigned)):
-        raise ValueError("zone target IDs do not form an exact partition")
+        raise ZoneContractError("zone target IDs do not form an exact partition")
     return zones

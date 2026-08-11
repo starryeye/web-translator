@@ -39,6 +39,8 @@ class CaptureResult:
     asset_map: dict[str, str]
     fingerprints: dict[str, str]
     missing_optional_assets: list[str]
+    critical_assets: list[str]
+    optional_assets: list[str]
 
 
 def capture_page(
@@ -98,6 +100,8 @@ def capture_page(
         asset_map=dict(sorted(capture.asset_map.items())),
         fingerprints=dict(sorted(capture.fingerprints.items())),
         missing_optional_assets=sorted(capture.missing_optional_assets),
+        critical_assets=sorted(capture.critical_assets),
+        optional_assets=sorted(capture.optional_assets),
     )
 
 
@@ -108,6 +112,8 @@ class _Capture:
         self.asset_map: dict[str, str] = {}
         self.fingerprints: dict[str, str] = {}
         self.missing_optional_assets: set[str] = set()
+        self.critical_assets: set[str] = set()
+        self.optional_assets: set[str] = set()
         self._complete_assets: set[str] = set()
         self._failed_assets: set[str] = set()
 
@@ -218,6 +224,7 @@ class _Capture:
 
         existing = self.asset_map.get(normalized)
         if existing is not None:
+            self._classify_cached_asset(existing, critical)
             return _with_fragment(existing, fragment)
         if normalized in self._failed_assets:
             if critical:
@@ -232,6 +239,7 @@ class _Capture:
             response, content, cached_target = self.fetch_asset(normalized, visited)
             if cached_target is not None:
                 local_path = self.asset_map[cached_target]
+                self._classify_cached_asset(local_path, critical)
                 for alias in visited:
                     self.asset_map[alias] = local_path
                     self._complete_assets.add(alias)
@@ -257,6 +265,7 @@ class _Capture:
             atomic_write(destination, content)
             self.fingerprints[local_path] = sha256_bytes(content)
             self._complete_assets.update(aliases)
+            self._classify_asset(local_path, critical)
             return _with_fragment(local_path, fragment)
         except (CaptureError, OSError) as error:
             for alias in aliases:
@@ -266,6 +275,18 @@ class _Capture:
             self._failed_assets.update(visited)
             self.missing_optional_assets.add(normalized)
             return reference
+
+    def _classify_asset(self, local_path: str, critical: bool) -> None:
+        if critical:
+            self.optional_assets.discard(local_path)
+            self.critical_assets.add(local_path)
+        elif local_path not in self.critical_assets:
+            self.optional_assets.add(local_path)
+
+    def _classify_cached_asset(self, local_path: str, critical: bool) -> None:
+        if critical and local_path in self.optional_assets:
+            raise CaptureError("cannot reuse an optional asset as a critical stylesheet")
+        self._classify_asset(local_path, critical)
 
     def rewrite_css(self, css: str, base_url: str, css_local_path: str | None, depth: int) -> str:
         rules = tinycss2.parse_stylesheet(css, skip_comments=False, skip_whitespace=False)

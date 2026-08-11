@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
 import re
+import tempfile
 import threading
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
@@ -814,7 +816,7 @@ def _run_browser_checks(
                         screenshot = screenshot_dir / f"{label}.png"
                         if screenshot.exists() and _is_link_or_reparse(screenshot):
                             raise OSError(f"screenshot target is unsafe: {screenshot}")
-                        page.screenshot(path=str(screenshot), full_page=True)
+                        _publish_screenshot(page, screenshot)
                         screenshots.append(screenshot)
                     finally:
                         context.close()
@@ -898,6 +900,20 @@ def _run_browser_checks(
             )
         )
     return required, warnings, screenshots, metrics
+
+
+def _publish_screenshot(page: Any, destination: Path) -> None:
+    """Render to a fresh inode, then replace the fixed screenshot name."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp.png", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        page.screenshot(path=str(temporary), full_page=True)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _origin(value: str) -> tuple[str, str, int | None] | None:

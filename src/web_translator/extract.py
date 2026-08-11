@@ -45,10 +45,18 @@ _SEMANTIC_TYPES = {
 }
 
 
+class ExtractionError(RuntimeError):
+    """Captured source cannot be read or extraction outputs cannot be written."""
+
+
 def extract_segments(source_html: Path, segments_path: Path) -> list[Segment]:
     """Mark eligible blocks, persist the DOM, and write their segment manifest."""
     source_html = Path(source_html)
-    soup = BeautifulSoup(source_html.read_text(encoding="utf-8"), "lxml")
+    try:
+        source_text = source_html.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ExtractionError(f"source HTML cannot be read as UTF-8: {error}") from error
+    soup = BeautifulSoup(source_text, "lxml")
     for marked in soup.select("[data-wt-segment]"):
         del marked["data-wt-segment"]
 
@@ -91,8 +99,11 @@ def extract_segments(source_html: Path, segments_path: Path) -> list[Segment]:
             )
         )
 
-    source_html.write_text(str(soup), encoding="utf-8", newline="\n")
-    write_segments(Path(segments_path), segments)
+    try:
+        source_html.write_text(str(soup), encoding="utf-8", newline="\n")
+        write_segments(Path(segments_path), segments)
+    except (OSError, UnicodeError) as error:
+        raise ExtractionError(f"extraction outputs cannot be written: {error}") from error
     return segments
 
 

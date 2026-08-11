@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 
+class SegmentContractError(ValueError):
+    """A persisted segment JSONL record violates the segment contract."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProtectedToken:
     """A source fragment temporarily replaced before translation."""
@@ -196,11 +200,15 @@ def read_segments(path: Path) -> list[Segment]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as error:
-                raise ValueError(f"segments JSONL line {line_number}: invalid JSON") from error
+                raise SegmentContractError(
+                    f"segments JSONL line {line_number}: invalid JSON"
+                ) from error
             try:
                 segments.append(Segment.from_dict(record))
             except ValueError as error:
-                raise ValueError(f"segments JSONL line {line_number}: {error}") from error
+                raise SegmentContractError(
+                    f"segments JSONL line {line_number}: {error}"
+                ) from error
         return segments
 
 

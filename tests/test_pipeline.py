@@ -11,11 +11,13 @@ import shutil
 import threading
 
 import pytest
+import httpx
 
 import web_translator.capture as capture_module
 import web_translator.cli as cli_module
-from web_translator.capture import CaptureError
+from web_translator.capture import CaptureError, capture_page
 from web_translator.cli import main
+from web_translator.models import MasterReview, QAResult
 
 
 TRANSLATED_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "translated"
@@ -126,6 +128,14 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
     assert main(
         ["assemble", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]
     ) == 0
+    screenshot_dir = run_dir / "qa-screenshots"
+    screenshot_dir.mkdir()
+    screenshot_sentinels: list[Path] = []
+    for filename in ("desktop-1440x900.png", "narrow-390x844.png"):
+        sentinel = tmp_path / f"outside-{filename}"
+        sentinel.write_bytes(f"sentinel:{filename}".encode())
+        os.link(sentinel, screenshot_dir / filename)
+        screenshot_sentinels.append(sentinel)
     assert main(
         ["qa", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]
     ) == 0
@@ -154,6 +164,12 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
         "narrow-390x844.png",
     }
     assert all(Path(path).is_file() for path in manifest["screenshots"])
+    for sentinel in screenshot_sentinels:
+        filename = sentinel.name.removeprefix("outside-")
+        screenshot = screenshot_dir / filename
+        assert sentinel.read_bytes() == f"sentinel:{filename}".encode()
+        assert not os.path.samefile(sentinel, screenshot)
+        assert screenshot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     translated_html = (output_dir / "index.html").read_text("utf-8")
     assert translated_html.count("OAuth(오픈 인증)") == 1
     assert translated_html.count("Token Exchange(토큰 교환)") == 1
@@ -180,6 +196,21 @@ def test_invalid_capture_url_returns_argument_exit_code_and_one_status(
     (tmp_path / "occupied").write_text("existing", encoding="utf-8")
     assert main(["capture", "file:///private", "--run-dir", str(tmp_path)]) == 2
     assert_error_status(capsys, command="capture", exit_code=2)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_unexpected_handler_errors_escape_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    def fail_unexpectedly(run_dir: Path) -> None:
+        raise error_type("simulated programming bug")
+
+    monkeypatch.setattr(cli_module, "_validate_run_root", fail_unexpectedly)
+
+    with pytest.raises(error_type, match="simulated programming bug"):
+        main(["extract", "--run-dir", str(tmp_path / "run")])
 
 
 def test_subcommand_help_keeps_stdout_reserved_for_one_status_object(
@@ -218,6 +249,91 @@ def test_capture_failure_returns_capture_exit_code_and_one_status(
         == 3
     )
     assert_error_status(capsys, command="capture", exit_code=3)
+
+
+def test_capture_persists_semantic_asset_classes_with_alias_merging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    html = (
+        '<html><head><link rel="stylesheet" href="alias.css">'
+        '<style>.hero{background:url("font.css")}</style></head>'
+        '<body><img src="critical-target"></body></html>'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        responses: dict[str, httpx.Response] = {
+            "https://fixture.example/": httpx.Response(
+                200, text=html, headers={"content-type": "text/html"}
+            ),
+            "https://fixture.example/alias.css": httpx.Response(
+                302, headers={"location": "/critical-target"}
+            ),
+            "https://fixture.example/critical-target": httpx.Response(
+                200, content=b"body{}", headers={"content-type": "text/css"}
+            ),
+            "https://fixture.example/font.css": httpx.Response(
+                200,
+                content=b"optional non-css bytes",
+                headers={"content-type": "application/octet-stream"},
+            ),
+        }
+        return responses[str(request.url)]
+
+    monkeypatch.setattr(
+        capture_module,
+        "_resolve_public_addresses",
+        lambda host, port: ["93.184.216.34"],
+    )
+    result = capture_page(
+        "https://fixture.example/",
+        tmp_path,
+        transport=httpx.MockTransport(handler),
+    )
+    critical = result.asset_map["https://fixture.example/critical-target"]
+    optional = result.asset_map["https://fixture.example/font.css"]
+
+    assert result.asset_map["https://fixture.example/alias.css"] == critical
+    assert result.critical_assets == [critical]
+    assert result.optional_assets == [optional]
+    assert Path(optional).suffix == ".css"
+
+
+@pytest.mark.parametrize("stylesheet_reference", ["/target", "/alias.css"])
+def test_capture_rejects_optional_asset_cache_promotion_to_stylesheet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stylesheet_reference: str,
+) -> None:
+    html = (
+        '<html><head><style>@import url("'
+        + stylesheet_reference
+        + '");</style></head><body><img src="/target"></body></html>'
+    )
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://fixture.example/":
+            return httpx.Response(
+                200, text=html, headers={"content-type": "text/html"}
+            )
+        if str(request.url) == "https://fixture.example/alias.css":
+            return httpx.Response(302, headers={"location": "/target"})
+        return httpx.Response(
+            200, content=svg, headers={"content-type": "image/svg+xml"}
+        )
+
+    monkeypatch.setattr(
+        capture_module,
+        "_resolve_public_addresses",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+    with pytest.raises(CaptureError, match="optional asset as a critical stylesheet"):
+        capture_page(
+            "https://fixture.example/",
+            tmp_path,
+            transport=httpx.MockTransport(handler),
+        )
 
 
 def test_capture_rejects_nonempty_run_directory_before_network_or_overwrite(
@@ -267,6 +383,10 @@ def test_nonpositive_zone_limit_is_an_invalid_argument(
 
 def write_empty_run_contract(run_dir: Path) -> None:
     run_dir.mkdir(parents=True)
+    source = run_dir / "source.html"
+    source.write_text(
+        "<html><head></head><body></body></html>", encoding="utf-8"
+    )
     (run_dir / "capture.json").write_text(
         json.dumps(
             {
@@ -274,7 +394,9 @@ def write_empty_run_contract(run_dir: Path) -> None:
                 "final_url": "https://fixture.example/",
                 "asset_map": {},
                 "critical_assets": [],
-                "fingerprints": {"source.html": "0" * 64},
+                "fingerprints": {
+                    "source.html": hashlib.sha256(source.read_bytes()).hexdigest()
+                },
                 "missing_optional_assets": [],
                 "optional_assets": [],
             }
@@ -664,7 +786,9 @@ def test_assembly_failure_returns_assembly_exit_code_and_one_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     run_dir = tmp_path / "run"
+    output_dir = tmp_path / "output"
     write_empty_run_contract(run_dir)
+    output_dir.mkdir()
 
     assert (
         main(
@@ -673,12 +797,42 @@ def test_assembly_failure_returns_assembly_exit_code_and_one_status(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(output_dir),
             ]
         )
         == 5
     )
     assert_error_status(capsys, command="assemble", exit_code=5)
+
+
+@pytest.mark.parametrize("command", ["assemble", "qa"])
+def test_missing_captured_source_is_a_contract_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    run_dir = tmp_path / command
+    output_dir = tmp_path / f"{command}-output"
+    write_empty_run_contract(run_dir)
+    (run_dir / "source.html").unlink()
+    (run_dir / "review.json").write_text(
+        '{"unresolved_required":[],"retries":{},"section_findings":{}}\n',
+        encoding="utf-8",
+    )
+
+    assert (
+        main(
+            [
+                command,
+                "--run-dir",
+                str(run_dir),
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+        == 4
+    )
+    assert_error_status(capsys, command=command, exit_code=4)
 
 
 def test_failed_qa_writes_reports_and_returns_qa_exit_code_and_one_status(
@@ -736,3 +890,71 @@ def test_qa_report_io_failure_returns_qa_exit_code_and_one_status(
         == 6
     )
     assert_error_status(capsys, command="qa", exit_code=6)
+
+
+def passing_qa_result(source_url: str) -> QAResult:
+    return QAResult(
+        passed=True,
+        required_findings=[],
+        warnings=[],
+        screenshots=[],
+        source_url=source_url,
+    )
+
+
+def empty_master_review() -> MasterReview:
+    return MasterReview(
+        unresolved_required=[], retries={}, section_findings={}
+    )
+
+
+def test_qa_evidence_report_failure_never_publishes_passing_manifest(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "review-report.md").mkdir()
+
+    with pytest.raises(cli_module.QAFailure, match="QA evidence"):
+        cli_module._publish_qa_evidence(
+            passing_qa_result("https://fixture.example/new"),
+            empty_master_review(),
+            output_dir,
+        )
+
+    assert not (output_dir / "manifest.json").exists()
+
+
+def test_qa_evidence_transaction_restores_previous_pair_on_manifest_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    cli_module._publish_qa_evidence(
+        passing_qa_result("https://fixture.example/old"),
+        empty_master_review(),
+        output_dir,
+    )
+    manifest = output_dir / "manifest.json"
+    report = output_dir / "review-report.md"
+    old_pair = (manifest.read_bytes(), report.read_bytes())
+    real_replace = cli_module.os.replace
+    failed = False
+
+    def fail_new_manifest_once(source_path: object, destination_path: object) -> None:
+        nonlocal failed
+        if Path(destination_path) == manifest and not failed:
+            failed = True
+            raise OSError("injected manifest publication failure")
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(cli_module.os, "replace", fail_new_manifest_once)
+
+    with pytest.raises(cli_module.QAFailure, match="QA evidence"):
+        cli_module._publish_qa_evidence(
+            passing_qa_result("https://fixture.example/new"),
+            empty_master_review(),
+            output_dir,
+        )
+
+    assert (manifest.read_bytes(), report.read_bytes()) == old_pair

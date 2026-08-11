@@ -16,18 +16,20 @@ from typing import Any
 from web_translator.assemble import AssemblyError, assemble_page
 from web_translator.assets import atomic_write
 from web_translator.capture import CaptureError, capture_page
-from web_translator.extract import extract_segments
+from web_translator.extract import ExtractionError, extract_segments
 from web_translator.models import (
     MasterReview,
     QAInputs,
+    QAResult,
     Segment,
+    SegmentContractError,
     read_segments,
 )
 from web_translator.paths import validate_public_url
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
-from web_translator.zones import Zone, build_zones
+from web_translator.zones import Zone, ZoneContractError, build_zones
 
 
 EXIT_INVALID_ARGUMENTS = 2
@@ -163,16 +165,13 @@ def _capture_command(args: argparse.Namespace) -> None:
     except (CLIContractError, OSError) as error:
         raise CaptureError(str(error)) from error
     result = capture_page(url, args.run_dir)
-    asset_paths = sorted(set(result.asset_map.values()))
-    critical_assets = [path for path in asset_paths if Path(path).suffix.lower() == ".css"]
-    optional_assets = [path for path in asset_paths if path not in critical_assets]
     payload = {
         "asset_map": result.asset_map,
-        "critical_assets": critical_assets,
+        "critical_assets": result.critical_assets,
         "final_url": result.final_url,
         "fingerprints": result.fingerprints,
         "missing_optional_assets": result.missing_optional_assets,
-        "optional_assets": optional_assets,
+        "optional_assets": result.optional_assets,
         "requested_url": result.requested_url,
     }
     try:
@@ -226,7 +225,7 @@ def _extract_command(args: argparse.Namespace) -> None:
                         f"publish={publish_error}; rollback={rollback_error}"
                     ) from publish_error
                 raise
-    except (CLIContractError, OSError, UnicodeError, ValueError) as error:
+    except (CLIContractError, ExtractionError, OSError) as error:
         raise CLIContractError(f"cannot extract captured source: {error}") from error
 
 
@@ -237,7 +236,7 @@ def _plan_zones_command(args: argparse.Namespace) -> None:
     segments = _read_segments(args.run_dir)
     try:
         zones = build_zones(segments, max_chars=args.max_chars)
-    except ValueError as error:
+    except ZoneContractError as error:
         raise CLIContractError(str(error)) from error
     zone_dir = args.run_dir / "zones"
     if zone_dir.exists():
@@ -305,11 +304,7 @@ def _qa_command(args: argparse.Namespace) -> None:
             capture_metadata=dict(capture),
         )
     )
-    try:
-        write_manifest(result, args.output_dir / "manifest.json")
-        write_review_report(result, review, args.output_dir / "review-report.md")
-    except OSError as error:
-        raise QAFailure(f"cannot write QA evidence: {error}") from error
+    _publish_qa_evidence(result, review, args.output_dir)
     if not result.passed:
         codes = ", ".join(finding.code for finding in result.required_findings)
         raise QAFailure(f"required QA checks failed: {codes or 'unknown finding'}")
@@ -320,7 +315,7 @@ def _read_segments(run_dir: Path) -> list[Segment]:
     try:
         _require_safe_file(path)
         return read_segments(path)
-    except (CLIContractError, OSError, UnicodeError, ValueError) as error:
+    except (CLIContractError, SegmentContractError, OSError, UnicodeError) as error:
         raise CLIContractError(f"cannot read segment manifest {path}: {error}") from error
 
 
@@ -354,7 +349,7 @@ def _read_zones(run_dir: Path) -> list[Zone]:
                 attempt=_integer(data, "attempt", path),
                 expected_tokens=_string_sequence_mapping(data, "expected_tokens", path),
             )
-        except ValueError as error:
+        except ZoneContractError as error:
             raise CLIContractError(f"invalid zone file {path}: {error}") from error
         if path.stem != zone.id:
             raise CLIContractError(
@@ -386,15 +381,14 @@ def _read_capture(run_dir: Path) -> dict[str, Any]:
     asset_paths = set(asset_map.values())
     critical_assets = _string_list(data, "critical_assets", path)
     optional_assets = _string_list(data, "optional_assets", path)
+    if critical_assets != sorted(set(critical_assets)):
+        raise CLIContractError(f"capture critical asset list must be sorted and unique: {path}")
+    if optional_assets != sorted(set(optional_assets)):
+        raise CLIContractError(f"capture optional asset list must be sorted and unique: {path}")
     if set(critical_assets) & set(optional_assets):
         raise CLIContractError(f"capture asset classes overlap: {path}")
     if set(critical_assets) | set(optional_assets) != asset_paths:
         raise CLIContractError(f"capture asset classes must exactly cover asset_map: {path}")
-    expected_critical = {
-        value for value in asset_paths if PurePosixPath(value).suffix.lower() == ".css"
-    }
-    if set(critical_assets) != expected_critical:
-        raise CLIContractError(f"capture critical asset classification is inconsistent: {path}")
     fingerprints = _string_mapping(data, "fingerprints", path)
     if set(fingerprints) != {"source.html", *asset_paths}:
         raise CLIContractError(f"capture fingerprints must exactly cover source and assets: {path}")
@@ -402,8 +396,6 @@ def _read_capture(run_dir: Path) -> dict[str, Any]:
         raise CLIContractError(f"capture fingerprints must be lowercase SHA-256 values: {path}")
     for relative_path, expected_digest in fingerprints.items():
         captured = run_dir / relative_path
-        if relative_path == "source.html" and not captured.exists():
-            continue
         _require_safe_file(captured)
         if _sha256_file(captured) != expected_digest:
             raise CLIContractError(
@@ -529,6 +521,59 @@ def _validate_qa_output_path(output_dir: Path) -> None:
     _reject_if_link(output_dir / "index.html")
     _reject_if_link(output_dir / "manifest.json")
     _reject_if_link(output_dir / "review-report.md")
+
+
+def _publish_qa_evidence(
+    result: QAResult, review: MasterReview, output_dir: Path
+) -> None:
+    """Publish report first and manifest last, rolling the pair back on failure."""
+    manifest = output_dir / "manifest.json"
+    report = output_dir / "review-report.md"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for destination in (manifest, report):
+            if destination.exists():
+                _require_safe_file(destination)
+            else:
+                _reject_if_link(destination)
+        original_manifest = manifest.read_bytes() if manifest.exists() else None
+        original_report = report.read_bytes() if report.exists() else None
+        with tempfile.TemporaryDirectory(
+            prefix=".qa-evidence-", dir=output_dir
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            temporary_manifest = temporary / "manifest.json"
+            temporary_report = temporary / "review-report.md"
+            write_manifest(result, temporary_manifest)
+            write_review_report(result, review, temporary_report)
+            try:
+                os.replace(temporary_report, report)
+                os.replace(temporary_manifest, manifest)
+            except BaseException as publish_error:
+                try:
+                    _restore_optional_file(report, original_report)
+                    _restore_optional_file(manifest, original_manifest)
+                except OSError as rollback_error:
+                    raise QAFailure(
+                        "QA evidence publication and rollback both failed: "
+                        f"publish={publish_error}; rollback={rollback_error}"
+                    ) from publish_error
+                if isinstance(publish_error, OSError):
+                    raise QAFailure(
+                        f"cannot publish QA evidence: {publish_error}"
+                    ) from publish_error
+                raise
+    except QAFailure:
+        raise
+    except (CLIContractError, OSError) as error:
+        raise QAFailure(f"cannot write QA evidence: {error}") from error
+
+
+def _restore_optional_file(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+    else:
+        _replace_bytes_atomic(path, content)
 
 
 def _require_safe_directory(path: Path) -> None:
