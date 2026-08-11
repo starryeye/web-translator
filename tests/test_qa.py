@@ -232,6 +232,66 @@ def test_protected_url_rejects_added_path_and_query_but_allows_sentence_period(
     assert result.required_findings[0].evidence["changed_segments"] == ["a", "b"]
 
 
+def test_protected_url_rejects_an_extra_complete_value_with_a_different_boundary(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><p data-wt-segment="a">'
+            'Visit https://example.com/docs normal.</p></main>'
+        ),
+        output_body=(
+            '<main><p>https://example.com/docs normal. '
+            'Duplicate https://example.com/docs.</p></main>'
+        ),
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={
+                "a": [ProtectedToken(TOKEN, "url", "https://example.com/docs")]
+            },
+            translated_texts={"a": f"{TOKEN} normal."},
+            master_review=MasterReview(["skip Chromium for token regression"], {}, {}),
+        )
+    )
+
+    assert [finding.code for finding in result.required_findings] == [
+        "protected-token-integrity",
+        "master-review-unresolved",
+    ]
+    assert result.required_findings[0].evidence["changed_segments"] == ["a"]
+
+
+def test_protected_keyword_rejects_an_extra_complete_value_with_a_different_boundary(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body='<main><p data-wt-segment="a">MUST retry.</p></main>',
+        output_body='<main><p>MUST retry. Duplicate MUST.</p></main>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            protected_tokens={"a": [ProtectedToken(TOKEN, "keyword", "MUST")]},
+            translated_texts={"a": f"{TOKEN} retry."},
+            master_review=MasterReview(["skip Chromium for token regression"], {}, {}),
+        )
+    )
+
+    assert [finding.code for finding in result.required_findings] == [
+        "protected-token-integrity",
+        "master-review-unresolved",
+    ]
+    assert result.required_findings[0].evidence["changed_segments"] == ["a"]
+
+
 def test_qa_detects_structural_change_and_unresolved_internal_anchor(tmp_path: Path) -> None:
     source, output = _write_pages(
         tmp_path,

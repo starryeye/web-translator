@@ -195,6 +195,9 @@ def _check_tokens(
             _exact_fragment_count(source_fragment, value, kind) != count
             for (value, kind), count in source_expectations.items()
         ) or any(
+            _exact_fragment_count(output_fragment, value, kind) != count
+            for (value, kind), count in source_expectations.items()
+        ) or any(
             _guarded_fragment_count(output_fragment, value, kind, guard) != count
             for (value, kind, guard), count in output_expectations.items()
         ):
