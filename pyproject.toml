@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web-translator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Translate public static web pages into reviewed offline Korean HTML bundles."
 requires-python = ">=3.11"
 dependencies = [

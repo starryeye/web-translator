@@ -16,6 +16,7 @@ import pytest
 import httpx
 from bs4 import BeautifulSoup
 
+from web_translator import __version__
 import web_translator.capture as capture_module
 import web_translator.cli as cli_module
 from web_translator.capture import CaptureError, capture_page
@@ -232,7 +233,7 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
         "warnings",
     }
     assert manifest["schema_version"] == "1.0"
-    assert manifest["tool"] == {"name": "web-translator", "version": "0.1.0"}
+    assert manifest["tool"] == {"name": "web-translator", "version": __version__}
     assert manifest["capture"] == {
         "captured_at": capture["captured_at"],
         "final_url": capture["final_url"],

@@ -17,6 +17,23 @@ py -3.12 -m venv .venv
 
 The final command downloads the browser used for layout, offline, and screenshot QA.
 
+## Versioning
+
+The release version is declared in `.codex-plugin/plugin.json` and mirrored in
+`pyproject.toml` and `src/web_translator/__init__.py`. Keep all three synchronized
+with the standard-library-only helper:
+
+```powershell
+python .\scripts\version.py check
+python .\scripts\version.py show
+python .\scripts\version.py bump patch
+python .\scripts\version.py set 1.0.0
+```
+
+Use `patch` for compatible fixes, `minor` for backward-compatible features, and
+`major` for breaking changes. Marketplace releases must vendor a committed plugin
+snapshot; Codex displays the vendored `.codex-plugin/plugin.json` version.
+
 ## Use from Codex
 
 Ask Codex to translate exactly one public URL, for example:
