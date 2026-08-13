@@ -142,6 +142,38 @@ def test_location_tokens_are_transparent_metadata_but_keep_placeholder_integrity
     assert result.required_findings == []
 
 
+def test_nested_segment_tokens_are_transparent_after_child_translation(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        source_body=(
+            '<main><div data-wt-segment="a">'
+            '<p data-wt-segment="b">Hello child</p></div></main>'
+        ),
+        output_body='<main><div><p>번역된 하위 항목</p></div></main>',
+    )
+    child_token = ProtectedToken(
+        TOKEN,
+        "segment",
+        '<p data-wt-segment="b">Hello child</p>',
+    )
+
+    result = run_qa(
+        _inputs(
+            source,
+            output,
+            source_segment_ids={"a", "b"},
+            translated_segment_ids={"a", "b"},
+            protected_tokens={"a": [child_token]},
+            translated_texts={"a": TOKEN, "b": "번역된 하위 항목"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
 def test_location_aware_attribute_protected_values_are_checked_in_attributes(
     tmp_path: Path,
 ) -> None:
@@ -669,6 +701,43 @@ def test_qa_statically_detects_external_import_hidden_by_offline_csp(
         "urls": ["https://cdn.example/theme.css"]
     }
     assert result.screenshots == []
+
+
+def test_external_source_script_is_not_an_offline_dependency_when_csp_blocks_scripts(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head='<script src="https://cdn.example/app.js"></script>',
+        output_head=(
+            '<meta data-wt-csp="offline" http-equiv="Content-Security-Policy" '
+            'content="default-src \'none\'; script-src \'none\'">'
+            '<script src="https://cdn.example/app.js"></script>'
+        ),
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert result.passed is True
+    assert result.required_findings == []
+
+
+def test_external_script_remains_required_without_the_offline_csp(
+    tmp_path: Path,
+) -> None:
+    source, output = _write_pages(
+        tmp_path,
+        head='<script src="https://cdn.example/app.js"></script>',
+    )
+
+    result = run_qa(_inputs(source, output))
+
+    assert [finding.code for finding in result.required_findings] == [
+        "external-critical-dependency"
+    ]
+    assert result.required_findings[0].evidence == {
+        "urls": ["https://cdn.example/app.js"]
+    }
 
 
 def test_protocol_relative_stylesheet_is_external_but_metadata_link_is_not(

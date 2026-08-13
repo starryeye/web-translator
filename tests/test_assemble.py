@@ -725,6 +725,107 @@ def test_assembly_rejects_executable_restored_markup_and_changed_shape(
         )
 
 
+def test_assembly_preserves_an_empty_style_element_inside_excluded_svg(
+    tmp_path: Path,
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<a href="https://github.com/example/project" title="GitHub">'
+        '<svg viewbox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">'
+        '<style type="text/css"></style><path d="M0 0h16v16z"></path></svg>'
+        'GitHub Project</a>',
+    )
+    extracted = extract_segments(source, source.parent / "segments.jsonl")
+    assert len(extracted) == 1
+    item = extracted[0]
+    assert any(
+        token.kind == "excluded" and "<style" in token.value
+        for token in item.protected
+    )
+
+    output = assemble_page(
+        source,
+        {item.id: item},
+        {
+            item.id: translation(
+                item.id,
+                item.source_text.replace("GitHub Project", "GitHub 프로젝트"),
+            )
+        },
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    soup = BeautifulSoup(output.read_text("utf-8"), "lxml")
+    assert soup.a.get_text(" ", strip=True) == "GitHub 프로젝트"
+    assert soup.svg.style is not None
+    assert soup.svg.style.get_text(strip=True) == ""
+    assert soup.svg.path["d"] == "M0 0h16v16z"
+
+
+def test_assembly_preserves_exact_excluded_source_script_behind_offline_csp(
+    tmp_path: Path,
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<p>Copyright 2005 - <script>document.write(new Date().getFullYear());</script> '
+        'Example. All Rights Reserved.</p>',
+    )
+    extracted = extract_segments(source, source.parent / "segments.jsonl")
+    assert len(extracted) == 1
+    item = extracted[0]
+    assert any(
+        token.kind == "excluded" and token.value.startswith("<script>")
+        for token in item.protected
+    )
+
+    output = assemble_page(
+        source,
+        {item.id: item},
+        {
+            item.id: translation(
+                item.id,
+                item.source_text.replace("All Rights Reserved.", "모든 권리 보유."),
+            )
+        },
+        {},
+        tmp_path / "out",
+        "https://example.com/",
+    )
+
+    soup = BeautifulSoup(output.read_text("utf-8"), "lxml")
+    assert soup.script.string == "document.write(new Date().getFullYear());"
+    csp = soup.find("meta", attrs={"http-equiv": "Content-Security-Policy"})
+    assert csp is not None
+    assert "script-src 'none'" in csp["content"]
+
+
+def test_assembly_still_rejects_nonempty_svg_style_from_restored_markup(
+    tmp_path: Path,
+) -> None:
+    source = write_source(
+        tmp_path,
+        '<p data-wt-segment="seg-000001"><svg><style></style></svg></p>',
+    )
+    dangerous = '<svg><style>@import url("https://evil.test/x.css");</style></svg>'
+    unsafe_segment = segment(
+        "seg-000001",
+        TOKEN,
+        protected=[ProtectedToken(TOKEN, "code", dangerous)],
+    )
+
+    with pytest.raises(AssemblyError, match="executable"):
+        assemble_page(
+            source,
+            {"seg-000001": unsafe_segment},
+            {"seg-000001": translation("seg-000001", TOKEN)},
+            {},
+            tmp_path / "out",
+            "https://example.com/",
+        )
+
+
 @pytest.mark.parametrize(
     "html",
     [

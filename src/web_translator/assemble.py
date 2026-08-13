@@ -121,9 +121,9 @@ def assemble_page(
                     )
                 element[attribute] = value
             if content is not None:
-                _replace_element_content(element, content, segment_id)
+                _replace_element_content(element, content, segment)
         else:
-            _replace_element_content(element, restored, segment_id)
+            _replace_element_content(element, restored, segment)
         del element["data-wt-segment"]
 
     if soup.select_one("[data-wt-segment]") is not None:
@@ -223,11 +223,11 @@ def _parse_location_payload(
     return attributes, content
 
 
-def _replace_element_content(element: Tag, restored: str, segment_id: str) -> None:
+def _replace_element_content(element: Tag, restored: str, segment: Segment) -> None:
     fragment = BeautifulSoup(restored, "html.parser")
-    _reject_executable_fragment(fragment, segment_id)
+    _reject_executable_fragment(fragment, segment)
     if _shape(element) != _shape(fragment):
-        raise AssemblyError(f"translated fragment shape changed for {segment_id}")
+        raise AssemblyError(f"translated fragment shape changed for {segment.id}")
     replacement = list(fragment.contents)
     element.clear()
     for child in replacement:
@@ -292,24 +292,43 @@ def _tag_signature(tag: Tag) -> tuple[object, ...]:
     )
 
 
-def _reject_executable_fragment(fragment: BeautifulSoup, segment_id: str) -> None:
+def _reject_executable_fragment(fragment: BeautifulSoup, segment: Segment) -> None:
+    allowed_executable = _excluded_executable_markup(segment)
     for tag in fragment.find_all(True):
         name = tag.name.lower()
         if name in _EXECUTABLE_TAGS or name in {"html", "head", "body"}:
-            raise AssemblyError(f"executable tag in translated fragment {segment_id}: {name}")
+            markup = str(tag)
+            if allowed_executable[markup] <= 0:
+                raise AssemblyError(
+                    f"executable tag in translated fragment {segment.id}: {name}"
+                )
+            allowed_executable[markup] -= 1
         for attribute, value in tag.attrs.items():
             lowered_attribute = attribute.lower()
             values = value if isinstance(value, list) else [value]
             if lowered_attribute.startswith("on") or lowered_attribute == "srcdoc":
                 raise AssemblyError(
-                    f"executable attribute in translated fragment {segment_id}: {attribute}"
+                    f"executable attribute in translated fragment {segment.id}: {attribute}"
                 )
             if lowered_attribute in _URL_ATTRIBUTES and any(
                 _is_executable_url(str(item)) for item in values
             ):
                 raise AssemblyError(
-                    f"executable URL in translated fragment {segment_id}: {attribute}"
+                    f"executable URL in translated fragment {segment.id}: {attribute}"
                 )
+
+
+def _excluded_executable_markup(segment: Segment) -> Counter[str]:
+    """Return executable nodes that can only be restored from exact excluded tokens."""
+    allowed: Counter[str] = Counter()
+    for token in segment.protected:
+        if token.kind != "excluded":
+            continue
+        protected_fragment = BeautifulSoup(token.value, "html.parser")
+        for tag in protected_fragment.find_all(True):
+            if tag.name.lower() in _EXECUTABLE_TAGS:
+                allowed[str(tag)] += 1
+    return allowed
 
 
 def _is_executable_url(value: str) -> bool:

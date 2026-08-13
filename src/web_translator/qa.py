@@ -228,12 +228,13 @@ def _check_tokens(
         kinds_by_value: dict[str, set[str]] = {}
         output_expectations: Counter[tuple[str, str, str | None]] = Counter()
         semantic_text = text
-        guard_tokens = [token for token in tokens if token.kind != "location"]
+        metadata_kinds = {"location", "segment"}
+        guard_tokens = [token for token in tokens if token.kind not in metadata_kinds]
         for token in tokens:
-            if token.kind == "location":
+            if token.kind in metadata_kinds:
                 semantic_text = semantic_text.replace(token.token, "")
         for token in tokens:
-            if token.kind in {"tag", "location"}:
+            if token.kind in {"tag", *metadata_kinds}:
                 continue
             normalized = _normalized_fragment(token.value)
             if not normalized:
@@ -568,6 +569,8 @@ def _check_external_dependencies(
         name = tag.name.lower()
         if name == "link":
             classification = _link_dependency_class(tag)
+        elif name == "script":
+            classification = None
         elif name in _OPTIONAL_TAGS:
             classification = "optional"
         elif name == "a":
