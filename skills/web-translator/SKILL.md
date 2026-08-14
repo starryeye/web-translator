@@ -26,47 +26,75 @@ checks prove structure; only the master can approve meaning. Read
    $python = (Resolve-Path ".\.venv\Scripts\python.exe").Path
    & $python -m web_translator capture $url --run-dir $workDir
    & $python -m web_translator extract --run-dir $workDir
-   & $python -m web_translator plan-zones --run-dir $workDir --max-chars 12000
+   & $python -m web_translator plan-zones --run-dir $workDir --max-chars 12000 --target-zones 3
    ```
 
+   Three target zones match the normal three translator slots and minimize the slowest
+   assignment by estimated source size. If the active collaboration surface explicitly
+   advertises a different translator-slot limit, use that positive limit for
+   `--target-zones` instead. `--max-chars` remains a hard bound.
+
 3. Read `segments.jsonl` and all `zones/*.json`. Build a concise outline and the same
-   document summary for every translator. Write the canonical `glossary.json` as an
-   object mapping retained English technical terms to Korean glosses. You may refine
-   semantic zone boundaries, but preserve the exact target partition: every target ID
-   appears once, no context ID becomes a target, and no target is added or removed.
+   document summary for every translator (the same document summary is embedded in each
+   package). Write the canonical `glossary.json` as an
+   object mapping retained English technical terms to Korean glosses. Preserve the exact
+   target partition: every target ID appears once, no context ID becomes a target, and
+   no target is added or removed.
+
+   Write the concise summary to `document-summary.txt`, then build one immutable
+   assignment package per zone using the deterministic packager:
+
+   ```powershell
+   & $python -m web_translator prepare-assignments --run-dir $workDir
+   ```
+
+   The generated packages follow
+   [assignment-package.md](references/assignment-package.md). Each contains the concise
+   summary, canonical glossary, exactly that zone's full target records, and only its
+   bounded read-only neighbor context records. Do not paste source records into agent prompts.
 
 4. Create `translations/`. Schedule one zone per available agent slot with
-   `spawn_agent`; queue remaining zones until a slot is free. Each translator prompt is
-   a positive contract containing, in this order:
+   `spawn_agent` and `fork_turns="none"`; use `reasoning_effort="medium"` for the
+   translation draft. Queue remaining zones until a slot is free. Every short,
+   self-contained prompt supplies only:
 
-   - the same document summary and canonical glossary;
-   - the complete `translator-contract.md`;
-   - exactly that zone's assigned target records;
-   - only its preceding/following read-only neighbor context; and
-   - one absolute destination: `translations/<zone-id>.jsonl`.
+   - the absolute immutable assignment package path;
+   - the absolute `translator-contract.md` path, which the agent must read completely;
+   - one absolute destination: `translations/<zone-id>.jsonl`; and
+   - the requirement to return only that path plus a short ambiguity note.
 
-   Require one zone result file and a response containing only its absolute path plus a
-   short ambiguity note. Agents must not edit `segments.jsonl`, `zones/`, `glossary.json`,
-   the DOM, another zone, or a shared aggregate file.
+   Require one zone result file from each fresh agent identity. Agents must not
+   edit the immutable assignment package, `segments.jsonl`, `zones/`, `glossary.json`,
+   the DOM, another zone, or a shared aggregate file. The assignment package plus these
+   paths is the complete positive contract; never rely on inherited conversation context.
 
-5. After every initial zone file exists, run **deterministic result validation before semantic review**:
+5. As soon as each zone file exists, run **deterministic result validation before semantic review** for that zone, even while other translators are still running:
+
+   ```powershell
+   & $python -m web_translator validate-translations --run-dir $workDir --zone-id zone-001
+   ```
+
+   Substitute the completed zone ID. Do not review or assemble invalid records. Send concrete schema, coverage, ID, or
+   protected-token findings back with `followup_task` to the same agent assigned to that
+   zone. Re-run deterministic validation after every replacement.
+
+6. The master, not another translator, owns semantic approval. The workflow must review completed zones while other translators are still running. Review every zone against every dimension in
+   `review-rubric.md`, including both read-only boundaries. Record concise written
+   evidence for every dimension. Deterministic validation may supply the protected-content
+   evidence; the master still judges meaning, qualifications, naturalness, terminology,
+   and boundaries. For any `required-fix`, send only the affected segment IDs, source,
+   output, and required correction to the same agent with `followup_task`. Each zone has
+   a maximum of two retries after its initial attempt. Never hand a failed zone to the
+   first free agent. Revalidate before reviewing each retry.
+
+7. After every zone has a valid result, run the aggregate validator once to prove exact
+   document-wide coverage before assembly:
 
    ```powershell
    & $python -m web_translator validate-translations --run-dir $workDir
    ```
 
-   Do not review or assemble invalid records. Send concrete schema, coverage, ID, or
-   protected-token findings back with `followup_task` to the same agent assigned to that
-   zone. Re-run deterministic validation after every replacement.
-
-6. The master, not another translator, reviews every zone against every dimension in
-   `review-rubric.md`, including both read-only boundaries. Record a verdict and written
-   evidence for every dimension. For any `required-fix`, send the segment IDs, source,
-   output, and required correction to the same agent with `followup_task`. Each zone has
-   a maximum of two retries after its initial attempt. Never hand a failed zone to the
-   first free agent. Revalidate before reviewing each retry.
-
-7. Merge glossary observations into the canonical glossary only after master judgment.
+   Merge glossary observations into the canonical glossary only after master judgment.
    Normalize first-use glossary placement document-wide: retain each English technical
    term everywhere and allow its Korean gloss only at the earliest eligible occurrence.
    Write `review.json` with `retries` exactly covering every planned zone and mapping to

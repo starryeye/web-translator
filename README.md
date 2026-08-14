@@ -58,6 +58,14 @@ translated-pages/<host>-<path>-<UTC timestamp>/
 The completion response links to `index.html` and `review-report.md` with absolute local
 paths and reports optional asset warnings.
 
+### Performance-oriented orchestration
+
+The default skill targets three size-balanced zones, starts each translator with no
+inherited chat history, and passes document input through immutable assignment files.
+The master validates and reviews each completed zone while the other translators are
+still running, then performs one final aggregate validation. This keeps the complete
+master-review and fail-closed guarantees while reducing duplicated context and idle time.
+
 ## Direct CLI stages
 
 The skill normally orchestrates these commands. They are also useful for diagnosis:
@@ -65,7 +73,9 @@ The skill normally orchestrates these commands. They are also useful for diagnos
 ```powershell
 .\.venv\Scripts\python.exe -m web_translator capture <URL> --run-dir <WORK_DIR>
 .\.venv\Scripts\python.exe -m web_translator extract --run-dir <WORK_DIR>
-.\.venv\Scripts\python.exe -m web_translator plan-zones --run-dir <WORK_DIR> --max-chars 12000
+.\.venv\Scripts\python.exe -m web_translator plan-zones --run-dir <WORK_DIR> --max-chars 12000 --target-zones 3
+.\.venv\Scripts\python.exe -m web_translator prepare-assignments --run-dir <WORK_DIR>
+.\.venv\Scripts\python.exe -m web_translator validate-translations --run-dir <WORK_DIR> --zone-id zone-001
 .\.venv\Scripts\python.exe -m web_translator validate-translations --run-dir <WORK_DIR>
 .\.venv\Scripts\python.exe -m web_translator assemble --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 .\.venv\Scripts\python.exe -m web_translator qa --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>

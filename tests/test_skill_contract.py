@@ -17,6 +17,8 @@ def test_skill_requires_master_review_and_isolated_subagents() -> None:
         "review-rubric.md",
         "maximum of two retries",
         "never report partial output as complete",
+        'fork_turns="none"',
+        "immutable assignment package",
     ):
         assert phrase in text
 
@@ -48,6 +50,10 @@ def test_skill_defines_the_fail_closed_master_sequence() -> None:
         "qa",
         "absolute links",
         "optional-asset warnings",
+        "--target-zones 3",
+        "prepare-assignments",
+        "--zone-id",
+        "review completed zones while other translators are still running",
     ):
         assert phrase in text
 
@@ -67,6 +73,24 @@ def test_translator_contract_is_strict_and_contextual() -> None:
         assert phrase in text
     assert '"segment_id"' in text
     assert '"text"' in text
+
+
+def test_assignment_package_keeps_fresh_agent_prompts_bounded() -> None:
+    text = Path(
+        "skills/web-translator/references/assignment-package.md"
+    ).read_text("utf-8")
+    for phrase in (
+        '"schema_version"',
+        '"zone_id"',
+        '"document_summary"',
+        '"glossary"',
+        '"targets"',
+        '"context_before"',
+        '"context_after"',
+        "Do not include unrelated segments",
+        "never modify it afterward",
+    ):
+        assert phrase in text
 
 
 def test_review_rubric_requires_evidence_for_every_dimension() -> None:
@@ -117,7 +141,7 @@ def test_skill_resolves_one_interpreter_and_persists_review_evidence() -> None:
     skill = SKILL.read_text("utf-8")
     readme = Path("README.md").read_text("utf-8")
     assert '$python = (Resolve-Path ".\\.venv\\Scripts\\python.exe").Path' in skill
-    assert skill.count("& $python -m web_translator") == 6
+    assert skill.count("& $python -m web_translator") == 8
     assert "section_findings must exactly cover every planned zone" in skill
     assert "integers from 0 through 2" in skill
     assert '"unresolved_required": []' in skill

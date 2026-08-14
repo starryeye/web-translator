@@ -764,6 +764,139 @@ def test_validate_rejects_stale_translation_files(
     assert "unexpected translation entries" in output.err
 
 
+def test_validate_one_completed_zone_before_other_results_exist(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    write_empty_run_contract(run_dir)
+    segments = [
+        {
+            "id": f"seg-{index:06d}",
+            "locator": f"[data-wt-segment='seg-{index:06d}']",
+            "semantic_type": "paragraph",
+            "heading_path": [],
+            "source_text": f"Source {index}",
+            "protected": [],
+            "context_ids": [],
+            "target": True,
+        }
+        for index in (1, 2)
+    ]
+    (run_dir / "segments.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in segments), encoding="utf-8"
+    )
+    for index in (1, 2):
+        zone_id = f"zone-{index:03d}"
+        segment_id = f"seg-{index:06d}"
+        (run_dir / "zones" / f"{zone_id}.json").write_text(
+            json.dumps(
+                {
+                    "attempt": 0,
+                    "context_after_ids": [],
+                    "context_before_ids": [],
+                    "expected_tokens": {segment_id: []},
+                    "heading_path": [],
+                    "id": zone_id,
+                    "target_ids": [segment_id],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    (run_dir / "translations" / "zone-001.jsonl").write_text(
+        '{"segment_id":"seg-000001","text":"번역 1","notes":null,"glossary_observations":{}}\n',
+        encoding="utf-8",
+    )
+
+    assert (
+        main(
+            [
+                "validate-translations",
+                "--run-dir",
+                str(run_dir),
+                "--zone-id",
+                "zone-001",
+            ]
+        )
+        == 0
+    )
+    assert main(["validate-translations", "--run-dir", str(run_dir)]) == 4
+    statuses = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [status["status"] for status in statuses] == ["ok", "error"]
+
+
+def test_prepare_assignments_builds_bounded_immutable_zone_packages(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    write_single_segment_run_contract(run_dir)
+    (run_dir / "document-summary.txt").write_text(
+        "OAuth 문서의 목적과 흐름", encoding="utf-8"
+    )
+    (run_dir / "glossary.json").write_text(
+        '{"OAuth":"권한 위임"}\n', encoding="utf-8"
+    )
+
+    assert main(["prepare-assignments", "--run-dir", str(run_dir)]) == 0
+
+    package = json.loads(
+        (run_dir / "assignments" / "zone-001.json").read_text("utf-8")
+    )
+    assert package == {
+        "context_after": [],
+        "context_before": [],
+        "document_summary": "OAuth 문서의 목적과 흐름",
+        "glossary": {"OAuth": "권한 위임"},
+        "schema_version": "1.0",
+        "targets": [
+            {
+                "heading_path": [],
+                "id": "seg-000001",
+                "protected": [],
+                "semantic_type": "paragraph",
+                "source_text": "OAuth",
+            }
+        ],
+        "zone_id": "zone-001",
+    }
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
+@pytest.mark.parametrize("summary", ["", "X" * 4_001])
+def test_prepare_assignments_rejects_missing_or_oversized_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    summary: str,
+) -> None:
+    run_dir = tmp_path / "run"
+    write_single_segment_run_contract(run_dir)
+    (run_dir / "document-summary.txt").write_text(summary, encoding="utf-8")
+
+    assert main(["prepare-assignments", "--run-dir", str(run_dir)]) == 4
+    assert "document summary" in capsys.readouterr().err
+
+
+def test_validate_one_zone_rejects_unknown_zone_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    write_single_segment_run_contract(run_dir)
+
+    assert (
+        main(
+            [
+                "validate-translations",
+                "--run-dir",
+                str(run_dir),
+                "--zone-id",
+                "zone-999",
+            ]
+        )
+        == 4
+    )
+    assert "unknown zone ID" in capsys.readouterr().err
+
+
 def test_assemble_rejects_unsafe_capture_asset_paths_as_contract_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

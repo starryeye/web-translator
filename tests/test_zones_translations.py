@@ -92,6 +92,49 @@ def test_zone_count_changes_when_complete_sections_fit_the_limit() -> None:
     assert len(build_zones(segments, max_chars=10_000)) == 1
 
 
+def test_target_zone_count_balances_a_dominant_section_by_estimated_size() -> None:
+    segments: list[Segment] = []
+    segment_number = 1
+    for section_number, section_size in enumerate((181, 57, 72), start=1):
+        for offset in range(section_size):
+            segments.append(
+                segment(
+                    f"seg-{segment_number:06d}",
+                    "X" * 100,
+                    semantic_type="heading" if offset == 0 else "paragraph",
+                    heading_path=[f"Section {section_number}"],
+                )
+            )
+            segment_number += 1
+
+    zones = build_zones(segments, max_chars=12_000, target_zones=3)
+    sizes = [
+        sum(
+            len(next(item.source_text for item in segments if item.id == segment_id))
+            for segment_id in zone.target_ids
+        )
+        for zone in zones
+    ]
+
+    assert len(zones) == 3
+    assert max(sizes) - min(sizes) <= 100
+    assert [segment_id for zone in zones for segment_id in zone.target_ids] == [
+        item.id for item in segments
+    ]
+
+
+def test_target_zone_count_never_violates_the_hard_character_bound() -> None:
+    segments = [
+        segment(f"seg-{index:06d}", "X" * 6_000)
+        for index in range(1, 5)
+    ]
+
+    zones = build_zones(segments, max_chars=6_000, target_zones=3)
+
+    assert len(zones) == 4
+    assert all(len(zone.target_ids) == 1 for zone in zones)
+
+
 def test_zone_splits_an_oversized_section_at_segment_boundaries() -> None:
     segments = [
         segment("seg-000001", "Large", semantic_type="heading"),
@@ -228,6 +271,15 @@ def test_zone_partition_contains_only_every_target_once() -> None:
 def test_zone_builder_rejects_invalid_character_limit(max_chars: object) -> None:
     with pytest.raises(ValueError, match="max_chars"):
         build_zones([segment("seg-000001", "Text")], max_chars=max_chars)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("target_zones", [0, -1, True, 65])
+def test_zone_builder_rejects_invalid_target_zone_count(target_zones: object) -> None:
+    with pytest.raises(ValueError, match="target_zones"):
+        build_zones(
+            [segment("seg-000001", "Text")],
+            target_zones=target_zones,  # type: ignore[arg-type]
+        )
 
 
 def test_zone_builder_rejects_duplicate_segment_ids() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -12,6 +13,9 @@ from web_translator.models import Segment
 
 class ZoneContractError(ValueError):
     """Segments or zone parameters violate the planning contract."""
+
+
+MAX_TARGET_ZONES = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +55,9 @@ class Zone:
 
 
 def build_zones(
-    segments: Sequence[Segment], max_chars: int = 12_000
+    segments: Sequence[Segment],
+    max_chars: int = 12_000,
+    target_zones: int | None = None,
 ) -> list[Zone]:
     """Return source-ordered assignments whose targets and context fit the bound.
 
@@ -61,6 +67,14 @@ def build_zones(
     """
     if type(max_chars) is not int or max_chars <= 0:
         raise ZoneContractError("max_chars must be a positive integer")
+    if target_zones is not None and (
+        type(target_zones) is not int
+        or target_zones <= 0
+        or target_zones > MAX_TARGET_ZONES
+    ):
+        raise ZoneContractError(
+            f"target_zones must be an integer from 1 through {MAX_TARGET_ZONES}"
+        )
 
     ordered = list(segments)
     ids = [item.id for item in ordered]
@@ -86,39 +100,39 @@ def build_zones(
         sections.append(current)
 
     pack_items: list[list[int]] = []
+    atomic_items: list[list[int]] = []
+    section_boundaries: set[int] = set()
     for section in sections:
         units = _atomic_units(section, ordered)
+        for unit in units:
+            unit_chars = _indices_chars(unit, ordered)
+            if unit_chars > max_chars:
+                _raise_oversized_unit(unit, ordered)
+            atomic_items.append(unit)
+        section_boundaries.add(len(atomic_items))
         section_chars = _indices_chars(section, ordered)
         if section_chars <= max_chars:
             pack_items.append(section)
             continue
         for unit in units:
-            unit_chars = _indices_chars(unit, ordered)
-            if unit_chars > max_chars:
-                identifiers = ", ".join(ordered[index].id for index in unit)
-                row_key = _row_key(ordered[unit[0]].semantic_type)
-                if row_key is not None:
-                    raise ZoneContractError(
-                        f"indivisible table row {row_key} exceeds max_chars: {identifiers}"
-                    )
-                raise ZoneContractError(
-                    f"indivisible segment {identifiers} exceeds max_chars"
-                )
             pack_items.append(unit)
 
-    packed_sections: list[list[int]] = []
-    current_indices: list[int] = []
-    current_chars = 0
-    for item in pack_items:
-        item_chars = _indices_chars(item, ordered)
-        if current_indices and current_chars + item_chars > max_chars:
-            packed_sections.append(current_indices)
-            current_indices = []
-            current_chars = 0
-        current_indices.extend(item)
-        current_chars += item_chars
-    if current_indices:
-        packed_sections.append(current_indices)
+    if target_zones is None:
+        packed_sections = _greedy_pack(pack_items, ordered, max_chars)
+    else:
+        greedy_atomic = _greedy_pack(atomic_items, ordered, max_chars)
+        minimum_zones = len(greedy_atomic)
+        if minimum_zones > target_zones:
+            packed_sections = greedy_atomic
+        else:
+            desired_zones = min(len(atomic_items), target_zones)
+            packed_sections = _balanced_pack(
+                atomic_items,
+                ordered,
+                desired_zones,
+                max_chars,
+                section_boundaries,
+            )
 
     zones: list[Zone] = []
     for zone_number, indices in enumerate(packed_sections, start=1):
@@ -145,6 +159,128 @@ def build_zones(
     if assigned != expected or len(assigned) != len(set(assigned)):
         raise ZoneContractError("zone target IDs do not form an exact partition")
     return zones
+
+
+def _raise_oversized_unit(unit: Sequence[int], ordered: Sequence[Segment]) -> None:
+    identifiers = ", ".join(ordered[index].id for index in unit)
+    row_key = _row_key(ordered[unit[0]].semantic_type)
+    if row_key is not None:
+        raise ZoneContractError(
+            f"indivisible table row {row_key} exceeds max_chars: {identifiers}"
+        )
+    raise ZoneContractError(f"indivisible segment {identifiers} exceeds max_chars")
+
+
+def _greedy_pack(
+    items: Sequence[Sequence[int]],
+    ordered: Sequence[Segment],
+    max_chars: int,
+) -> list[list[int]]:
+    packed: list[list[int]] = []
+    current_indices: list[int] = []
+    current_chars = 0
+    for item in items:
+        item_chars = _indices_chars(item, ordered)
+        if current_indices and current_chars + item_chars > max_chars:
+            packed.append(current_indices)
+            current_indices = []
+            current_chars = 0
+        current_indices.extend(item)
+        current_chars += item_chars
+    if current_indices:
+        packed.append(current_indices)
+    return packed
+
+
+def _balanced_pack(
+    items: Sequence[Sequence[int]],
+    ordered: Sequence[Segment],
+    zone_count: int,
+    max_chars: int,
+    section_boundaries: set[int],
+) -> list[list[int]]:
+    """Partition ordered atomic items while minimizing the slowest zone."""
+    if not items:
+        return []
+    weights = [_indices_chars(item, ordered) for item in items]
+    prefix = [0]
+    for weight in weights:
+        prefix.append(prefix[-1] + weight)
+    total = prefix[-1]
+    capacity = _minimum_balanced_capacity(weights, zone_count, max_chars)
+    minimum_from = _minimum_zones_from(prefix, capacity)
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    remaining_total = total
+    for zones_left in range(zone_count, 1, -1):
+        maximum_end = len(items) - (zones_left - 1)
+        best_end: int | None = None
+        best_objective: tuple[int, int] | None = None
+        for end in range(start + 1, maximum_end + 1):
+            weight = prefix[end] - prefix[start]
+            if weight > capacity:
+                break
+            if minimum_from[end] > zones_left - 1:
+                continue
+            objective = (
+                abs(weight * zones_left - remaining_total),
+                int(end not in section_boundaries),
+            )
+            if best_objective is None or objective < best_objective:
+                best_objective = objective
+                best_end = end
+        if best_end is None:
+            raise ZoneContractError(
+                "cannot satisfy target_zones without exceeding max_chars"
+            )
+        ranges.append((start, best_end))
+        remaining_total -= prefix[best_end] - prefix[start]
+        start = best_end
+    ranges.append((start, len(items)))
+    return [
+        [index for item in items[start:end] for index in item]
+        for start, end in ranges
+    ]
+
+
+def _minimum_balanced_capacity(
+    weights: Sequence[int], zone_count: int, max_chars: int
+) -> int:
+    total = sum(weights)
+    lower = max(max(weights), (total + zone_count - 1) // zone_count)
+    upper = max_chars
+    while lower < upper:
+        candidate = (lower + upper) // 2
+        if _required_zone_count(weights, candidate) <= zone_count:
+            upper = candidate
+        else:
+            lower = candidate + 1
+    return lower
+
+
+def _required_zone_count(weights: Sequence[int], capacity: int) -> int:
+    count = 0
+    current = 0
+    has_items = False
+    for weight in weights:
+        if has_items and current + weight > capacity:
+            count += 1
+            current = 0
+            has_items = False
+        current += weight
+        has_items = True
+    return count + int(has_items)
+
+
+def _minimum_zones_from(prefix: Sequence[int], capacity: int) -> list[int]:
+    result = [0] * len(prefix)
+    for start in range(len(prefix) - 2, -1, -1):
+        end = bisect_right(prefix, prefix[start] + capacity, lo=start + 1) - 1
+        if end <= start:
+            raise ZoneContractError("an atomic zone item exceeds max_chars")
+        result[start] = 1 + result[end]
+    return result
 
 
 def _indices_chars(indices: Sequence[int], ordered: Sequence[Segment]) -> int:

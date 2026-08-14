@@ -40,7 +40,12 @@ from web_translator.paths import validate_public_url
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
-from web_translator.zones import Zone, ZoneContractError, build_zones
+from web_translator.zones import (
+    MAX_TARGET_ZONES,
+    Zone,
+    ZoneContractError,
+    build_zones,
+)
 
 
 EXIT_INVALID_ARGUMENTS = 2
@@ -155,12 +160,20 @@ def _build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan-zones", help="Create translation zones.")
     _add_run_dir(plan)
     plan.add_argument("--max-chars", type=int, default=12_000)
+    plan.add_argument("--target-zones", type=int)
     plan.set_defaults(handler=_plan_zones_command)
+
+    assignments = subparsers.add_parser(
+        "prepare-assignments", help="Build immutable translator assignment packages."
+    )
+    _add_run_dir(assignments)
+    assignments.set_defaults(handler=_prepare_assignments_command)
 
     validate = subparsers.add_parser(
         "validate-translations", help="Validate reviewed zone results."
     )
     _add_run_dir(validate)
+    validate.add_argument("--zone-id")
     validate.set_defaults(handler=_validate_translations_command)
 
     assemble = subparsers.add_parser("assemble", help="Assemble the offline page.")
@@ -267,10 +280,18 @@ def _extract_command(args: argparse.Namespace) -> None:
 def _plan_zones_command(args: argparse.Namespace) -> None:
     if args.max_chars <= 0:
         raise InvalidArgumentsError("max-chars must be a positive integer")
+    if args.target_zones is not None and not 1 <= args.target_zones <= MAX_TARGET_ZONES:
+        raise InvalidArgumentsError(
+            f"target-zones must be from 1 through {MAX_TARGET_ZONES}"
+        )
     _validate_run_root(args.run_dir)
     segments = _read_segments(args.run_dir)
     try:
-        zones = build_zones(segments, max_chars=args.max_chars)
+        zones = build_zones(
+            segments,
+            max_chars=args.max_chars,
+            target_zones=args.target_zones,
+        )
     except ZoneContractError as error:
         raise CLIContractError(str(error)) from error
     zone_dir = args.run_dir / "zones"
@@ -288,8 +309,110 @@ def _validate_translations_command(args: argparse.Namespace) -> None:
     _validate_run_root(args.run_dir)
     segments = _read_segments(args.run_dir)
     zones = _read_zones(args.run_dir)
+    if args.zone_id is not None:
+        matches = [zone for zone in zones if zone.id == args.zone_id]
+        if len(matches) != 1:
+            raise CLIContractError(f"unknown zone ID: {args.zone_id}")
+        zone = matches[0]
+        result_dir = _validate_partial_translation_files(args.run_dir, zones, zone)
+        target_ids = set(zone.target_ids)
+        merge_translations(
+            [segment for segment in segments if segment.id in target_ids],
+            [zone],
+            result_dir,
+        )
+        return
     result_dir = _validate_translation_files(args.run_dir, zones)
     merge_translations(segments, zones, result_dir)
+
+
+def _prepare_assignments_command(args: argparse.Namespace) -> None:
+    _validate_run_root(args.run_dir)
+    segments = _read_segments(args.run_dir)
+    zones = _read_zones(args.run_dir)
+    glossary = _read_glossary(args.run_dir / "glossary.json")
+    summary_path = args.run_dir / "document-summary.txt"
+    try:
+        _require_safe_file(summary_path)
+        summary = summary_path.read_text(encoding="utf-8").strip()
+    except (CLIContractError, OSError, UnicodeError) as error:
+        raise CLIContractError(f"cannot read document summary {summary_path}: {error}") from error
+    if not summary or len(summary) > 4_000:
+        raise CLIContractError(
+            "document summary must contain from 1 through 4000 characters"
+        )
+
+    by_id = {segment.id: segment for segment in segments}
+    if len(by_id) != len(segments):
+        raise CLIContractError("assignment source contains duplicate segment IDs")
+    assigned = [segment_id for zone in zones for segment_id in zone.target_ids]
+    expected = [segment.id for segment in segments if segment.target]
+    if assigned != expected or len(assigned) != len(set(assigned)):
+        raise CLIContractError(
+            "assignment zones must exactly partition source targets in order"
+        )
+
+    destination = args.run_dir / "assignments"
+    if destination.exists() or destination.is_symlink():
+        raise CLIContractError(f"assignment directory already exists: {destination}")
+    _reject_if_link(destination)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".assignments-", dir=args.run_dir
+        ) as temporary_name:
+            temporary = Path(temporary_name) / "assignments"
+            temporary.mkdir()
+            for zone in zones:
+                if set(zone.target_ids) & set(
+                    zone.context_before_ids + zone.context_after_ids
+                ):
+                    raise CLIContractError(
+                        f"assignment context overlaps targets: {zone.id}"
+                    )
+                payload = {
+                    "context_after": _assignment_records(
+                        zone.context_after_ids, by_id, zone.id
+                    ),
+                    "context_before": _assignment_records(
+                        zone.context_before_ids, by_id, zone.id
+                    ),
+                    "document_summary": summary,
+                    "glossary": glossary,
+                    "schema_version": "1.0",
+                    "targets": _assignment_records(zone.target_ids, by_id, zone.id),
+                    "zone_id": zone.id,
+                }
+                _write_json_atomic(temporary / f"{zone.id}.json", payload)
+            os.replace(temporary, destination)
+    except CLIContractError:
+        raise
+    except OSError as error:
+        raise CLIContractError(f"cannot publish assignment packages: {error}") from error
+
+
+def _assignment_records(
+    segment_ids: Sequence[str], by_id: Mapping[str, Segment], zone_id: str
+) -> list[dict[str, Any]]:
+    if len(segment_ids) != len(set(segment_ids)):
+        raise CLIContractError(f"assignment contains duplicate segment IDs: {zone_id}")
+    missing = [segment_id for segment_id in segment_ids if segment_id not in by_id]
+    if missing:
+        raise CLIContractError(
+            f"assignment references missing segments in {zone_id}: {', '.join(missing)}"
+        )
+    records: list[dict[str, Any]] = []
+    for segment_id in segment_ids:
+        segment = by_id[segment_id]
+        records.append(
+            {
+                "heading_path": segment.heading_path,
+                "id": segment.id,
+                "protected": [token.to_dict() for token in segment.protected],
+                "semantic_type": segment.semantic_type,
+                "source_text": segment.source_text,
+            }
+        )
+    return records
 
 
 def _assemble_command(args: argparse.Namespace) -> None:
@@ -754,6 +877,30 @@ def _validate_translation_files(run_dir: Path, zones: Sequence[Zone]) -> Path:
         raise CLIContractError(f"missing translation entries: {', '.join(missing)}")
     for path in entries:
         _require_safe_file(path)
+    return result_dir
+
+
+def _validate_partial_translation_files(
+    run_dir: Path, zones: Sequence[Zone], requested: Zone
+) -> Path:
+    result_dir = run_dir / "translations"
+    _require_safe_directory(result_dir)
+    try:
+        entries = sorted(result_dir.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        raise CLIContractError(
+            f"cannot read translation directory {result_dir}: {error}"
+        ) from error
+    expected = {f"{zone.id}.jsonl" for zone in zones}
+    unexpected = sorted(path.name for path in entries if path.name not in expected)
+    if unexpected:
+        raise CLIContractError(
+            f"unexpected translation entries: {', '.join(unexpected)}"
+        )
+    for path in entries:
+        _require_safe_file(path)
+    requested_path = result_dir / f"{requested.id}.jsonl"
+    _require_safe_file(requested_path)
     return result_dir
 
 
