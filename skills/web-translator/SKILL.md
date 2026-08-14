@@ -36,8 +36,8 @@ checks prove structure; only the master can approve meaning. Read
 
 3. Read `segments.jsonl` and all `zones/*.json`. Build a concise outline and the same
    document summary for every translator (the same document summary is embedded in each
-   package). Write the canonical `glossary.json` as an
-   object mapping retained English technical terms to Korean glosses. Preserve the exact
+   package). Write the canonical `glossary.json` as an object mapping retained English
+   technical terms to Korean glosses. Preserve the exact
    target partition: every target ID appears once, no context ID becomes a target, and
    no target is added or removed.
 
@@ -50,8 +50,9 @@ checks prove structure; only the master can approve meaning. Read
 
    The generated packages follow
    [assignment-package.md](references/assignment-package.md). Each contains the concise
-   summary, canonical glossary, exactly that zone's full target records, and only its
-   bounded read-only neighbor context records. Do not paste source records into agent prompts.
+   summary, canonical glossary, exactly that zone's compact target translation fields,
+   and only its bounded read-only neighbor context fields. Do not paste source records
+   into agent prompts.
 
 4. Create `translations/`. Schedule one zone per available agent slot with
    `spawn_agent` and `fork_turns="none"`; use `reasoning_effort="medium"` for the
@@ -68,18 +69,21 @@ checks prove structure; only the master can approve meaning. Read
    the DOM, another zone, or a shared aggregate file. The assignment package plus these
    paths is the complete positive contract; never rely on inherited conversation context.
 
-5. As soon as each zone file exists, run **deterministic result validation before semantic review** for that zone, even while other translators are still running:
+5. As soon as each zone file exists, run **deterministic result validation before
+   semantic review** for that zone, even while other translators are still running:
 
    ```powershell
    & $python -m web_translator validate-translations --run-dir $workDir --zone-id zone-001
    ```
 
-   Substitute the completed zone ID. Do not review or assemble invalid records. Send concrete schema, coverage, ID, or
-   protected-token findings back with `followup_task` to the same agent assigned to that
-   zone. Re-run deterministic validation after every replacement.
+   Substitute the completed zone ID. Do not review or assemble invalid records. Send
+   concrete schema, coverage, ID, or protected-token findings back with `followup_task`
+   to the same agent assigned to that zone. Re-run deterministic validation after every
+   replacement.
 
-6. The master, not another translator, owns semantic approval. The workflow must review completed zones while other translators are still running. Review every zone against every dimension in
-   `review-rubric.md`, including both read-only boundaries. Record concise written
+6. The master, not another translator, owns semantic approval. The workflow must review
+   completed zones while other translators are still running. Review every zone against
+   every dimension in `review-rubric.md`, including both read-only boundaries. Record concise written
    evidence for every dimension. Deterministic validation may supply the protected-content
    evidence; the master still judges meaning, qualifications, naturalness, terminology,
    and boundaries. For any `required-fix`, send only the affected segment IDs, source,

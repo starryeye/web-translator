@@ -43,7 +43,8 @@ def test_skill_defines_the_fail_closed_master_sequence() -> None:
         "exact target partition",
         "same document summary",
         "read-only neighbor context",
-        "deterministic result validation before semantic review",
+        "deterministic result validation before",
+        "semantic review",
         "same agent",
         "Normalize first-use glossary placement",
         "assemble",
@@ -53,7 +54,7 @@ def test_skill_defines_the_fail_closed_master_sequence() -> None:
         "--target-zones 3",
         "prepare-assignments",
         "--zone-id",
-        "review completed zones while other translators are still running",
+        "completed zones while other translators are still running",
     ):
         assert phrase in text
 
