@@ -10,6 +10,37 @@ checks prove structure; only the master can approve meaning. Read
 [translator-contract.md](references/translator-contract.md) before dispatch and
 [review-rubric.md](references/review-rubric.md) before review.
 
+## Platform execution contract
+
+Detect the active OS and shell yourself. Never ask the user to choose a platform.
+Resolve the repository-local virtual-environment interpreter once, keep its absolute
+path, and do not depend on environment activation:
+
+- Windows PowerShell:
+
+  ```powershell
+  $python = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+  ```
+
+- macOS or Linux with a POSIX shell:
+
+  ```sh
+  python="$(cd .venv/bin && pwd -P)/python"
+  ```
+
+Every `<python>` token below means the native invocation prefix for that resolved path:
+PowerShell: `& $python`; POSIX: `"$python"`. Replace the remaining placeholders with
+the platform-native variables before each tool call:
+
+- PowerShell: `<url>` → `$url`, `<work-dir>` → `$workDir`, and
+  `<output-dir>` → `$outputDir`.
+- POSIX: `<url>` → `"$url"`, `<work-dir>` → `"$work_dir"`, and
+  `<output-dir>` → `"$output_dir"`.
+
+Never execute a placeholder literally. Never build or evaluate a command string. Invoke
+the resolved interpreter directly and pass every URL and filesystem path as one argument,
+preserving spaces and non-ASCII characters.
+
 ## Master workflow
 
 1. Confirm the request contains exactly one supported public URL: one unauthenticated
@@ -19,14 +50,13 @@ checks prove structure; only the master can approve meaning. Read
 
 2. Create unique paths with `web_translator.paths.create_run_paths(Path.cwd(), url,
    datetime.now(UTC))`. Keep the returned `work_dir` and unused `output_dir` absolute.
-   Resolve the installed interpreter once; do not depend on an activated environment.
-   Run these commands in order and stop on any nonzero exit:
+   Run these commands with the platform execution contract above and stop on any nonzero
+   exit:
 
-   ```powershell
-   $python = (Resolve-Path ".\.venv\Scripts\python.exe").Path
-   & $python -m web_translator capture $url --run-dir $workDir
-   & $python -m web_translator extract --run-dir $workDir
-   & $python -m web_translator plan-zones --run-dir $workDir --max-chars 12000 --target-zones 3
+   ```text
+   <python> -m web_translator capture <url> --run-dir <work-dir>
+   <python> -m web_translator extract --run-dir <work-dir>
+   <python> -m web_translator plan-zones --run-dir <work-dir> --max-chars 12000 --target-zones 3
    ```
 
    Three target zones match the normal three translator slots and minimize the slowest
@@ -44,8 +74,8 @@ checks prove structure; only the master can approve meaning. Read
    Write the concise summary to `document-summary.txt`, then build one immutable
    assignment package per zone using the deterministic packager:
 
-   ```powershell
-   & $python -m web_translator prepare-assignments --run-dir $workDir
+   ```text
+   <python> -m web_translator prepare-assignments --run-dir <work-dir>
    ```
 
    The generated packages follow
@@ -72,8 +102,8 @@ checks prove structure; only the master can approve meaning. Read
 5. As soon as each zone file exists, run **deterministic result validation before
    semantic review** for that zone, even while other translators are still running:
 
-   ```powershell
-   & $python -m web_translator validate-translations --run-dir $workDir --zone-id zone-001
+   ```text
+   <python> -m web_translator validate-translations --run-dir <work-dir> --zone-id zone-001
    ```
 
    Substitute the completed zone ID. Do not review or assemble invalid records. Send
@@ -94,8 +124,8 @@ checks prove structure; only the master can approve meaning. Read
 7. After every zone has a valid result, run the aggregate validator once to prove exact
    document-wide coverage before assembly:
 
-   ```powershell
-   & $python -m web_translator validate-translations --run-dir $workDir
+   ```text
+   <python> -m web_translator validate-translations --run-dir <work-dir>
    ```
 
    Merge glossary observations into the canonical glossary only after master judgment.
@@ -127,9 +157,9 @@ checks prove structure; only the master can approve meaning. Read
 
 8. Only when deterministic validation passes and every rubric verdict is `pass`, run:
 
-   ```powershell
-   & $python -m web_translator assemble --run-dir $workDir --output-dir $outputDir
-   & $python -m web_translator qa --run-dir $workDir --output-dir $outputDir
+   ```text
+   <python> -m web_translator assemble --run-dir <work-dir> --output-dir <output-dir>
+   <python> -m web_translator qa --run-dir <work-dir> --output-dir <output-dir>
    ```
 
    Treat any nonzero exit, unresolved required finding, missing artifact, or failed QA

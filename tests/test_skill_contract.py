@@ -122,10 +122,12 @@ def test_live_samples_are_opt_in_and_cover_both_approved_urls() -> None:
     assert "not live" in project
 
 
-def test_readme_documents_windows_usage_and_validation() -> None:
+def test_readme_documents_cross_platform_usage_and_validation() -> None:
     text = Path("README.md").read_text("utf-8")
     for phrase in (
         "Windows",
+        "macOS",
+        ".venv/bin/python",
         "playwright install chromium",
         "translated-pages",
         "Limitations",
@@ -141,8 +143,13 @@ def test_readme_documents_windows_usage_and_validation() -> None:
 def test_skill_resolves_one_interpreter_and_persists_review_evidence() -> None:
     skill = SKILL.read_text("utf-8")
     readme = Path("README.md").read_text("utf-8")
+    assert "Detect the active OS and shell yourself" in skill
+    assert "Never ask the user to choose a platform" in skill
     assert '$python = (Resolve-Path ".\\.venv\\Scripts\\python.exe").Path' in skill
-    assert skill.count("& $python -m web_translator") == 8
+    assert 'python="$(cd .venv/bin && pwd -P)/python"' in skill
+    assert 'PowerShell: `& $python`' in skill
+    assert 'POSIX: `"$python"`' in skill
+    assert skill.count("<python> -m web_translator") == 8
     assert "section_findings must exactly cover every planned zone" in skill
     assert "integers from 0 through 2" in skill
     assert '"unresolved_required": []' in skill
@@ -160,5 +167,24 @@ def test_skill_resolves_one_interpreter_and_persists_review_evidence() -> None:
     assert "non-empty `evidence`" in skill
     assert "sorted, unique string array" in skill
     assert "`zone-ID:dimension`" in skill
-    assert '.\\.venv\\Scripts\\python.exe -m web_translator capture' in readme
+    assert '.\\.venv\\Scripts\\python.exe' in readme
+    assert './.venv/bin/python' in readme
     assert "assets/ (when captured)" in readme
+
+
+def test_skill_preserves_platform_arguments_as_single_values() -> None:
+    skill = SKILL.read_text("utf-8")
+    readme = Path("README.md").read_text("utf-8")
+
+    for substitution in (
+        '`<url>` → `$url`',
+        '`<work-dir>` → `$workDir`',
+        '`<output-dir>` → `$outputDir`',
+        '`<url>` → `"$url"`',
+        '`<work-dir>` → `"$work_dir"`',
+        '`<output-dir>` → `"$output_dir"`',
+    ):
+        assert substitution in skill
+    assert "Never build or evaluate a command string" in skill
+    assert '& $python -m web_translator capture $url --run-dir $workDir' in readme
+    assert '"$python" -m web_translator capture "$url" --run-dir "$work_dir"' in readme
