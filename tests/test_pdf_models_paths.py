@@ -72,6 +72,30 @@ def test_pdf_records_reject_mistyped_or_invalid_values(
         record_type.from_dict(payload)
 
 
+def test_pdf_source_record_requires_sorted_unique_warning_evidence() -> None:
+    payload = make_pdf_source_record().to_dict()
+    payload["warnings"] = ["generic-content-type: application/octet-stream"]
+
+    record = PdfSourceRecord.from_dict(payload)
+
+    assert record.warnings == ["generic-content-type: application/octet-stream"]
+
+    unsorted = dict(payload)
+    unsorted["warnings"] = ["z-warning", "a-warning"]
+    with pytest.raises(PdfContractError, match="warnings must be sorted and unique"):
+        PdfSourceRecord.from_dict(unsorted)
+
+    duplicate = dict(payload)
+    duplicate["warnings"] = ["generic-content-type: application/octet-stream"] * 2
+    with pytest.raises(PdfContractError, match="warnings must be sorted and unique"):
+        PdfSourceRecord.from_dict(duplicate)
+
+    missing = dict(payload)
+    del missing["warnings"]
+    with pytest.raises(PdfContractError, match="fields must be exactly"):
+        PdfSourceRecord.from_dict(missing)
+
+
 def test_pdf_document_round_trip_rejects_unknown_fields() -> None:
     document = PdfDocument(
         schema_version="1.0",

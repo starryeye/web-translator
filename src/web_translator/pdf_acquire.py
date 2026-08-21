@@ -98,6 +98,7 @@ def _acquire_local_pdf(
         sha256=digest,
         now=now,
         redirects=[],
+        warnings=[],
     )
 
 
@@ -145,6 +146,11 @@ def _acquire_public_pdf(
         sha256=hashlib.sha256(content).hexdigest(),
         now=now,
         redirects=[str(item.url) for item in response.history],
+        warnings=(
+            [f"generic-content-type: {content_type}"]
+            if content_type in _GENERIC_BINARY_TYPES
+            else []
+        ),
     )
 
 
@@ -240,6 +246,7 @@ def _source_record(
     sha256: str,
     now: datetime | None,
     redirects: list[str],
+    warnings: list[str],
 ) -> PdfSourceRecord:
     acquired = now or datetime.now(UTC)
     acquired_at = (
@@ -257,4 +264,5 @@ def _source_record(
         sha256=sha256,
         acquired_at=acquired_at,
         redirects=redirects,
+        warnings=warnings,
     )

@@ -50,6 +50,7 @@ class PdfSourceRecord:
     sha256: str
     acquired_at: str
     redirects: list[str]
+    warnings: list[str]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -62,6 +63,7 @@ class PdfSourceRecord:
             "sha256": self.sha256,
             "acquired_at": self.acquired_at,
             "redirects": list(self.redirects),
+            "warnings": list(self.warnings),
         }
 
     @classmethod
@@ -70,11 +72,14 @@ class PdfSourceRecord:
         data = _require_exact_fields(
             data, context,
             {"schema_version", "input_kind", "requested_source", "final_source", "content_type",
-             "byte_length", "sha256", "acquired_at", "redirects"},
+             "byte_length", "sha256", "acquired_at", "redirects", "warnings"},
         )
         input_kind = _require_string(data, "input_kind", context)
         if input_kind not in {"local", "public"}:
             raise PdfContractError(f"{context}.input_kind must be local or public")
+        warnings = _require_string_list(data, "warnings", context)
+        if warnings != sorted(set(warnings)):
+            raise PdfContractError(f"{context}.warnings must be sorted and unique")
         return cls(
             schema_version=_require_schema_version(data, context),
             input_kind=input_kind,
@@ -85,6 +90,7 @@ class PdfSourceRecord:
             sha256=_require_sha256(data, "sha256", context),
             acquired_at=_require_string(data, "acquired_at", context),
             redirects=_require_string_list(data, "redirects", context),
+            warnings=warnings,
         )
 
 

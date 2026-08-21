@@ -47,6 +47,7 @@ def test_acquire_local_pdf_copies_to_fresh_inode_and_records_private_provenance(
     assert record.byte_length == len(PDF)
     assert record.acquired_at == "2026-08-21T01:02:03Z"
     assert record.redirects == []
+    assert record.warnings == []
 
 
 @pytest.mark.parametrize("kind", ["link", "directory"])
@@ -125,6 +126,7 @@ def test_acquire_public_pdf_records_redirect_chain_and_accepts_generic_binary_ty
     assert record.final_source == "https://cdn.example/report.pdf"
     assert record.content_type == "application/octet-stream"
     assert record.redirects == ["https://start.example/report.pdf"]
+    assert record.warnings == ["generic-content-type: application/octet-stream"]
     assert (tmp_path / "run" / "source.pdf").read_bytes() == PDF
 
 
@@ -174,6 +176,7 @@ def test_acquire_public_pdf_measures_streamed_content_not_lie_in_content_length(
     )
 
     assert record.byte_length == len(PDF)
+    assert record.warnings == []
     assert (tmp_path / "run" / "source.pdf").read_bytes() == PDF
 
 

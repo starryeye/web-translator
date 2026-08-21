@@ -44,6 +44,7 @@ def test_pdf_acquire_cli_requires_an_empty_run_directory_and_writes_source_metad
     source_json = json.loads((run_dir / "source.json").read_text(encoding="utf-8"))
     assert source_json["input_kind"] == "local"
     assert source_json["requested_source"] == "source.pdf"
+    assert source_json["warnings"] == []
     assert json.loads(capsys.readouterr().out) == {
         "command": "pdf-acquire", "exit_code": 0, "status": "ok"
     }

@@ -25,6 +25,7 @@ def make_pdf_source_record() -> PdfSourceRecord:
         sha256="a" * 64,
         acquired_at="2026-08-21T01:02:03Z",
         redirects=[],
+        warnings=[],
     )
 
 
