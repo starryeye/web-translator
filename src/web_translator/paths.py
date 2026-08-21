@@ -48,7 +48,7 @@ def create_run_paths(workspace: Path, url: str, now: datetime) -> RunPaths:
 
 def create_pdf_run_paths(workspace: Path, source_label: str, now: datetime) -> RunPaths:
     """Allocate one private run directory and a reserved PDF output path."""
-    source_name = Path(source_label).name
+    source_name = Path(source_label.replace("\\", "/")).name
     stem = Path(source_name).stem or "document"
     base_run_id = "-".join(
         part for part in (_slugify(stem), _utc_timestamp(now)) if part

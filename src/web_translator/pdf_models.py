@@ -290,11 +290,33 @@ class PdfBlock:
         if segment_id is not None and not _SEGMENT_ID.fullmatch(segment_id):
             raise PdfContractError(f"{context}.segment_id must be a stable segment ID")
         table_id = _require_optional_string(data, "table_id", context)
-        if table_id is not None and not _TABLE_ID.fullmatch(table_id):
+        table_match = _TABLE_ID.fullmatch(table_id) if table_id is not None else None
+        if table_id is not None and table_match is None:
             raise PdfContractError(f"{context}.table_id must be a stable table ID")
+        if table_match is not None and int(table_match.group("page")) != page_number:
+            raise PdfContractError(f"{context}.table_id page must match page_number")
         caption_id = _require_optional_string(data, "caption_id", context)
         if caption_id is not None and not _BLOCK_ID.fullmatch(caption_id):
             raise PdfContractError(f"{context}.caption_id must be a stable block ID")
+        row = _require_optional_nonnegative_int(data, "row", context)
+        column = _require_optional_nonnegative_int(data, "column", context)
+        row_span = _require_positive_int(data, "row_span", context)
+        column_span = _require_positive_int(data, "column_span", context)
+        table_metadata_complete = table_id is not None and row is not None and column is not None
+        if kind == "table-cell" and not table_metadata_complete:
+            raise PdfContractError(
+                f"{context} table-cell blocks must include table_id, row, and column"
+            )
+        if kind != "table-cell" and (
+            table_id is not None or row is not None or column is not None
+        ):
+            raise PdfContractError(
+                f"{context} table metadata must include table_id, row, and column together"
+            )
+        if not table_metadata_complete and (row_span != 1 or column_span != 1):
+            raise PdfContractError(
+                f"{context} table metadata must include table_id, row, and column together"
+            )
         return cls(
             id=identifier,
             page_number=page_number,
@@ -305,10 +327,10 @@ class PdfBlock:
             source_text=_require_string(data, "source_text", context),
             segment_id=segment_id,
             table_id=table_id,
-            row=_require_optional_nonnegative_int(data, "row", context),
-            column=_require_optional_nonnegative_int(data, "column", context),
-            row_span=_require_positive_int(data, "row_span", context),
-            column_span=_require_positive_int(data, "column_span", context),
+            row=row,
+            column=column,
+            row_span=row_span,
+            column_span=column_span,
             media_path=_require_optional_relative_path(data, "media_path", context),
             caption_id=caption_id,
             uri=_require_optional_string(data, "uri", context),
@@ -380,6 +402,8 @@ class PdfDocument:
         blocks = [PdfBlock.from_dict(_require_mapping(item, f"{context}.blocks[{index}]")) for index, item in enumerate(_require_list(data, "blocks", context))]
         if [block.order for block in blocks] != list(range(len(blocks))):
             raise PdfContractError(f"{context}.blocks must be in exact document order")
+        if len({block.id for block in blocks}) != len(blocks):
+            raise PdfContractError(f"{context}.blocks must have unique IDs")
         if any(block.page_number > page_count for block in blocks):
             raise PdfContractError(f"{context}.blocks must refer to source pages")
         table_cells = [PdfTableCell.from_dict(_require_mapping(item, f"{context}.table_cells[{index}]")) for index, item in enumerate(_require_list(data, "table_cells", context))]

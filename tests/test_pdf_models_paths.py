@@ -109,6 +109,37 @@ def test_pdf_document_rejects_blocks_outside_document_order() -> None:
         PdfDocument.from_dict(payload)
 
 
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"table_id": "pdf:page-0002:table-0001", "row": 0, "column": 0},
+            "table_id page must match page_number",
+        ),
+        ({"kind": "table-cell"}, "table-cell blocks must include table_id, row, and column"),
+        ({"row": 0}, "table metadata must include table_id, row, and column together"),
+    ],
+)
+def test_pdf_block_rejects_incoherent_table_metadata(
+    changes: dict[str, object], message: str
+) -> None:
+    payload = make_pdf_block().to_dict()
+    payload.update(changes)
+
+    with pytest.raises(PdfContractError, match=message):
+        PdfBlock.from_dict(payload)
+
+
+def test_pdf_document_rejects_duplicate_block_ids() -> None:
+    payload = make_pdf_document().to_dict()
+    duplicate = make_pdf_block(order=1).to_dict()
+    duplicate["id"] = payload["blocks"][0]["id"]
+    payload["blocks"].append(duplicate)
+
+    with pytest.raises(PdfContractError, match="blocks must have unique IDs"):
+        PdfDocument.from_dict(payload)
+
+
 def test_pdf_run_paths_use_separate_collision_safe_output_root(tmp_path: Path) -> None:
     now = datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC)
     existing = tmp_path / "translated-pdfs" / "report-20260821-010203"
@@ -122,3 +153,21 @@ def test_pdf_run_paths_use_separate_collision_safe_output_root(tmp_path: Path) -
     assert (existing / "keep.txt").read_text(encoding="utf-8") == "existing output"
     assert paths.work_dir.is_dir()
     assert not paths.output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("source_label", "expected_run_id"),
+    [
+        ("자료 보고서 final.pdf", "final-20260821-010203"),
+        (r"C:\자료 폴더\quarterly report.pdf", "quarterly-report-20260821-010203"),
+    ],
+)
+def test_pdf_run_paths_portably_derive_slug_from_source_label(
+    tmp_path: Path, source_label: str, expected_run_id: str
+) -> None:
+    now = datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC)
+
+    paths = create_pdf_run_paths(tmp_path, source_label, now)
+
+    assert paths.run_id == expected_run_id
+    assert paths.work_dir.name == expected_run_id
