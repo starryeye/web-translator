@@ -236,28 +236,42 @@ def find_clear_gutter(
     candidates = [
         line
         for line in lines
-        if not line.is_heading and line.width <= page_width * 0.60
+        if not line.is_heading
+        and line.kind not in {"header", "footer", "page-number"}
     ]
-    centers = sorted({line.center_x for line in candidates})
-    gutters: list[tuple[float, float]] = []
-    for left_center, right_center in zip(centers, centers[1:]):
-        split = (left_center + right_center) / 2.0
-        left = [line for line in candidates if line.center_x <= split]
-        right = [line for line in candidates if line.center_x > split]
-        if not left or not right:
-            continue
-        gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
-        if gutter[1] - gutter[0] + 1e-9 < minimum_width:
-            continue
-        if not any(
-            math.isclose(gutter[0], existing[0], abs_tol=0.01)
-            and math.isclose(gutter[1], existing[1], abs_tol=0.01)
-            for existing in gutters
-        ):
-            gutters.append(gutter)
+    evidence: list[tuple[tuple[float, float], tuple[int, int]]] = []
+    for left_boundary in candidates:
+        for right_boundary in candidates:
+            if right_boundary.x0 - left_boundary.x1 + 1e-9 < minimum_width:
+                continue
+            left = [line for line in candidates if line.x1 <= left_boundary.x1]
+            right = [line for line in candidates if line.x0 >= right_boundary.x0]
+            if not left or not right:
+                continue
+            gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
+            if gutter[1] - gutter[0] + 1e-9 < minimum_width:
+                continue
+            score = (len(left) + len(right), min(len(left), len(right)))
+            matching = next(
+                (
+                    index
+                    for index, (existing, _) in enumerate(evidence)
+                    if math.isclose(gutter[0], existing[0], abs_tol=0.01)
+                    and math.isclose(gutter[1], existing[1], abs_tol=0.01)
+                ),
+                None,
+            )
+            if matching is None:
+                evidence.append((gutter, score))
+            elif score > evidence[matching][1]:
+                evidence[matching] = (gutter, score)
+    if not evidence:
+        return None
+    best_score = max(score for _, score in evidence)
+    gutters = [gutter for gutter, score in evidence if score == best_score]
     if len(gutters) > 1:
         raise PdfExtractionError("ambiguous column evidence")
-    return gutters[0] if gutters else None
+    return gutters[0]
 
 
 def order_page_lines(lines: Sequence[PdfLine], page_width: float) -> list[PdfLine]:
@@ -335,7 +349,7 @@ def classify_document_lines(
     sizes: Counter[int] = Counter()
     for lines in normalized:
         for line in lines:
-            if line.kind is None and _LIST_PATTERN.match(line.text) is None:
+            if line.kind is None:
                 sizes[round(line.size)] += line.character_count
     body_size = max(sizes, key=lambda size: (sizes[size], -size)) if sizes else 0
     heading_sizes = sorted(
@@ -345,14 +359,20 @@ def classify_document_lines(
     result: list[list[PdfLine]] = []
     for lines in normalized:
         classified: list[PdfLine] = []
-        for line in lines:
+        for index, line in enumerate(lines):
             if line.kind is not None:
                 classified.append(line)
                 continue
             rounded_size = round(line.size)
             heading_candidate = rounded_size in heading_sizes or line.bold
-            if heading_candidate and _LIST_PATTERN.match(line.text) is None:
-                number = _HEADING_NUMBER_PATTERN.match(line.text)
+            list_marker = _LIST_PATTERN.match(line.text)
+            number = _HEADING_NUMBER_PATTERN.match(line.text)
+            numbered_heading = (
+                heading_candidate
+                and number is not None
+                and _has_heading_spacing(lines, index)
+            )
+            if heading_candidate and (list_marker is None or numbered_heading):
                 if number is not None:
                     level = number.group("number").count(".") + 1
                 elif rounded_size in heading_sizes:
@@ -360,12 +380,30 @@ def classify_document_lines(
                 else:
                     level = len(heading_sizes) + 1
                 classified.append(replace(line, kind="heading", heading_level=level))
-            elif _LIST_PATTERN.match(line.text) is not None:
+            elif list_marker is not None:
                 classified.append(replace(line, kind="list-item"))
             else:
                 classified.append(replace(line, kind="paragraph"))
         result.append(classified)
     return result
+
+
+def _has_heading_spacing(lines: Sequence[PdfLine], index: int) -> bool:
+    line = lines[index]
+    gaps: list[float] = []
+    neighboring_sizes: list[float] = [line.size]
+    if index > 0:
+        previous = lines[index - 1]
+        gaps.append(max(0.0, line.top - previous.bottom))
+        neighboring_sizes.append(previous.size)
+    if index + 1 < len(lines):
+        following = lines[index + 1]
+        gaps.append(max(0.0, following.top - line.bottom))
+        neighboring_sizes.append(following.size)
+    if not gaps:
+        return False
+    threshold = max(neighboring_sizes) * 0.75
+    return any(gap >= threshold for gap in gaps)
 
 
 def _classify_page_numbers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:

@@ -120,9 +120,9 @@ def _column_pdf(path: Path, *, columns: int) -> Path:
 def _heading_hierarchy_pdf(path: Path) -> Path:
     canvas = Canvas(str(path), pagesize=(612, 792))
     canvas.setFont("Helvetica-Bold", 18)
-    canvas.drawString(72, 720, "1 Architecture")
+    canvas.drawString(72, 720, "1. Architecture")
     canvas.setFont("Helvetica-Bold", 14)
-    canvas.drawString(72, 680, "1.1 Layers")
+    canvas.drawString(72, 680, "1.1. Layers")
     canvas.setFont("Helvetica", 11)
     canvas.drawString(
         72,
@@ -188,6 +188,37 @@ def test_order_page_lines_uses_an_eighteen_point_gutter_boundary() -> None:
         "L1",
         "R1",
         "L2",
+        "R2",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("left_bounds", "right_bounds"),
+    [
+        ((0, 128), (146, 200)),
+        ((0, 54), (72, 200)),
+    ],
+    ids=["seventy-thirty", "thirty-seventy"],
+)
+def test_order_page_lines_detects_asymmetric_clear_gutters(
+    left_bounds: tuple[float, float],
+    right_bounds: tuple[float, float],
+) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("L1", x0=left_bounds[0], x1=left_bounds[1], top=10, bottom=20),
+            _word("R1", x0=right_bounds[0], x1=right_bounds[1], top=10, bottom=20),
+            _word("L2", x0=left_bounds[0], x1=left_bounds[1], top=30, bottom=40),
+            _word("R2", x0=right_bounds[0], x1=right_bounds[1], top=30, bottom=40),
+        ]
+    )
+
+    assert [line.text for line in order_page_lines(lines, 200)] == [
+        "L1",
+        "L2",
+        "R1",
         "R2",
     ]
 
@@ -273,6 +304,81 @@ def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     assert [(block.kind, block.source_text) for block in blocks] == [
         ("paragraph", "First line continues"),
         ("list-item", "- item"),
+    ]
+
+
+def test_numbered_heading_classification_consumes_style_and_vertical_spacing() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word(
+                "1. Architecture",
+                x0=20,
+                x1=140,
+                top=10,
+                bottom=26,
+                size=16,
+                fontname="Helvetica-Bold",
+            ),
+            _word(
+                "1.1. Layers",
+                x0=20,
+                x1=120,
+                top=50,
+                bottom=64,
+                size=14,
+                fontname="Helvetica-Bold",
+            ),
+            _word(
+                "Body text makes the ten point cluster dominant for classification.",
+                x0=20,
+                x1=180,
+                top=88,
+                bottom=98,
+            ),
+            _word(
+                "1. Bold ordered item",
+                x0=35,
+                x1=155,
+                top=104,
+                bottom=116,
+                size=12,
+                fontname="Helvetica-Bold",
+            ),
+            _word(
+                "2. Bold ordered item",
+                x0=35,
+                x1=155,
+                top=119,
+                bottom=131,
+                size=12,
+                fontname="Helvetica-Bold",
+            ),
+            _word(
+                "3. Plain ordered item",
+                x0=35,
+                x1=155,
+                top=134,
+                bottom=144,
+            ),
+        ]
+    )
+    pages = [([line.with_page_geometry(200, 200) for line in lines], 200.0)]
+
+    classified = classify_document_lines(pages)[0]
+
+    assert [(line.kind, line.heading_level) for line in classified[:2]] == [
+        ("heading", 1),
+        ("heading", 2),
+    ]
+    assert [line.kind for line in classified[3:]] == [
+        "list-item",
+        "list-item",
+        "list-item",
     ]
 
 
@@ -451,7 +557,7 @@ def test_extract_pdf_builds_numbered_heading_hierarchy(tmp_path: Path) -> None:
         "heading",
         "paragraph",
     ]
-    assert segments[2].heading_path == ["1 Architecture", "1.1 Layers"]
+    assert segments[2].heading_path == ["1. Architecture", "1.1. Layers"]
 
 
 def test_extract_pdf_orders_clear_columns_and_rejects_ambiguous_columns(
