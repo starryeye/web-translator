@@ -19,6 +19,9 @@ _LIST_PATTERN = re.compile(
     r"^(?:[\u2022\u2023\u25e6\u2043\u2219*+-]|"
     r"\d+(?:\.\d+)*[.)]|[A-Za-z][.)]|[ivxlcdmIVXLCDM]+[.)])\s+"
 )
+_NUMBERED_LIST_PATTERN = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)*)(?P<marker>[.)])\s+"
+)
 _HEADING_NUMBER_PATTERN = re.compile(r"^(?P<number>\d+(?:\.\d+)*)[.)]?\s+")
 _PAGE_NUMBER_PATTERN = re.compile(r"\d+\Z")
 _TEXT_BLOCK_KINDS = {
@@ -239,7 +242,7 @@ def find_clear_gutter(
         if not line.is_heading
         and line.kind not in {"header", "footer", "page-number"}
     ]
-    evidence: list[tuple[tuple[float, float], tuple[int, int]]] = []
+    evidence: list[tuple[float, float]] = []
     for left_boundary in candidates:
         for right_boundary in candidates:
             if right_boundary.x0 - left_boundary.x1 + 1e-9 < minimum_width:
@@ -251,27 +254,29 @@ def find_clear_gutter(
             gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
             if gutter[1] - gutter[0] + 1e-9 < minimum_width:
                 continue
-            score = (len(left) + len(right), min(len(left), len(right)))
+            if not all(
+                line.x1 <= gutter[0]
+                or line.x0 >= gutter[1]
+                or line.crosses(gutter)
+                for line in candidates
+            ):
+                continue
             matching = next(
                 (
                     index
-                    for index, (existing, _) in enumerate(evidence)
+                    for index, existing in enumerate(evidence)
                     if math.isclose(gutter[0], existing[0], abs_tol=0.01)
                     and math.isclose(gutter[1], existing[1], abs_tol=0.01)
                 ),
                 None,
             )
             if matching is None:
-                evidence.append((gutter, score))
-            elif score > evidence[matching][1]:
-                evidence[matching] = (gutter, score)
+                evidence.append(gutter)
     if not evidence:
         return None
-    best_score = max(score for _, score in evidence)
-    gutters = [gutter for gutter, score in evidence if score == best_score]
-    if len(gutters) > 1:
+    if len(evidence) > 1:
         raise PdfExtractionError("ambiguous column evidence")
-    return gutters[0]
+    return evidence[0]
 
 
 def order_page_lines(lines: Sequence[PdfLine], page_width: float) -> list[PdfLine]:
@@ -371,6 +376,7 @@ def classify_document_lines(
                 heading_candidate
                 and number is not None
                 and _has_heading_spacing(lines, index)
+                and not _has_tight_numbered_list_peer(lines, index)
             )
             if heading_candidate and (list_marker is None or numbered_heading):
                 if number is not None:
@@ -404,6 +410,39 @@ def _has_heading_spacing(lines: Sequence[PdfLine], index: int) -> bool:
         return False
     threshold = max(neighboring_sizes) * 0.75
     return any(gap >= threshold for gap in gaps)
+
+
+def _has_tight_numbered_list_peer(
+    lines: Sequence[PdfLine], index: int
+) -> bool:
+    line = lines[index]
+    family = _numbered_list_family(line)
+    if family is None:
+        return False
+    for peer_index in (index - 1, index + 1):
+        if peer_index < 0 or peer_index >= len(lines):
+            continue
+        peer = lines[peer_index]
+        if _numbered_list_family(peer) != family:
+            continue
+        indent_tolerance = max(line.size, peer.size) * 0.5
+        if abs(line.x0 - peer.x0) > indent_tolerance:
+            continue
+        if peer_index < index:
+            gap = max(0.0, line.top - peer.bottom)
+        else:
+            gap = max(0.0, peer.top - line.bottom)
+        if gap < max(line.size, peer.size) * 0.75:
+            return True
+    return False
+
+
+def _numbered_list_family(line: PdfLine) -> tuple[int, str] | None:
+    marker = _NUMBERED_LIST_PATTERN.match(line.text)
+    if marker is None:
+        return None
+    depth = marker.group("number").count(".") + 1
+    return (depth, marker.group("marker"))
 
 
 def _classify_page_numbers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:

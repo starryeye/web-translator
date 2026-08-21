@@ -288,6 +288,37 @@ def test_order_page_lines_rejects_ambiguous_three_column_evidence() -> None:
         order_page_lines(lines, 200)
 
 
+@pytest.mark.parametrize(
+    "column_counts",
+    [(3, 2, 1), (1, 2, 3)],
+    ids=["three-two-one", "one-two-three"],
+)
+def test_order_page_lines_rejects_unbalanced_three_column_evidence(
+    column_counts: tuple[int, int, int],
+) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    words = []
+    for column, (x0, x1, count) in enumerate(
+        zip((10, 80, 150), (50, 120, 190), column_counts, strict=True),
+        start=1,
+    ):
+        words.extend(
+            _word(
+                f"C{column}-{line_number}",
+                x0=x0,
+                x1=x1,
+                top=10 + (line_number - 1) * 20,
+                bottom=20 + (line_number - 1) * 20,
+            )
+            for line_number in range(1, count + 1)
+        )
+    lines = group_words_into_lines(words)
+
+    with pytest.raises(PdfExtractionError, match="ambiguous column evidence"):
+        order_page_lines(lines, 200)
+
+
 def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
 
@@ -377,6 +408,71 @@ def test_numbered_heading_classification_consumes_style_and_vertical_spacing() -
     ]
     assert [line.kind for line in classified[3:]] == [
         "list-item",
+        "list-item",
+        "list-item",
+    ]
+
+
+@pytest.mark.parametrize("styled_position", ["first", "last"])
+def test_styled_ordered_list_edge_uses_tight_same_indent_peer_context(
+    styled_position: str,
+) -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    first_style = {
+        "size": 12,
+        "fontname": "Helvetica-Bold",
+    } if styled_position == "first" else {}
+    last_style = {
+        "size": 12,
+        "fontname": "Helvetica-Bold",
+    } if styled_position == "last" else {}
+    if styled_position == "first":
+        first_top, last_top, following_top = 50, 65, 82
+    else:
+        first_top, last_top, following_top = 50, 63, 110
+    lines = group_words_into_lines(
+        [
+            _word(
+                "Surrounding prose makes the ten point body cluster dominant.",
+                x0=20,
+                x1=180,
+                top=10,
+                bottom=20,
+            ),
+            _word(
+                "1. First ordered item",
+                x0=35,
+                x1=155,
+                top=first_top,
+                bottom=first_top + (12 if styled_position == "first" else 10),
+                **first_style,
+            ),
+            _word(
+                "2. Last ordered item",
+                x0=35,
+                x1=155,
+                top=last_top,
+                bottom=last_top + (12 if styled_position == "last" else 10),
+                **last_style,
+            ),
+            _word(
+                "Following prose stays outside the ordered list sequence.",
+                x0=20,
+                x1=180,
+                top=following_top,
+                bottom=following_top + 10,
+            ),
+        ]
+    )
+    pages = [([line.with_page_geometry(200, 200) for line in lines], 200.0)]
+
+    classified = classify_document_lines(pages)[0]
+
+    assert [line.kind for line in classified[1:3]] == [
         "list-item",
         "list-item",
     ]
