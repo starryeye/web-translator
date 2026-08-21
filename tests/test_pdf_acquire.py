@@ -205,18 +205,68 @@ def test_acquire_pdf_rejects_destination_race_without_overwriting_racer(
     source = tmp_path / "source.pdf"
     source.write_bytes(PDF)
     destination = tmp_path / "run" / "source.pdf"
-    original_atomic_write = acquire_module.atomic_write
+    original_link = acquire_module.os.link
 
-    def race(destination_path: Path, content: bytes) -> None:
-        destination_path.write_bytes(b"racer")
-        original_atomic_write(destination_path, content)
+    def race(source_path: Path, destination_name: str, **kwargs: object) -> None:
+        destination.write_bytes(b"racer")
+        original_link(source_path, destination_name, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(acquire_module, "atomic_write", race)
+    monkeypatch.setattr(acquire_module.os, "link", race)
 
     with pytest.raises(PdfAcquireError, match="already exists"):
         acquire_pdf(str(source), tmp_path / "run", now=FIXED_TIME)
 
     assert destination.read_bytes() == b"racer"
+
+
+def test_acquire_pdf_rejects_run_directory_swap_after_source_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    replacement_dir = tmp_path / "replacement"
+    original_publish = acquire_module._publish_staged_file
+
+    def swap_after_source(
+        temporary: Path, destination: Path, run: object
+    ) -> tuple[int, int]:
+        identity = original_publish(temporary, destination, run)  # type: ignore[arg-type]
+        if destination.name == "source.pdf":
+            run_dir.replace(replacement_dir)
+            run_dir.symlink_to(tmp_path / "attacker", target_is_directory=True)
+        return identity
+
+    monkeypatch.setattr(acquire_module, "_publish_staged_file", swap_after_source)
+
+    with pytest.raises(PdfAcquireError, match="link or reparse|changed identity"):
+        acquire_pdf(str(source), run_dir, now=FIXED_TIME)
+
+    assert not (replacement_dir / "source.pdf").exists()
+    assert run_dir.is_symlink()
+
+
+def test_acquire_pdf_rejects_destination_replaced_before_identity_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    replacement = tmp_path / "replacement.pdf"
+    replacement.write_bytes(b"racer")
+    original_link = acquire_module.os.link
+
+    def replace_after_publication(source: Path, destination: str, **kwargs: object) -> None:
+        original_link(source, destination, **kwargs)  # type: ignore[arg-type]
+        if destination == "source.pdf":
+            replacement.replace(run_dir / destination)
+
+    monkeypatch.setattr(acquire_module.os, "link", replace_after_publication)
+
+    with pytest.raises(PdfAcquireError, match="changed identity during publication"):
+        acquire_pdf(str(source), run_dir, now=FIXED_TIME)
+
+    assert (run_dir / "source.pdf").read_bytes() == b"racer"
 
 
 def test_acquire_public_pdf_records_redirect_chain_and_accepts_generic_binary_type(

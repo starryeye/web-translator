@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
 from itertools import chain
@@ -36,6 +37,14 @@ _GENERIC_BINARY_TYPES = {"application/octet-stream", "binary/octet-stream"}
 MetadataWriter = Callable[[PdfSourceRecord, Path], None]
 
 
+@dataclass(slots=True)
+class _RunDirectory:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int]
+    published: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+
 class PdfAcquireError(RuntimeError):
     """A PDF source could not be acquired safely."""
 
@@ -49,38 +58,50 @@ def acquire_pdf(
     metadata_writer: MetadataWriter | None = None,
 ) -> PdfSourceRecord:
     """Copy one validated source PDF into *run_dir* as ``source.pdf``."""
-    if _is_windows_local_path(source):
-        return _acquire_local_pdf(
-            Path(source), run_dir, now=now, metadata_writer=metadata_writer
-        )
-    parsed = urlsplit(source)
-    if parsed.scheme in {"http", "https"}:
-        return _acquire_public_pdf(
-            source,
-            run_dir,
-            transport=transport,
-            now=now,
-            metadata_writer=metadata_writer,
-        )
-    if parsed.scheme:
-        raise PdfAcquireError("PDF source must be a local path or public HTTP(S) URL")
-    return _acquire_local_pdf(
-        Path(source), run_dir, now=now, metadata_writer=metadata_writer
-    )
+    run = _prepare_destination(run_dir)
+    try:
+        if _is_windows_local_path(source):
+            record = _acquire_local_pdf(
+                Path(source), run, now=now, metadata_writer=metadata_writer
+            )
+        else:
+            parsed = urlsplit(source)
+            if parsed.scheme in {"http", "https"}:
+                record = _acquire_public_pdf(
+                    source,
+                    run,
+                    transport=transport,
+                    now=now,
+                    metadata_writer=metadata_writer,
+                )
+            elif parsed.scheme:
+                raise PdfAcquireError(
+                    "PDF source must be a local path or public HTTP(S) URL"
+                )
+            else:
+                record = _acquire_local_pdf(
+                    Path(source), run, now=now, metadata_writer=metadata_writer
+                )
+        _verify_run_identity(run)
+        return record
+    except BaseException:
+        _rollback_published(run)
+        raise
+    finally:
+        os.close(run.descriptor)
 
 
 def _acquire_local_pdf(
     source: Path,
-    run_dir: Path,
+    run: _RunDirectory,
     *,
     now: datetime | None,
     metadata_writer: MetadataWriter | None,
 ) -> PdfSourceRecord:
     initial = _regular_file_lstat(source)
-    _prepare_destination(run_dir)
     descriptor: int | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix=".pdf-acquiring-", dir=run_dir) as name:
+        with tempfile.TemporaryDirectory(prefix=".pdf-acquiring-", dir=run.path) as name:
             staging = Path(name)
             flags = (
                 os.O_RDONLY
@@ -111,7 +132,7 @@ def _acquire_local_pdf(
                 redirects=[],
                 warnings=[],
             )
-            _publish_artifacts(staging, run_dir, record, metadata_writer)
+            _publish_artifacts(staging, run, record, metadata_writer)
     except PdfAcquireError:
         raise
     except OSError as error:
@@ -124,7 +145,7 @@ def _acquire_local_pdf(
 
 def _acquire_public_pdf(
     source: str,
-    run_dir: Path,
+    run: _RunDirectory,
     *,
     transport: httpx.BaseTransport | None,
     now: datetime | None,
@@ -132,7 +153,6 @@ def _acquire_public_pdf(
 ) -> PdfSourceRecord:
     try:
         requested = str(validate_public_url(source))
-        _prepare_destination(run_dir)
         budget = NetworkBudget(
             max_bytes=MAX_PDF_BYTES,
             max_redirects=MAX_REDIRECTS,
@@ -170,11 +190,11 @@ def _acquire_public_pdf(
     )
     try:
         with tempfile.TemporaryDirectory(
-            prefix=".pdf-acquiring-", dir=run_dir
+            prefix=".pdf-acquiring-", dir=run.path
         ) as name:
             staging = Path(name)
             atomic_write(staging / "source.pdf", content)
-            _publish_artifacts(staging, run_dir, record, metadata_writer)
+            _publish_artifacts(staging, run, record, metadata_writer)
     except OSError as error:
         raise PdfAcquireError(f"cannot publish public PDF source: {error}") from error
     return record
@@ -220,19 +240,26 @@ def _copy_and_hash_pdf(
     return digest.hexdigest(), size
 
 
-def _publish_staged_file(temporary: Path, destination: Path) -> tuple[int, int]:
+def _publish_staged_file(
+    temporary: Path, destination: Path, run: _RunDirectory
+) -> tuple[int, int]:
+    _verify_run_identity(run)
+    source = _regular_file_lstat(temporary)
+    source_identity = (source.st_dev, source.st_ino)
     try:
-        with temporary.open("rb") as stream:
-            atomic_write(destination, stream.read())
+        os.link(temporary, destination.name, dst_dir_fd=run.descriptor)
     except FileExistsError as error:
         raise PdfAcquireError(f"PDF destination already exists: {destination}") from error
-    result = _regular_file_lstat(destination)
-    return result.st_dev, result.st_ino
+    run.published[destination.name] = source_identity
+    if not _matches_identity_at(run, destination.name, source_identity):
+        raise PdfAcquireError(f"PDF destination changed identity during publication: {destination}")
+    _verify_run_identity(run)
+    return source_identity
 
 
 def _publish_artifacts(
     staging: Path,
-    run_dir: Path,
+    run: _RunDirectory,
     record: PdfSourceRecord,
     metadata_writer: MetadataWriter | None,
 ) -> None:
@@ -245,30 +272,27 @@ def _publish_artifacts(
         except OSError as error:
             raise PdfAcquireError(f"cannot stage PDF metadata: {error}") from error
 
-    source_destination = run_dir / "source.pdf"
-    metadata_destination = run_dir / "source.json"
-    source_identity: tuple[int, int] | None = None
-    metadata_identity: tuple[int, int] | None = None
+    source_destination = run.path / "source.pdf"
+    metadata_destination = run.path / "source.json"
     try:
-        _assert_run_contents(run_dir, staging, set())
-        source_identity = _publish_staged_file(staged_source, source_destination)
+        _assert_run_contents(run.path, staging, set(), run)
+        _publish_staged_file(staged_source, source_destination, run)
         if metadata_writer is None:
             return
-        _assert_run_contents(run_dir, staging, {"source.pdf"})
-        if not _matches_identity(source_destination, source_identity):
+        _assert_run_contents(run.path, staging, {"source.pdf"}, run)
+        if not _matches_identity_at(run, "source.pdf", run.published["source.pdf"]):
             raise PdfAcquireError("PDF source changed identity during publication")
-        metadata_identity = _publish_staged_file(staged_metadata, metadata_destination)
-        if not _matches_identity(source_destination, source_identity):
+        _publish_staged_file(staged_metadata, metadata_destination, run)
+        if not _matches_identity_at(run, "source.pdf", run.published["source.pdf"]):
             raise PdfAcquireError("PDF source changed identity during publication")
-        if not _matches_identity(metadata_destination, metadata_identity):
+        if not _matches_identity_at(run, "source.json", run.published["source.json"]):
             raise PdfAcquireError("PDF metadata changed identity during publication")
     except BaseException:
-        _unlink_if_same(metadata_destination, metadata_identity)
-        _unlink_if_same(source_destination, source_identity)
+        _rollback_published(run)
         raise
 
 
-def _prepare_destination(run_dir: Path) -> None:
+def _prepare_destination(run_dir: Path) -> _RunDirectory:
     try:
         _reject_linked_ancestors(run_dir)
         if run_dir.exists():
@@ -281,7 +305,15 @@ def _prepare_destination(run_dir: Path) -> None:
         raise PdfAcquireError(
             f"cannot create PDF run directory {run_dir}: {error}"
         ) from error
-    _assert_run_contents(run_dir, None, set())
+    descriptor = _open_run_directory(run_dir)
+    try:
+        result = os.fstat(descriptor)
+        run = _RunDirectory(run_dir, descriptor, (result.st_dev, result.st_ino))
+        _assert_run_contents(run_dir, None, set(), run)
+        return run
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _is_windows_local_path(source: str) -> bool:
@@ -316,8 +348,13 @@ def _reject_linked_ancestors(path: Path) -> None:
 
 
 def _assert_run_contents(
-    run_dir: Path, staging: Path | None, allowed: set[str]
+    run_dir: Path,
+    staging: Path | None,
+    allowed: set[str],
+    run: _RunDirectory | None = None,
 ) -> None:
+    if run is not None:
+        _verify_run_identity(run)
     _reject_linked_ancestors(run_dir)
     _require_safe_directory(run_dir)
     try:
@@ -332,21 +369,54 @@ def _assert_run_contents(
         raise PdfAcquireError(f"PDF run directory must be empty: {run_dir}")
 
 
-def _matches_identity(path: Path, identity: tuple[int, int]) -> bool:
+def _open_run_directory(path: Path) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        result = _regular_file_lstat(path)
-    except PdfAcquireError:
-        return False
-    return (result.st_dev, result.st_ino) == identity
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise PdfAcquireError(f"cannot open PDF run directory {path}: {error}") from error
+    result = os.fstat(descriptor)
+    current = _require_safe_directory(path)
+    if (result.st_dev, result.st_ino) != (current.st_dev, current.st_ino):
+        os.close(descriptor)
+        raise PdfAcquireError(f"PDF run directory changed identity: {path}")
+    return descriptor
 
 
-def _unlink_if_same(path: Path, identity: tuple[int, int] | None) -> None:
-    if identity is None or not _matches_identity(path, identity):
-        return
+def _verify_run_identity(run: _RunDirectory) -> None:
+    current = _require_safe_directory(run.path)
+    if (current.st_dev, current.st_ino) != run.identity:
+        raise PdfAcquireError(f"PDF run directory changed identity: {run.path}")
+
+
+def _matches_identity_at(
+    run: _RunDirectory, name: str, identity: tuple[int, int]
+) -> bool:
     try:
-        path.unlink()
+        result = os.stat(name, dir_fd=run.descriptor, follow_symlinks=False)
     except OSError:
-        return
+        return False
+    return (
+        stat.S_ISREG(result.st_mode)
+        and not _is_reparse_point(result)
+        and (result.st_dev, result.st_ino) == identity
+    )
+
+
+def _rollback_published(run: _RunDirectory) -> None:
+    for name, identity in reversed(tuple(run.published.items())):
+        if not _matches_identity_at(run, name, identity):
+            continue
+        try:
+            os.unlink(name, dir_fd=run.descriptor)
+        except OSError:
+            continue
+    run.published.clear()
 
 
 def _require_pdf_signature(content: bytes, source: str) -> None:

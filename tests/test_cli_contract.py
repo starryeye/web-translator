@@ -104,14 +104,16 @@ def test_pdf_acquire_cli_rolls_back_source_when_metadata_destination_races(
     run_dir = tmp_path / "run"
     import web_translator.pdf_acquire as acquire_module
 
-    original_atomic_write = acquire_module.atomic_write
+    original_link = acquire_module.os.link
 
-    def race_metadata_destination(path: Path, content: bytes) -> None:
-        if path == run_dir / "source.json":
-            path.write_text("racer", encoding="utf-8")
-        original_atomic_write(path, content)
+    def race_metadata_destination(
+        source: Path, destination: str, **kwargs: object
+    ) -> None:
+        if destination == "source.json":
+            (run_dir / destination).write_text("racer", encoding="utf-8")
+        original_link(source, destination, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(acquire_module, "atomic_write", race_metadata_destination)
+    monkeypatch.setattr(acquire_module.os, "link", race_metadata_destination)
 
     exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
 
