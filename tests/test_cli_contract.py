@@ -72,6 +72,59 @@ def test_pdf_acquire_cli_rejects_nonempty_directory_without_overwrite(
     }
 
 
+def test_pdf_acquire_cli_rolls_back_source_when_metadata_publication_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    run_dir = tmp_path / "run"
+
+    def fail_metadata(path: Path, value: object) -> None:
+        raise OSError("metadata disk failure")
+
+    monkeypatch.setattr(cli_module, "_write_json_atomic", fail_metadata)
+
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CAPTURE_FAILURE
+    assert not (run_dir / "source.pdf").exists()
+    assert not (run_dir / "source.json").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-acquire",
+        "exit_code": cli_module.EXIT_CAPTURE_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_acquire_cli_rolls_back_source_when_metadata_destination_races(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    run_dir = tmp_path / "run"
+    import web_translator.pdf_acquire as acquire_module
+
+    original_atomic_write = acquire_module.atomic_write
+
+    def race_metadata_destination(path: Path, content: bytes) -> None:
+        if path == run_dir / "source.json":
+            path.write_text("racer", encoding="utf-8")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(acquire_module, "atomic_write", race_metadata_destination)
+
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CAPTURE_FAILURE
+    assert not (run_dir / "source.pdf").exists()
+    assert (run_dir / "source.json").read_text(encoding="utf-8") == "racer"
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-acquire",
+        "exit_code": cli_module.EXIT_CAPTURE_FAILURE,
+        "status": "error",
+    }
+
+
 def _zone(zone_id: str = "zone-001") -> Zone:
     return Zone(
         id=zone_id,

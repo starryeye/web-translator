@@ -38,6 +38,7 @@ from web_translator.models import (
 )
 from web_translator.paths import validate_public_url
 from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
+from web_translator.pdf_models import PdfSourceRecord
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -237,16 +238,15 @@ def _capture_command(args: argparse.Namespace) -> None:
 
 
 def _pdf_acquire_command(args: argparse.Namespace) -> None:
+    def write_metadata(record: PdfSourceRecord, path: Path) -> None:
+        _write_json_atomic(path, record.to_dict())
+
     try:
-        _validate_run_root(args.run_dir)
-        if args.run_dir.exists() and any(args.run_dir.iterdir()):
-            raise CLIContractError(
-                f"PDF acquire run directory must be empty: {args.run_dir}"
-            )
-        _reject_if_link(args.run_dir / "source.pdf")
-        _reject_if_link(args.run_dir / "source.json")
-        record = acquire_pdf(str(args.source), args.run_dir)
-        _write_json_atomic(args.run_dir / "source.json", record.to_dict())
+        acquire_pdf(
+            str(args.source),
+            args.run_dir,
+            metadata_writer=write_metadata,
+        )
     except (CLIContractError, OSError) as error:
         raise PdfAcquireError(str(error)) from error
 
