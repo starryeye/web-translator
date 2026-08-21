@@ -5,7 +5,6 @@ from __future__ import annotations
 import ipaddress
 import socket
 import time
-from collections.abc import Callable
 
 import httpcore
 import httpx
@@ -31,7 +30,6 @@ class NetworkBudget:
         deadline_seconds: float,
         max_total_redirects: int | None = None,
         error_prefix: str = "network resource budget exceeded",
-        resolve_public_addresses: Callable[[str, int], list[str]] | None = None,
     ) -> None:
         self.max_bytes = max_bytes
         self.max_redirects = max_redirects
@@ -42,11 +40,6 @@ class NetworkBudget:
         self.downloaded_bytes = 0
         self.redirects = 0
         self.error_prefix = error_prefix
-        self.resolve_public_addresses = (
-            _resolve_public_addresses
-            if resolve_public_addresses is None
-            else resolve_public_addresses
-        )
 
     def check_deadline(self) -> None:
         if time.monotonic() > self.deadline:
@@ -106,20 +99,11 @@ def build_public_client(
         follow_redirects=True,
         max_redirects=budget.max_redirects,
         timeout=30.0,
-        transport=(
-            transport
-            if transport is not None
-            else PinnedHTTPTransport(budget.resolve_public_addresses)
-        ),
+        transport=transport if transport is not None else PinnedHTTPTransport(),
         trust_env=False,
         headers={"user-agent": user_agent, "accept-encoding": "identity"},
         event_hooks={
-            "request": [
-                lambda request: validate_network_boundary(
-                    request, budget.resolve_public_addresses
-                ),
-                budget.before_request,
-            ],
+            "request": [validate_network_boundary, budget.before_request],
             "response": [budget.after_response],
         },
     )
@@ -145,10 +129,7 @@ def fetch_limited(
         raise NetworkError(f"failed to fetch {label}: {error}") from error
 
 
-def validate_network_boundary(
-    request: httpx.Request,
-    resolve_public_addresses: Callable[[str, int], list[str]] | None = None,
-) -> None:
+def validate_network_boundary(request: httpx.Request) -> None:
     """Resolve and reject unsafe addresses immediately before a request is handled."""
     try:
         url = validate_public_url(str(request.url))
@@ -157,12 +138,7 @@ def validate_network_boundary(
     host = url.host
     assert host is not None
     port = url.port or (443 if url.scheme == "https" else 80)
-    resolver = (
-        _resolve_public_addresses
-        if resolve_public_addresses is None
-        else resolve_public_addresses
-    )
-    resolver(host, port)
+    _resolve_public_addresses(host, port)
 
 
 def _resolve_public_addresses(host: str, port: int) -> list[str]:
@@ -190,9 +166,6 @@ def _resolve_public_addresses(host: str, port: int) -> list[str]:
 class _PinnedNetworkBackend(httpcore.SyncBackend):
     """Resolve once per connection and connect only to the approved numeric IPs."""
 
-    def __init__(self, resolve_public_addresses: Callable[[str, int], list[str]]) -> None:
-        self.resolve_public_addresses = resolve_public_addresses
-
     def connect_tcp(
         self,
         host: str,
@@ -201,7 +174,7 @@ class _PinnedNetworkBackend(httpcore.SyncBackend):
         local_address: str | None = None,
         socket_options: object = None,
     ) -> httpcore.NetworkStream:
-        addresses = self.resolve_public_addresses(host, port)
+        addresses = _resolve_public_addresses(host, port)
         last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
         for address in addresses:
             try:
@@ -221,17 +194,14 @@ class _PinnedNetworkBackend(httpcore.SyncBackend):
 class PinnedHTTPTransport(httpx.HTTPTransport):
     """HTTP transport whose connection pool cannot re-resolve approved hosts."""
 
-    def __init__(
-        self,
-        resolve_public_addresses: Callable[[str, int], list[str]] = _resolve_public_addresses,
-    ) -> None:
+    def __init__(self) -> None:
         _assert_transport_compatibility(httpx.__version__, httpcore.__version__)
         super().__init__(trust_env=False)
         if not hasattr(self._pool, "_network_backend"):
             raise RuntimeError(
                 "httpx/httpcore transport adapter is incompatible: missing network backend seam"
             )
-        self._pool._network_backend = _PinnedNetworkBackend(resolve_public_addresses)
+        self._pool._network_backend = _PinnedNetworkBackend()
 
 
 def _assert_transport_compatibility(httpx_version: str, httpcore_version: str) -> None:

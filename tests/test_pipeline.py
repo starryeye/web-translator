@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from web_translator import __version__
 import web_translator.capture as capture_module
 import web_translator.cli as cli_module
+import web_translator.network as network_module
 from web_translator.capture import CaptureError, capture_page
 from web_translator.cli import main
 from web_translator.models import MasterReview, QAResult
@@ -99,7 +100,7 @@ def fixture_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[FixtureServer]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(
-        capture_module,
+        network_module,
         "_resolve_public_addresses",
         lambda host, port: ["127.0.0.1"],
     )
@@ -519,7 +520,7 @@ def test_capture_failure_returns_capture_exit_code_and_one_status(
     def fail_resolution(host: str, port: int) -> list[str]:
         raise CaptureError("fixture DNS failure")
 
-    monkeypatch.setattr(capture_module, "_resolve_public_addresses", fail_resolution)
+    monkeypatch.setattr(network_module, "_resolve_public_addresses", fail_resolution)
 
     assert (
         main(
@@ -564,7 +565,7 @@ def test_capture_persists_semantic_asset_classes_with_alias_merging(
         return responses[str(request.url)]
 
     monkeypatch.setattr(
-        capture_module,
+        network_module,
         "_resolve_public_addresses",
         lambda host, port: ["93.184.216.34"],
     )
@@ -607,7 +608,7 @@ def test_capture_rejects_optional_asset_cache_promotion_to_stylesheet(
         )
 
     monkeypatch.setattr(
-        capture_module,
+        network_module,
         "_resolve_public_addresses",
         lambda host, port: ["93.184.216.34"],
     )

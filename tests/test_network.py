@@ -73,3 +73,13 @@ def test_public_client_rejects_non_mock_transport() -> None:
             build_public_client(budget=budget, transport=transport)
     finally:
         transport.close()
+
+
+def test_network_budget_does_not_allow_dns_resolver_substitution() -> None:
+    with pytest.raises(TypeError, match="resolve_public_addresses"):
+        NetworkBudget(
+            max_bytes=1024,
+            max_redirects=5,
+            deadline_seconds=10.0,
+            resolve_public_addresses=lambda *_: ["127.0.0.1"],
+        )

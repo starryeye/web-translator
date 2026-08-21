@@ -22,7 +22,6 @@ from web_translator.network import (
     NetworkError,
     _assert_transport_compatibility,
     _read_limited,
-    _resolve_public_addresses as _network_resolve_public_addresses,
     build_public_client,
     fetch_limited,
 )
@@ -56,11 +55,6 @@ def _capture_network_error(error: NetworkError) -> CaptureError:
     return CaptureError(message)
 
 
-def _resolve_public_addresses(host: str, port: int) -> list[str]:
-    """Capture compatibility seam around the shared DNS resolver."""
-    return _network_resolve_public_addresses(host, port)
-
-
 class _CaptureBudget:
     def __init__(self, network_budget: NetworkBudget) -> None:
         self.network_budget = network_budget
@@ -68,7 +62,10 @@ class _CaptureBudget:
         self.emitted_bytes = 0
 
     def check_deadline(self) -> None:
-        self.network_budget.check_deadline()
+        try:
+            self.network_budget.check_deadline()
+        except NetworkError as error:
+            raise _CaptureBudgetError(str(error)) from error
 
     def before_request(self, request: httpx.Request) -> None:
         self.check_deadline()
@@ -123,9 +120,6 @@ def capture_page(
         max_total_redirects=MAX_TOTAL_REDIRECTS,
         deadline_seconds=MAX_CAPTURE_SECONDS,
         error_prefix="capture resource budget exceeded",
-        resolve_public_addresses=lambda host, port: _resolve_public_addresses(
-            host, port
-        ),
     )
     budget = _CaptureBudget(network_budget)
     try:
