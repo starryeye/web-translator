@@ -6,9 +6,17 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
+from pathlib import Path
 import re
 
-from web_translator.pdf_models import PdfBlock, PdfBlockKind, PdfBlockStyle
+from pypdf import PdfReader
+
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfBlockKind,
+    PdfBlockStyle,
+    PdfTableCell,
+)
 
 
 _VERTICAL_OVERLAP = 0.60
@@ -38,6 +46,24 @@ _TEXT_BLOCK_KINDS = {
 
 class PdfExtractionError(RuntimeError):
     """A PDF cannot safely enter the translation extraction workflow."""
+
+
+class PdfExtractionWarning(UserWarning):
+    """Noncritical PDF evidence could not be mapped unambiguously."""
+
+
+@dataclass(frozen=True, slots=True)
+class TableDetectionResult:
+    blocks: tuple[PdfBlock, ...]
+    cells: tuple[PdfTableCell, ...]
+    bboxes: tuple[tuple[float, float, float, float], ...]
+    owned_character_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class LinkEvidenceResult:
+    blocks: tuple[PdfBlock, ...]
+    warnings: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,7 +266,7 @@ def find_clear_gutter(
         line
         for line in lines
         if not line.is_heading
-        and line.kind not in {"header", "footer", "page-number"}
+        and line.kind not in {"caption", "header", "footer", "page-number"}
     ]
     evidence: list[tuple[float, float]] = []
     for left_boundary in candidates:
@@ -626,6 +652,722 @@ def _alignment(lines: Sequence[PdfLine]) -> str:
     if page_width - x1 <= page_width * 0.05:
         return "right"
     return "left"
+
+
+def detect_tables(page: object, *, page_number: int) -> TableDetectionResult:
+    """Detect fixed table grids with strict selectable-character ownership."""
+    try:
+        explicit = list(
+            page.find_tables(  # type: ignore[attr-defined]
+                {
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                }
+            )
+        )
+        explicit = [table for table in explicit if _usable_table(table, "lines")]
+        explicit_bboxes = [
+            tuple(float(value) for value in table.bbox) for table in explicit
+        ]
+        text_page = (
+            page.filter(  # type: ignore[attr-defined]
+                lambda item: not _mapping_center_inside_any_bbox(
+                    item, explicit_bboxes
+                )
+            )
+            if explicit_bboxes
+            else page
+        )
+        text_candidates = [
+            table
+            for table in text_page.find_tables(  # type: ignore[attr-defined]
+                {
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "min_words_vertical": 2,
+                    "min_words_horizontal": 1,
+                }
+            )
+            if _usable_table(table, "text")
+            and not any(
+                _bbox_intersection(
+                    tuple(float(value) for value in table.bbox),
+                    tuple(float(value) for value in ruled.bbox),
+                )
+                > 0
+                for ruled in explicit
+            )
+        ]
+        candidates = [
+            (table, "lines") for table in explicit
+        ] + [
+            (table, "text") for table in text_candidates
+        ]
+    except PdfExtractionError:
+        raise
+    except Exception as error:
+        raise PdfExtractionError(
+            f"cannot detect tables on page {page_number}: {error}"
+        ) from error
+
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            float(item[0].bbox[1]),
+            float(item[0].bbox[0]),
+            float(item[0].bbox[3]),
+            float(item[0].bbox[2]),
+        ),
+    )
+    _reject_overlapping_tables([table for table, _ in ordered], page_number)
+    blocks: list[PdfBlock] = []
+    cells: list[PdfTableCell] = []
+    owned_characters = 0
+    table_bboxes: list[tuple[float, float, float, float]] = []
+    for table_index, (table, strategy) in enumerate(ordered, start=1):
+        table_id = f"pdf:page-{page_number:04d}:table-{table_index:04d}"
+        table_blocks, table_cells, character_count = _convert_table(
+            page,
+            table,
+            strategy=strategy,
+            table_id=table_id,
+            page_number=page_number,
+        )
+        blocks.extend(table_blocks)
+        cells.extend(table_cells)
+        owned_characters += character_count
+        table_bboxes.append(tuple(float(value) for value in table.bbox))
+    return TableDetectionResult(
+        blocks=tuple(blocks),
+        cells=tuple(cells),
+        bboxes=tuple(table_bboxes),
+        owned_character_count=owned_characters,
+    )
+
+
+def detect_footnotes(
+    blocks: Sequence[PdfBlock],
+    characters: Sequence[Mapping[str, object]],
+    *,
+    page_height: float,
+) -> list[PdfBlock]:
+    """Pair clear superscript markers with smaller-font page-edge bodies."""
+    if not blocks:
+        return []
+    body_sizes = sorted(
+        block.style.font_size
+        for block in blocks
+        if block.kind not in {"figure", "table-cell"} and block.source_text.strip()
+    )
+    if not body_sizes:
+        return list(blocks)
+    median_size = body_sizes[len(body_sizes) // 2]
+    bodies: list[tuple[PdfBlock, str]] = []
+    for block in blocks:
+        marker = _leading_footnote_marker(block.source_text)
+        if (
+            marker is not None
+            and block.bbox[1] >= page_height * 0.75
+            and block.style.font_size <= median_size * 0.85 + 1e-9
+        ):
+            bodies.append((block, marker))
+
+    replacements: dict[str, PdfBlock] = {}
+    removed: set[str] = set()
+    for body, marker in bodies:
+        owners = [
+            block
+            for block in blocks
+            if block.id != body.id
+            and block.bbox[1] < body.bbox[1]
+            and any(
+                _normalized_marker(str(character.get("text", ""))) == marker
+                and _character_inside_bbox(character, block.bbox)
+                and _character_size(character) <= block.style.font_size * 0.85 + 1e-9
+                for character in characters
+            )
+        ]
+        standalone_markers = [
+            block
+            for block in blocks
+            if block.id != body.id
+            and block.bbox[1] < body.bbox[1]
+            and _normalized_marker(block.source_text) == marker
+            and block.style.font_size <= median_size * 0.85 + 1e-9
+        ]
+        if not owners and standalone_markers:
+            if len(standalone_markers) > 1:
+                raise PdfExtractionError(
+                    f"ambiguous footnote marker {marker!r} on page {body.page_number}"
+                )
+            marker_block = standalone_markers[0]
+            neighbors = [
+                block
+                for block in blocks
+                if block.id not in {body.id, marker_block.id}
+                and block.kind not in {"caption", "figure", "table-cell"}
+                and _vertical_overlap_ratio(block.bbox, marker_block.bbox) >= 0.50
+                and _horizontal_bbox_gap(block.bbox, marker_block.bbox)
+                <= median_size * 1.5
+            ]
+            if len(neighbors) > 1:
+                raise PdfExtractionError(
+                    f"ambiguous footnote marker {marker!r} on page {body.page_number}"
+                )
+            if neighbors:
+                owner = neighbors[0]
+                owners = [
+                    replace(
+                        owner,
+                        bbox=(
+                            min(owner.bbox[0], marker_block.bbox[0]),
+                            min(owner.bbox[1], marker_block.bbox[1]),
+                            max(owner.bbox[2], marker_block.bbox[2]),
+                            max(owner.bbox[3], marker_block.bbox[3]),
+                        ),
+                        source_text=f"{owner.source_text.rstrip()} {marker}",
+                    )
+                ]
+                removed.add(marker_block.id)
+        if len(owners) > 1:
+            raise PdfExtractionError(
+                f"ambiguous footnote marker {marker!r} on page {body.page_number}"
+            )
+        if not owners:
+            continue
+        owner = owners[0]
+        if owner.destination is not None and owner.destination != body.id:
+            raise PdfExtractionError(
+                f"ambiguous footnote destination for block {owner.id}"
+            )
+        replacements[body.id] = replace(body, kind="footnote")
+        replacements[owner.id] = replace(owner, destination=body.id)
+    return [
+        replacements.get(block.id, block)
+        for block in blocks
+        if block.id not in removed
+    ]
+
+
+def pair_figure_captions(blocks: Sequence[PdfBlock]) -> list[PdfBlock]:
+    """Pair figures and explicit captions only when the relation is unique."""
+    figures = [block for block in blocks if block.kind == "figure"]
+    captions = [
+        block
+        for block in blocks
+        if block.kind in {"paragraph", "caption"}
+        and re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", block.source_text, re.I)
+    ]
+    candidates: dict[str, list[PdfBlock]] = {}
+    for figure in figures:
+        candidates[figure.id] = [
+            caption
+            for caption in captions
+            if caption.page_number == figure.page_number
+            and _caption_distance(figure.bbox, caption.bbox) <= 36.0
+            and _horizontal_overlap_ratio(figure.bbox, caption.bbox) >= 0.25
+        ]
+        if len(candidates[figure.id]) > 1:
+            raise PdfExtractionError(
+                f"ambiguous figure-caption pairing for {figure.id}"
+            )
+    claimed: dict[str, str] = {}
+    for figure in figures:
+        matches = candidates[figure.id]
+        if not matches:
+            continue
+        caption = matches[0]
+        if caption.id in claimed:
+            raise PdfExtractionError(
+                f"ambiguous figure-caption pairing for {caption.id}"
+            )
+        claimed[caption.id] = figure.id
+    replacements: dict[str, PdfBlock] = {}
+    by_id = {block.id: block for block in blocks}
+    for caption_id, figure_id in claimed.items():
+        replacements[figure_id] = replace(by_id[figure_id], caption_id=caption_id)
+        replacements[caption_id] = replace(
+            by_id[caption_id], kind="caption", caption_id=figure_id
+        )
+    return [replacements.get(block.id, block) for block in blocks]
+
+
+def extract_link_evidence(
+    source_pdf: Path,
+    blocks: Sequence[PdfBlock],
+) -> LinkEvidenceResult:
+    """Attach clear URI/internal annotations and return unresolved warnings."""
+    try:
+        reader = PdfReader(Path(source_pdf), strict=True)
+    except Exception as error:
+        raise PdfExtractionError(f"cannot inspect PDF link annotations: {error}") from error
+    replacements = {block.id: block for block in blocks}
+    warnings: list[str] = []
+    by_page: dict[int, list[PdfBlock]] = defaultdict(list)
+    for block in blocks:
+        by_page[block.page_number].append(block)
+
+    for page_index, page in enumerate(reader.pages):
+        page_number = page_index + 1
+        try:
+            page_height = float(page.mediabox.height)
+        except (TypeError, ValueError) as error:
+            raise PdfExtractionError(
+                f"cannot map PDF links on page {page_number}: invalid page bounds"
+            ) from error
+        annotations = page.get("/Annots", ())
+        for annotation_index, reference in enumerate(annotations, start=1):
+            try:
+                annotation = reference.get_object()
+                if str(annotation.get("/Subtype", "")) != "/Link":
+                    continue
+                source_bbox = _annotation_bbox(annotation.get("/Rect"), page_height)
+                owners = _blocks_intersecting_bbox(by_page.get(page_number, ()), source_bbox)
+            except Exception:
+                warnings.append(
+                    f"page {page_number} link {annotation_index}: malformed annotation"
+                )
+                continue
+            if len(owners) != 1:
+                warnings.append(
+                    f"page {page_number} link {annotation_index}: "
+                    "unresolved visible link source"
+                )
+                continue
+            owner = replacements[owners[0].id]
+            uri = _annotation_uri(annotation)
+            if uri is not None:
+                if owner.uri is not None and owner.uri != uri:
+                    warnings.append(
+                        f"page {page_number} link {annotation_index}: "
+                        "multiple URI annotations for one block"
+                    )
+                    continue
+                replacements[owner.id] = replace(owner, uri=uri)
+                continue
+            destination = _annotation_destination(annotation)
+            target = _map_internal_destination(reader, destination, by_page)
+            if target is None:
+                warnings.append(
+                    f"page {page_number} link {annotation_index}: "
+                    "unresolved internal destination"
+                )
+                continue
+            if owner.destination is not None and owner.destination != target.id:
+                warnings.append(
+                    f"page {page_number} link {annotation_index}: "
+                    "multiple destinations for one block"
+                )
+                continue
+            replacements[owner.id] = replace(owner, destination=target.id)
+    return LinkEvidenceResult(
+        blocks=tuple(replacements[block.id] for block in blocks),
+        warnings=tuple(sorted(set(warnings))),
+    )
+
+
+def _usable_table(table: object, strategy: str) -> bool:
+    rows = list(getattr(table, "rows", ()))
+    if len(rows) < 2:
+        return False
+    columns = max((len(getattr(row, "cells", ())) for row in rows), default=0)
+    if columns < 2:
+        return False
+    extracted = table.extract()
+    occupied = [
+        row
+        for row in extracted
+        if any(isinstance(value, str) and value.strip() for value in row)
+    ]
+    if strategy == "text" and (
+        len(occupied) < 2
+        or any(
+            len(row) != columns
+            or any(not isinstance(value, str) or not value.strip() for value in row)
+            for row in occupied
+        )
+    ):
+        return False
+    return True
+
+
+def _reject_overlapping_tables(tables: Sequence[object], page_number: int) -> None:
+    for index, left in enumerate(tables):
+        left_bbox = tuple(float(value) for value in left.bbox)
+        for right in tables[index + 1 :]:
+            right_bbox = tuple(float(value) for value in right.bbox)
+            if _bbox_intersection(left_bbox, right_bbox) > 0:
+                raise PdfExtractionError(
+                    f"ambiguous overlapping tables on page {page_number}"
+                )
+
+
+def _convert_table(
+    page: object,
+    table: object,
+    *,
+    strategy: str,
+    table_id: str,
+    page_number: int,
+) -> tuple[list[PdfBlock], list[PdfTableCell], int]:
+    table_bbox = tuple(float(value) for value in table.bbox)
+    rows = list(table.rows)
+    extracted = list(table.extract())
+    if strategy == "text":
+        selected_rows = [
+            (raw_index, row)
+            for raw_index, row in enumerate(rows)
+            if any(
+                isinstance(value, str) and value.strip()
+                for value in extracted[raw_index]
+            )
+        ]
+    else:
+        selected_rows = list(enumerate(rows))
+    actual_cells = [
+        tuple(float(value) for value in cell)
+        for _, row in selected_rows
+        for cell in row.cells
+        if cell is not None
+    ]
+    unique_cells = list(dict.fromkeys(actual_cells))
+    characters = [
+        character
+        for character in getattr(page, "chars", ())
+        if str(character.get("text", "")).strip()
+        and _character_center_inside_bbox(character, table_bbox)
+    ]
+    owned: dict[tuple[float, float, float, float], list[Mapping[str, object]]] = {
+        cell: [] for cell in unique_cells
+    }
+    for character in characters:
+        owners = [
+            cell for cell in unique_cells if _character_fully_inside_bbox(character, cell)
+        ]
+        if len(owners) != 1:
+            raise PdfExtractionError(
+                "ambiguous table character ownership on page "
+                f"{page_number} in {table_id}"
+            )
+        owned[owners[0]].append(character)
+
+    x_edges = sorted({value for cell in unique_cells for value in (cell[0], cell[2])})
+    y_edges = sorted({value for cell in unique_cells for value in (cell[1], cell[3])})
+    blocks: list[PdfBlock] = []
+    cells: list[PdfTableCell] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    for logical_row, (raw_row, row) in enumerate(selected_rows):
+        for raw_column, raw_cell in enumerate(row.cells):
+            if raw_cell is None:
+                continue
+            bbox = tuple(float(value) for value in raw_cell)
+            if bbox in seen:
+                continue
+            seen.add(bbox)
+            if strategy == "text":
+                row_index = logical_row
+                column_index = raw_column
+                row_span = 1
+                column_span = 1
+            else:
+                column_index = _edge_index(x_edges, bbox[0])
+                row_index = _edge_index(y_edges, bbox[1])
+                column_span = _edge_index(x_edges, bbox[2]) - column_index
+                row_span = _edge_index(y_edges, bbox[3]) - row_index
+            identifier = (
+                f"{table_id}:row-{row_index + 1:04d}:cell-{column_index + 1:04d}"
+            )
+            text = ""
+            if raw_row < len(extracted) and raw_column < len(extracted[raw_row]):
+                value = extracted[raw_row][raw_column]
+                if isinstance(value, str):
+                    text = re.sub(r"\s+", " ", value).strip()
+            cell_chars = owned.get(bbox, [])
+            font_size = max(
+                (_character_size(character) for character in cell_chars),
+                default=10.0,
+            )
+            bold = any(
+                any(
+                    marker in str(character.get("fontname", "")).casefold()
+                    for marker in ("bold", "black", "heavy")
+                )
+                for character in cell_chars
+            )
+            block = PdfBlock(
+                id=identifier,
+                page_number=page_number,
+                order=0,
+                kind="table-cell",
+                bbox=bbox,
+                style=PdfBlockStyle(
+                    font_size=font_size,
+                    bold=bold,
+                    alignment="left",
+                    indentation=bbox[0],
+                    space_after=0.0,
+                ),
+                source_text=text,
+                table_id=table_id,
+                row=row_index,
+                column=column_index,
+                row_span=row_span,
+                column_span=column_span,
+            )
+            blocks.append(block)
+            cells.append(
+                PdfTableCell(
+                    id=identifier,
+                    table_id=table_id,
+                    page_number=page_number,
+                    row=row_index,
+                    column=column_index,
+                    row_span=row_span,
+                    column_span=column_span,
+                    is_header=row_index == 0,
+                    block_id=identifier,
+                )
+            )
+    key = lambda block: (block.row or 0, block.column or 0)
+    return (
+        sorted(blocks, key=key),
+        sorted(cells, key=lambda cell: (cell.row, cell.column)),
+        len(characters),
+    )
+
+
+def _edge_index(edges: Sequence[float], value: float) -> int:
+    for index, edge in enumerate(edges):
+        if math.isclose(edge, value, abs_tol=0.01):
+            return index
+    raise PdfExtractionError("table cell edge does not belong to the fixed grid")
+
+
+def _leading_footnote_marker(text: str) -> str | None:
+    match = re.match(r"^\s*([\[(]?(?:\d{1,3}|[*†‡])[\].)]?)\s+", text)
+    return _normalized_marker(match.group(1)) if match is not None else None
+
+
+def _normalized_marker(text: str) -> str:
+    return re.sub(r"[\s\[\]().]", "", text).casefold()
+
+
+def _character_size(character: Mapping[str, object]) -> float:
+    try:
+        size = float(character.get("size", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return size if math.isfinite(size) else 0.0
+
+
+def _character_bbox(
+    character: Mapping[str, object],
+) -> tuple[float, float, float, float] | None:
+    try:
+        bbox = (
+            float(character["x0"]),
+            float(character["top"]),
+            float(character["x1"]),
+            float(character["bottom"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in bbox):
+        return None
+    return bbox
+
+
+def _character_center_inside_bbox(
+    character: Mapping[str, object],
+    bbox: tuple[float, float, float, float],
+) -> bool:
+    char_bbox = _character_bbox(character)
+    if char_bbox is None:
+        return False
+    x = (char_bbox[0] + char_bbox[2]) / 2.0
+    y = (char_bbox[1] + char_bbox[3]) / 2.0
+    return (
+        bbox[0] - 1e-6 <= x <= bbox[2] + 1e-6
+        and bbox[1] - 1e-6 <= y <= bbox[3] + 1e-6
+    )
+
+
+def _mapping_center_inside_any_bbox(
+    value: object,
+    bboxes: Sequence[tuple[float, float, float, float]],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    char_bbox = _character_bbox(value)
+    if char_bbox is None:
+        return False
+    x = (char_bbox[0] + char_bbox[2]) / 2.0
+    y = (char_bbox[1] + char_bbox[3]) / 2.0
+    return any(
+        bbox[0] - 1e-6 <= x <= bbox[2] + 1e-6
+        and bbox[1] - 1e-6 <= y <= bbox[3] + 1e-6
+        for bbox in bboxes
+    )
+
+
+def _character_fully_inside_bbox(
+    character: Mapping[str, object],
+    bbox: tuple[float, float, float, float],
+) -> bool:
+    char_bbox = _character_bbox(character)
+    if char_bbox is None:
+        return False
+    return (
+        char_bbox[0] >= bbox[0] - 1e-6
+        and char_bbox[1] >= bbox[1] - 1e-6
+        and char_bbox[2] <= bbox[2] + 1e-6
+        and char_bbox[3] <= bbox[3] + 1e-6
+    )
+
+
+def _character_inside_bbox(
+    character: Mapping[str, object],
+    bbox: tuple[float, float, float, float],
+) -> bool:
+    return _character_center_inside_bbox(character, bbox)
+
+
+def _caption_distance(
+    figure: tuple[float, float, float, float],
+    caption: tuple[float, float, float, float],
+) -> float:
+    if caption[1] >= figure[3]:
+        return caption[1] - figure[3]
+    if figure[1] >= caption[3]:
+        return figure[1] - caption[3]
+    return 0.0
+
+
+def _horizontal_overlap_ratio(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    overlap = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    return overlap / max(1e-9, min(left[2] - left[0], right[2] - right[0]))
+
+
+def _vertical_overlap_ratio(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    overlap = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    return overlap / max(1e-9, min(left[3] - left[1], right[3] - right[1]))
+
+
+def _horizontal_bbox_gap(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    return max(left[0] - right[2], right[0] - left[2], 0.0)
+
+
+def _annotation_bbox(
+    value: object, page_height: float
+) -> tuple[float, float, float, float]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 4
+    ):
+        raise ValueError("invalid link rectangle")
+    x0, y0, x1, y1 = (float(item) for item in value)
+    return (
+        min(x0, x1),
+        page_height - max(y0, y1),
+        max(x0, x1),
+        page_height - min(y0, y1),
+    )
+
+
+def _blocks_intersecting_bbox(
+    blocks: Sequence[PdfBlock],
+    bbox: tuple[float, float, float, float],
+) -> list[PdfBlock]:
+    return [block for block in blocks if _bbox_intersection(block.bbox, bbox) > 0]
+
+
+def _annotation_uri(annotation: Mapping[str, object]) -> str | None:
+    action = annotation.get("/A")
+    if not isinstance(action, Mapping) or str(action.get("/S", "")) != "/URI":
+        return None
+    uri = action.get("/URI")
+    return str(uri) if uri is not None and str(uri) else None
+
+
+def _annotation_destination(annotation: Mapping[str, object]) -> object:
+    if "/Dest" in annotation:
+        return annotation["/Dest"]
+    action = annotation.get("/A")
+    if isinstance(action, Mapping) and str(action.get("/S", "")) == "/GoTo":
+        return action.get("/D")
+    return None
+
+
+def _map_internal_destination(
+    reader: PdfReader,
+    destination: object,
+    by_page: Mapping[int, Sequence[PdfBlock]],
+) -> PdfBlock | None:
+    if destination is None:
+        return None
+    if isinstance(destination, str):
+        destination = reader.named_destinations.get(destination)
+        if destination is None:
+            return None
+    if hasattr(destination, "page"):
+        try:
+            page_index = reader.get_destination_page_number(destination)  # type: ignore[arg-type]
+        except Exception:
+            return None
+        candidates = sorted(by_page.get(page_index + 1, ()), key=lambda block: block.order)
+        return candidates[0] if candidates else None
+    if (
+        not isinstance(destination, Sequence)
+        or isinstance(destination, (str, bytes))
+        or not destination
+    ):
+        return None
+    try:
+        page_object = destination[0]
+        if hasattr(page_object, "get_object"):
+            page_object = page_object.get_object()
+        page_index = reader.get_page_number(page_object)
+    except Exception:
+        return None
+    candidates = sorted(by_page.get(page_index + 1, ()), key=lambda block: block.order)
+    if not candidates:
+        return None
+    mode = str(destination[1]) if len(destination) > 1 else "/Fit"
+    if mode != "/XYZ" or len(destination) < 4:
+        return candidates[0]
+    try:
+        x = float(destination[2])
+        source_top = float(destination[3])
+        page_height = float(reader.pages[page_index].mediabox.height)
+        y = page_height - source_top
+    except (TypeError, ValueError):
+        return candidates[0]
+    matches = [
+        block
+        for block in candidates
+        if block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6
+        and block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _bbox_intersection(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    return max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+        0.0, min(left[3], right[3]) - max(left[1], right[1])
+    )
 
 
 def _finite_number(value: object, context: str) -> float:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -9,6 +10,7 @@ import math
 from numbers import Real
 from pathlib import Path
 import re
+import warnings
 
 import pdfplumber
 from pypdf import PdfReader
@@ -24,17 +26,30 @@ from web_translator.pdf_acquire import MAX_PDF_BYTES
 from web_translator.models import ProtectedToken, Segment, write_segments
 from web_translator.pdf_layout import (
     PdfExtractionError,
+    PdfExtractionWarning,
     PdfLine,
     build_text_blocks,
     classify_document_lines,
+    detect_footnotes,
+    detect_tables,
+    extract_link_evidence,
     group_words_into_lines,
     order_page_lines,
+    pair_figure_captions,
+)
+from web_translator.pdf_media import (
+    FigureRegion,
+    PdfMediaError,
+    crop_figure_regions,
+    detect_figure_regions,
 )
 from web_translator.pdf_models import (
     PdfBlock,
+    PdfBlockStyle,
     PdfDocument,
     PdfPage,
     PdfPageEvidence,
+    PdfTableCell,
 )
 from web_translator.protection import protect_fragment
 
@@ -52,6 +67,17 @@ class PdfInspection:
     selectable_characters: int
     scan_candidate_pages: list[int]
     pages: list[PdfPageEvidence]
+
+
+@dataclass(frozen=True, slots=True)
+class _PageMaterial:
+    lines: list[PdfLine]
+    table_blocks: tuple[PdfBlock, ...]
+    table_cells: tuple[PdfTableCell, ...]
+    table_character_count: int
+    figure_regions: tuple[FigureRegion, ...]
+    figure_character_count: int
+    characters: tuple[dict[str, object], ...]
 
 
 def inspect_pdf(source_pdf: Path) -> PdfInspection:
@@ -108,30 +134,76 @@ def extract_pdf(
     source = Path(source_pdf)
     inspection = inspect_pdf(source)
     reject_unsupported_pdf(inspection)
-    page_lines = _extract_page_lines(source, inspection)
+    materials = _extract_page_materials(source, inspection)
     classified_pages = classify_document_lines(
         [
-            (lines, evidence.height)
-            for lines, evidence in zip(
-                page_lines, inspection.pages, strict=True
+            (material.lines, evidence.height)
+            for material, evidence in zip(
+                materials, inspection.pages, strict=True
             )
         ]
     )
 
     blocks: list[PdfBlock] = []
+    table_cells: list[PdfTableCell] = []
+    figure_regions: list[FigureRegion] = []
     assigned_by_page: list[int] = []
-    for evidence, lines in zip(inspection.pages, classified_pages, strict=True):
+    figure_number = 0
+    for evidence, lines, material in zip(
+        inspection.pages, classified_pages, materials, strict=True
+    ):
         ordered = order_page_lines(lines, evidence.width)
-        assigned_by_page.append(sum(line.character_count for line in ordered))
-        page_blocks = build_text_blocks(ordered, evidence.number)
-        first_order = len(blocks)
-        blocks.extend(
-            replace(block, order=first_order + index)
-            for index, block in enumerate(page_blocks)
+        assigned_by_page.append(
+            sum(line.character_count for line in ordered)
+            + material.table_character_count
+            + material.figure_character_count
         )
+        page_blocks = build_text_blocks(ordered, evidence.number)
+        page_figures: list[PdfBlock] = []
+        for region in material.figure_regions:
+            figure_number += 1
+            page_figures.append(
+                PdfBlock(
+                    id=(
+                        f"pdf:page-{evidence.number:04d}:"
+                        f"block-{len(page_blocks) + len(page_figures) + 1:04d}"
+                    ),
+                    page_number=evidence.number,
+                    order=0,
+                    kind="figure",
+                    bbox=region.bbox,
+                    style=PdfBlockStyle(
+                        font_size=10.0,
+                        bold=False,
+                        alignment="center",
+                        indentation=region.bbox[0],
+                        space_after=0.0,
+                    ),
+                    media_path=f"media/figure-{figure_number:04d}.png",
+                )
+            )
+        page_blocks = _insert_rich_blocks(
+            page_blocks,
+            material.table_blocks,
+            page_figures,
+        )
+        page_blocks = detect_footnotes(
+            page_blocks,
+            material.characters,
+            page_height=evidence.height,
+        )
+        page_blocks = pair_figure_captions(page_blocks)
+        blocks.extend(page_blocks)
+        table_cells.extend(material.table_cells)
+        figure_regions.extend(material.figure_regions)
 
     _validate_character_assignment(inspection, assigned_by_page)
+    blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
     _validate_peer_overlap(blocks)
+    link_evidence = extract_link_evidence(source, blocks)
+    blocks = list(link_evidence.blocks)
+    for message in link_evidence.warnings:
+        warnings.warn(message, PdfExtractionWarning, stacklevel=2)
     blocks, segments = _build_segments(blocks)
     document = PdfDocument(
         schema_version="1.0",
@@ -149,16 +221,19 @@ def extract_pdf(
             for evidence in inspection.pages
         ],
         blocks=blocks,
-        table_cells=[],
+        table_cells=table_cells,
     )
     try:
         PdfDocument.from_dict(document.to_dict())
         Path(document_path).parent.mkdir(parents=True, exist_ok=True)
         Path(segments_path).parent.mkdir(parents=True, exist_ok=True)
         media = Path(media_dir)
-        media.mkdir(parents=True, exist_ok=True)
-        if not media.is_dir():
-            raise PdfExtractionError(f"PDF media path is not a directory: {media}")
+        if figure_regions:
+            crop_figure_regions(source, figure_regions, media, dpi=144)
+        else:
+            media.mkdir(parents=True, exist_ok=True)
+            if not media.is_dir():
+                raise PdfExtractionError(f"PDF media path is not a directory: {media}")
         Path(document_path).write_text(
             json.dumps(document.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
             + "\n",
@@ -168,20 +243,31 @@ def extract_pdf(
         write_segments(Path(segments_path), segments)
     except PdfExtractionError:
         raise
+    except PdfMediaError as error:
+        raise PdfExtractionError(str(error)) from error
     except (OSError, UnicodeError, ValueError) as error:
         raise PdfExtractionError(f"cannot write PDF extraction outputs: {error}") from error
     return document
 
 
-def _extract_page_lines(
+def _extract_page_materials(
     source: Path, inspection: PdfInspection
-) -> list[list[PdfLine]]:
+) -> list[_PageMaterial]:
     try:
         with pdfplumber.open(source) as document:
             if len(document.pages) != inspection.page_count:
                 raise PdfExtractionError("PDF readers disagree on page count")
-            result: list[list[PdfLine]] = []
+            result: list[_PageMaterial] = []
             for page, evidence in zip(document.pages, inspection.pages, strict=True):
+                tables = detect_tables(page, page_number=evidence.number)
+                try:
+                    regions = detect_figure_regions(
+                        page,
+                        page_number=evidence.number,
+                        excluded_bboxes=tables.bboxes,
+                    )
+                except PdfMediaError as error:
+                    raise PdfExtractionError(str(error)) from error
                 raw_words = page.extract_words(
                     return_chars=True,
                     extra_attrs=["fontname", "size"],
@@ -190,17 +276,130 @@ def _extract_page_lines(
                     raise PdfExtractionError(
                         f"page {evidence.number} did not produce word evidence"
                     )
+                excluded = [*tables.bboxes, *(region.bbox for region in regions)]
+                prose_words = [
+                    word for word in raw_words if not _word_in_any_bbox(word, excluded)
+                ]
+                lines = [
+                    line.with_page_geometry(evidence.width, evidence.height)
+                    for line in group_words_into_lines(prose_words)
+                ]
+                lines = [
+                    replace(line, kind="caption")
+                    if re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", line.text, re.I)
+                    else line
+                    for line in lines
+                ]
+                characters = tuple(
+                    dict(character)
+                    for character in page.chars
+                    if isinstance(character, Mapping)
+                )
+                figure_character_count = sum(
+                    1
+                    for character in characters
+                    if str(character.get("text", "")).strip()
+                    and _mapping_center_in_any_bbox(
+                        character, [region.bbox for region in regions]
+                    )
+                )
                 result.append(
-                    [
-                        line.with_page_geometry(evidence.width, evidence.height)
-                        for line in group_words_into_lines(raw_words)
-                    ]
+                    _PageMaterial(
+                        lines=lines,
+                        table_blocks=tables.blocks,
+                        table_cells=tables.cells,
+                        table_character_count=tables.owned_character_count,
+                        figure_regions=tuple(regions),
+                        figure_character_count=figure_character_count,
+                        characters=characters,
+                    )
                 )
             return result
     except PdfExtractionError:
         raise
     except Exception as error:
         raise PdfExtractionError(f"cannot extract PDF words: {error}") from error
+
+
+def _extract_page_lines(
+    source: Path, inspection: PdfInspection
+) -> list[list[PdfLine]]:
+    """Compatibility wrapper for callers that only need non-rich page lines."""
+    return [material.lines for material in _extract_page_materials(source, inspection)]
+
+
+def _word_in_any_bbox(
+    word: Mapping[str, object],
+    bboxes: Sequence[tuple[float, float, float, float]],
+) -> bool:
+    return _mapping_center_in_any_bbox(word, bboxes)
+
+
+def _mapping_center_in_any_bbox(
+    value: Mapping[str, object],
+    bboxes: Sequence[tuple[float, float, float, float]],
+) -> bool:
+    try:
+        x = (float(value["x0"]) + float(value["x1"])) / 2.0
+        y = (float(value["top"]) + float(value["bottom"])) / 2.0
+    except (KeyError, TypeError, ValueError):
+        return False
+    return any(
+        bbox[0] - 1e-6 <= x <= bbox[2] + 1e-6
+        and bbox[1] - 1e-6 <= y <= bbox[3] + 1e-6
+        for bbox in bboxes
+    )
+
+
+def _insert_rich_blocks(
+    ordinary: Sequence[PdfBlock],
+    table_blocks: Sequence[PdfBlock],
+    figure_blocks: Sequence[PdfBlock],
+) -> list[PdfBlock]:
+    """Insert each rich-layout group without perturbing unaffected text order."""
+    result = list(ordinary)
+    groups: list[tuple[tuple[float, float, float, float], list[PdfBlock]]] = []
+    by_table: dict[str, list[PdfBlock]] = {}
+    for block in table_blocks:
+        if block.table_id is None:
+            raise PdfExtractionError(f"table cell {block.id} has no table ID")
+        by_table.setdefault(block.table_id, []).append(block)
+    for cells in by_table.values():
+        ordered_cells = sorted(
+            cells, key=lambda block: (block.row or 0, block.column or 0)
+        )
+        groups.append((_union_block_bbox(ordered_cells), ordered_cells))
+    groups.extend((block.bbox, [block]) for block in figure_blocks)
+    for bbox, group in sorted(groups, key=lambda item: (item[0][1], item[0][0])):
+        insertion = next(
+            (
+                index
+                for index, block in enumerate(result)
+                if block.bbox[1] >= bbox[1]
+                and _horizontal_overlap(block.bbox, bbox) > 0
+            ),
+            len(result),
+        )
+        result[insertion:insertion] = group
+    return result
+
+
+def _union_block_bbox(
+    blocks: Sequence[PdfBlock],
+) -> tuple[float, float, float, float]:
+    return (
+        min(block.bbox[0] for block in blocks),
+        min(block.bbox[1] for block in blocks),
+        max(block.bbox[2] for block in blocks),
+        max(block.bbox[3] for block in blocks),
+    )
+
+
+def _horizontal_overlap(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    return max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
 
 
 def _validate_character_assignment(

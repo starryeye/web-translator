@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PIL import Image
+import pdfplumber
 import pytest
 from reportlab.pdfgen.canvas import Canvas
 
@@ -1001,3 +1003,331 @@ def test_inspect_pdf_clips_against_nonzero_page_bbox(tmp_path: Path) -> None:
 
     assert inspection.pages[0].image_coverage == 0.5
     assert inspection.scan_candidate_pages == [1]
+
+
+def _ruled_table_pdf(path: Path, *, crossing_border: bool = False) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    for x in (50, 150, 250):
+        canvas.line(x, 200, x, 300)
+    canvas.line(50, 300, 250, 300)
+    canvas.line(50, 200, 250, 200)
+    if crossing_border:
+        canvas.line(50, 250, 250, 250)
+        canvas.drawCentredString(150, 270, "W")
+        canvas.drawString(60, 220, "A2")
+        canvas.drawString(160, 220, "B2")
+    else:
+        canvas.line(150, 250, 250, 250)
+        canvas.drawString(60, 270, "Merged")
+        canvas.drawString(160, 270, "B1")
+        # The lower-right cell is deliberately empty.
+    canvas.save()
+    return path
+
+
+def _text_aligned_table_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    canvas.setFont("Helvetica-Bold", 10)
+    canvas.drawString(50, 300, "Name")
+    canvas.drawString(180, 300, "Value")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(50, 280, "Alpha")
+    canvas.drawString(180, 280, "10")
+    canvas.drawString(50, 260, "Beta")
+    canvas.drawString(180, 260, "20")
+    canvas.save()
+    return path
+
+
+def _mixed_table_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(500, 500))
+    for x in (300, 375, 450):
+        canvas.line(x, 330, x, 430)
+    for y in (330, 380, 430):
+        canvas.line(300, y, 450, y)
+    canvas.drawString(310, 400, "R1")
+    canvas.drawString(385, 400, "R2")
+    canvas.drawString(310, 350, "R3")
+    canvas.drawString(385, 350, "R4")
+    canvas.setFont("Helvetica-Bold", 10)
+    canvas.drawString(50, 260, "Name")
+    canvas.drawString(160, 260, "Value")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(50, 240, "Alpha")
+    canvas.drawString(160, 240, "10")
+    canvas.drawString(50, 220, "Beta")
+    canvas.drawString(160, 220, "20")
+    canvas.save()
+    return path
+
+
+def _rich_layout_pdf(path: Path) -> Path:
+    image_path = path.with_suffix(".png")
+    Image.new("RGB", (100, 80), (220, 50, 40)).save(image_path)
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(72, 750, "Rich Layout Evidence")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(
+        72,
+        724,
+        "This document contains deterministic selectable content for complete extraction.",
+    )
+    canvas.drawString(
+        72,
+        708,
+        "Every native table cell, caption, footnote, figure, and link remains evidenced.",
+    )
+
+    # A ruled table with one two-column merged header.
+    canvas.rect(72, 570, 300, 100, stroke=1, fill=0)
+    canvas.line(72, 620, 372, 620)
+    canvas.line(222, 570, 222, 620)
+    canvas.setFont("Helvetica-Bold", 10)
+    canvas.drawString(82, 642, "Merged table heading")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(82, 592, "Left value")
+
+    canvas.drawImage(str(image_path), 72, 390, width=100, height=80)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(72, 374, "Figure 1. Source raster image")
+
+    # Connected vector chart without a closed table grid.
+    canvas.line(260, 390, 260, 470)
+    canvas.line(260, 390, 410, 390)
+    canvas.line(260, 405, 305, 430)
+    canvas.line(305, 430, 355, 415)
+    canvas.line(355, 415, 410, 455)
+    canvas.drawString(260, 374, "Figure 2. Source vector chart")
+
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 330, "External specification link")
+    canvas.linkURL("https://example.com/spec", (72, 328, 205, 342), relative=0)
+    canvas.drawString(72, 306, "Continue at the internal destination")
+    canvas.linkRect("", "internal-target", (72, 304, 245, 318), relative=0)
+    canvas.drawString(72, 270, "The deterministic workflow includes a page-local note")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(335, 275, "1")
+    canvas.drawString(72, 40, "1 Footnote evidence remains linked to its marker.")
+
+    canvas.showPage()
+    canvas.bookmarkPage("internal-target")
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.drawString(72, 720, "Internal Destination")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(
+        72,
+        690,
+        "This known emitted block is the unambiguous target of the source navigation link.",
+    )
+    canvas.save()
+    return path
+
+
+def _ambiguous_caption_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.drawString(72, 730, "Ambiguous Caption Evidence")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(
+        72,
+        700,
+        "Selectable prose keeps this fixture above the supported text threshold while",
+    )
+    canvas.drawString(
+        72,
+        684,
+        "two explicit captions compete for one connected graphical region below.",
+    )
+    canvas.line(72, 520, 72, 620)
+    canvas.line(72, 520, 300, 520)
+    canvas.line(72, 540, 150, 585)
+    canvas.line(150, 585, 230, 550)
+    canvas.line(230, 550, 300, 610)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(72, 502, "Figure 1. First possible caption")
+    canvas.drawString(90, 484, "Figure 2. Second possible caption")
+    canvas.save()
+    return path
+
+
+def _ambiguous_link_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    canvas.drawString(50, 300, "First visible owner")
+    canvas.drawString(50, 280, "Second visible owner")
+    canvas.linkURL("https://example.com/ambiguous", (50, 278, 180, 312), relative=0)
+    canvas.save()
+    return path
+
+
+def test_detect_tables_preserves_merged_spans_and_empty_structural_cells(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import detect_tables
+
+    with pdfplumber.open(_ruled_table_pdf(tmp_path / "merged.pdf")) as document:
+        result = detect_tables(document.pages[0], page_number=1)
+
+    assert [
+        (block.row, block.column, block.row_span, block.column_span, block.source_text)
+        for block in result.blocks
+    ] == [
+        (0, 0, 2, 1, "Merged"),
+        (0, 1, 1, 1, "B1"),
+        (1, 1, 1, 1, ""),
+    ]
+    assert [cell.block_id for cell in result.cells] == [
+        block.id for block in result.blocks
+    ]
+
+
+def test_detect_tables_falls_back_to_aligned_text_without_synthetic_blank_rows(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import detect_tables
+
+    with pdfplumber.open(_text_aligned_table_pdf(tmp_path / "aligned.pdf")) as document:
+        result = detect_tables(document.pages[0], page_number=1)
+
+    assert [(block.row, block.column, block.source_text) for block in result.blocks] == [
+        (0, 0, "Name"),
+        (0, 1, "Value"),
+        (1, 0, "Alpha"),
+        (1, 1, "10"),
+        (2, 0, "Beta"),
+        (2, 1, "20"),
+    ]
+    assert [cell.is_header for cell in result.cells] == [True, True, False, False, False, False]
+
+
+def test_detect_tables_keeps_nonoverlapping_text_table_after_ruled_table(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import detect_tables
+
+    with pdfplumber.open(_mixed_table_pdf(tmp_path / "mixed-tables.pdf")) as document:
+        result = detect_tables(document.pages[0], page_number=1)
+
+    assert [cell.table_id for cell in result.cells] == (
+        ["pdf:page-0001:table-0001"] * 4
+        + ["pdf:page-0001:table-0002"] * 6
+    )
+
+
+def test_detect_tables_rejects_character_crossing_an_internal_border(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import detect_tables
+
+    with pdfplumber.open(
+        _ruled_table_pdf(tmp_path / "ambiguous.pdf", crossing_border=True)
+    ) as document:
+        with pytest.raises(PdfExtractionError, match="ambiguous table character ownership"):
+            detect_tables(document.pages[0], page_number=1)
+
+
+def test_extract_pdf_emits_figures_captions_footnotes_tables_and_links(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    document = extract_pdf(
+        _rich_layout_pdf(tmp_path / "rich.pdf"),
+        tmp_path / "document.json",
+        tmp_path / "segments.jsonl",
+        tmp_path / "media",
+    )
+
+    assert [
+        (cell.row, cell.column, cell.row_span, cell.column_span)
+        for cell in document.table_cells
+    ] == [(0, 0, 1, 2), (1, 0, 1, 1), (1, 1, 1, 1)]
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    captions = [block for block in document.blocks if block.kind == "caption"]
+    assert [block.media_path for block in figures] == [
+        "media/figure-0001.png",
+        "media/figure-0002.png",
+    ]
+    assert [block.caption_id for block in figures] == [block.id for block in captions]
+    assert [block.caption_id for block in captions] == [block.id for block in figures]
+    assert [(Image.open(tmp_path / str(block.media_path))).size for block in figures] == [
+        (200, 160),
+        (300, 160),
+    ]
+
+    footnote = next(block for block in document.blocks if block.kind == "footnote")
+    marker_owner = next(
+        block for block in document.blocks if "page-local note" in block.source_text
+    )
+    assert marker_owner.destination == footnote.id
+    external = next(
+        block for block in document.blocks if "External specification link" in block.source_text
+    )
+    internal = next(
+        block
+        for block in document.blocks
+        if "Continue at the internal destination" in block.source_text
+    )
+    target = next(
+        block for block in document.blocks if block.source_text == "Internal Destination"
+    )
+    assert external.uri == "https://example.com/spec"
+    assert internal.destination == target.id
+
+    segments = read_segments(tmp_path / "segments.jsonl")
+    empty_cell = next(
+        block
+        for block in document.blocks
+        if block.kind == "table-cell" and not block.source_text
+    )
+    assert empty_cell.segment_id is None
+    assert empty_cell.id not in {segment.locator for segment in segments}
+    assert {"table-cell", "caption", "footnote"} <= {
+        segment.semantic_type for segment in segments
+    }
+
+
+def test_extract_pdf_rejects_ambiguous_figure_caption_pairing(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    with pytest.raises(PdfExtractionError, match="ambiguous figure-caption pairing"):
+        extract_pdf(
+            _ambiguous_caption_pdf(tmp_path / "ambiguous-caption.pdf"),
+            tmp_path / "document.json",
+            tmp_path / "segments.jsonl",
+            tmp_path / "media",
+        )
+
+
+def test_extract_link_evidence_warns_and_fails_closed_for_ambiguous_source(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    style = PdfBlockStyle(12.0, False, "left", 50.0, 6.0)
+    blocks = [
+        PdfBlock(
+            id=f"pdf:page-0001:block-{index:04d}",
+            page_number=1,
+            order=index - 1,
+            kind="paragraph",
+            bbox=bbox,
+            style=style,
+            source_text=text,
+        )
+        for index, bbox, text in (
+            (1, (50.0, 88.0, 180.0, 102.0), "First visible owner"),
+            (2, (50.0, 108.0, 180.0, 122.0), "Second visible owner"),
+        )
+    ]
+
+    evidence = extract_link_evidence(
+        _ambiguous_link_pdf(tmp_path / "ambiguous-link.pdf"), blocks
+    )
+
+    assert [block.uri for block in evidence.blocks] == [None, None]
+    assert evidence.warnings == (
+        "page 1 link 1: unresolved visible link source",
+    )
