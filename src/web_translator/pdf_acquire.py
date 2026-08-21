@@ -63,7 +63,7 @@ class _StagingDirectory:
     name: str
     descriptor: int | None
     identity: tuple[int, int]
-    files: dict[str, tuple[int, int]] = field(default_factory=dict)
+    files: dict[str, tuple[int, int] | None] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -497,6 +497,9 @@ def _publish_artifacts(
     metadata_writer: MetadataWriter | None,
 ) -> None:
     if metadata_writer is not None:
+        # The private staging name is cleanup-owned even if the writer aborts
+        # before its inode can be recorded.
+        staging.files["source.json"] = None
         try:
             _verify_run_identity(run)
             staged_metadata = _staging_path(run, staging) / "source.json"
@@ -714,12 +717,13 @@ def _cleanup_staging_directory(
 ) -> None:
     cleanup_failed = False
     for name, identity in reversed(tuple(staging.files.items())):
-        try:
-            result = _staged_file_stat(run, staging, name)
-        except PdfAcquireError:
-            continue
-        if (result.st_dev, result.st_ino) != identity:
-            continue
+        if identity is not None:
+            try:
+                result = _staged_file_stat(run, staging, name)
+            except PdfAcquireError:
+                continue
+            if (result.st_dev, result.st_ino) != identity:
+                continue
         try:
             if _supports_descriptor_relative_operations():
                 assert staging.descriptor is not None

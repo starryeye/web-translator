@@ -360,6 +360,80 @@ def test_acquire_pdf_rolls_back_link_when_interrupted_before_post_link_checks(
     assert not (run_dir / "source.json").exists()
 
 
+@pytest.mark.parametrize(
+    "force_fallback", [False, True], ids=["posix", "windows-fallback"]
+)
+def test_metadata_writer_exception_cleans_unregistered_stage_without_touching_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_fallback: bool,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside", encoding="utf-8")
+
+    if force_fallback:
+        monkeypatch.setattr(
+            acquire_module, "_supports_descriptor_relative_operations", lambda: False
+        )
+
+    def write_then_fail(record: object, path: Path) -> None:
+        path.write_text("staged metadata", encoding="utf-8")
+        raise RuntimeError("metadata writer failed")
+
+    with pytest.raises(RuntimeError, match="metadata writer failed"):
+        acquire_pdf(
+            str(source),
+            run_dir,
+            now=FIXED_TIME,
+            metadata_writer=write_then_fail,
+        )
+
+    assert not (run_dir / "source.pdf").exists()
+    assert not (run_dir / "source.json").exists()
+    assert list(run_dir.glob(".pdf-acquiring-*")) == []
+    assert outside.read_text(encoding="utf-8") == "outside"
+
+
+@pytest.mark.parametrize(
+    "force_fallback", [False, True], ids=["posix", "windows-fallback"]
+)
+def test_metadata_writer_base_exception_cleans_unregistered_stage_without_touching_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_fallback: bool,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside", encoding="utf-8")
+
+    if force_fallback:
+        monkeypatch.setattr(
+            acquire_module, "_supports_descriptor_relative_operations", lambda: False
+        )
+
+    def write_then_interrupt(record: object, path: Path) -> None:
+        path.write_text("staged metadata", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        acquire_pdf(
+            str(source),
+            run_dir,
+            now=FIXED_TIME,
+            metadata_writer=write_then_interrupt,
+        )
+
+    assert not (run_dir / "source.pdf").exists()
+    assert not (run_dir / "source.json").exists()
+    assert list(run_dir.glob(".pdf-acquiring-*")) == []
+    assert outside.read_text(encoding="utf-8") == "outside"
+
+
 def test_acquire_pdf_uses_windows_fallback_with_korean_space_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
