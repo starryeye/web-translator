@@ -18,6 +18,7 @@ from web_translator.cli import (
 )
 from web_translator.models import MasterReview, QAResult, Segment
 from web_translator.zones import Zone
+from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
 
 REVIEW_DIMENSIONS = (
@@ -28,6 +29,125 @@ REVIEW_DIMENSIONS = (
     "boundary_consistency",
     "protected_content",
 )
+
+
+def test_pdf_extract_cli_publishes_document_segments_and_media_atomically(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_text_pdf(tmp_path / "input.pdf")
+    run_dir = tmp_path / "run"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["pdf-extract", "--run-dir", str(run_dir)])
+
+    assert exit_code == 0
+    assert json.loads((run_dir / "document.json").read_text(encoding="utf-8"))[
+        "page_count"
+    ] == 1
+    assert (run_dir / "segments.jsonl").is_file()
+    assert (run_dir / "media").is_dir()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-extract",
+        "exit_code": 0,
+        "status": "ok",
+    }
+
+
+def test_pdf_extract_cli_maps_extraction_rejection_to_contract_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_image_only_pdf(tmp_path / "image-only.pdf")
+    run_dir = tmp_path / "run"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["pdf-extract", "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+    assert not (run_dir / "media").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-extract",
+        "exit_code": cli_module.EXIT_CONTRACT_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_extract_cli_keeps_existing_outputs_when_staging_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_text_pdf(tmp_path / "input.pdf")
+    run_dir = tmp_path / "run"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    capsys.readouterr()
+    (run_dir / "document.json").write_text("old document", encoding="utf-8")
+    (run_dir / "segments.jsonl").write_text("old segments", encoding="utf-8")
+    (run_dir / "media").mkdir()
+    (run_dir / "media" / "keep.txt").write_text("old media", encoding="utf-8")
+
+    def fail_extraction(*args: object, **kwargs: object) -> object:
+        from web_translator.pdf_extract import PdfExtractionError
+
+        raise PdfExtractionError("ambiguous column evidence")
+
+    monkeypatch.setattr(cli_module, "extract_pdf", fail_extraction)
+
+    exit_code = main(["pdf-extract", "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+    assert (run_dir / "document.json").read_text(encoding="utf-8") == "old document"
+    assert (run_dir / "segments.jsonl").read_text(encoding="utf-8") == "old segments"
+    assert (run_dir / "media" / "keep.txt").read_text(encoding="utf-8") == "old media"
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-extract",
+        "exit_code": cli_module.EXIT_CONTRACT_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_extract_cli_rolls_back_all_outputs_when_publication_fails_midway(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = make_text_pdf(tmp_path / "input.pdf")
+    run_dir = tmp_path / "run"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    capsys.readouterr()
+    (run_dir / "document.json").write_text("old document", encoding="utf-8")
+    (run_dir / "segments.jsonl").write_text("old segments", encoding="utf-8")
+    (run_dir / "media").mkdir()
+    (run_dir / "media" / "keep.txt").write_text("old media", encoding="utf-8")
+    original_replace = cli_module.os.replace
+
+    def fail_staged_segments(source_path: object, destination: object) -> None:
+        source_candidate = Path(source_path)  # type: ignore[arg-type]
+        destination_candidate = Path(destination)  # type: ignore[arg-type]
+        if (
+            source_candidate.name == "segments.jsonl"
+            and source_candidate.parent.name.startswith(".pdf-extracting-")
+            and destination_candidate == run_dir / "segments.jsonl"
+        ):
+            raise OSError("segments publication failed")
+        original_replace(source_path, destination)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli_module.os, "replace", fail_staged_segments)
+
+    exit_code = main(["pdf-extract", "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+    assert (run_dir / "document.json").read_text(encoding="utf-8") == "old document"
+    assert (run_dir / "segments.jsonl").read_text(encoding="utf-8") == "old segments"
+    assert (run_dir / "media" / "keep.txt").read_text(encoding="utf-8") == "old media"
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-extract",
+        "exit_code": cli_module.EXIT_CONTRACT_FAILURE,
+        "status": "error",
+    }
 
 
 def test_pdf_acquire_cli_requires_an_empty_run_directory_and_writes_source_metadata(

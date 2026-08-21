@@ -1,11 +1,14 @@
-"""Fail-closed structural inspection for acquired PDF sources."""
+"""Fail-closed structural inspection and logical extraction for PDF sources."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
+import json
 import math
 from numbers import Real
 from pathlib import Path
+import re
 
 import pdfplumber
 from pypdf import PdfReader
@@ -18,16 +21,27 @@ from pypdf.generic import (
 )
 
 from web_translator.pdf_acquire import MAX_PDF_BYTES
-from web_translator.pdf_models import PdfPageEvidence
+from web_translator.models import ProtectedToken, Segment, write_segments
+from web_translator.pdf_layout import (
+    PdfExtractionError,
+    PdfLine,
+    build_text_blocks,
+    classify_document_lines,
+    group_words_into_lines,
+    order_page_lines,
+)
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfDocument,
+    PdfPage,
+    PdfPageEvidence,
+)
+from web_translator.protection import protect_fragment
 
 
 _MIN_PAGE_POINTS = 36.0
 _MAX_PAGE_POINTS = 14_400.0
 _MAX_PAGE_COUNT = 100
-
-
-class PdfExtractionError(RuntimeError):
-    """A PDF cannot safely enter the translation extraction workflow."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +96,247 @@ def reject_unsupported_pdf(inspection: PdfInspection) -> None:
             "scanned PDF: candidate pages "
             f"{page_numbers} exceed {maximum_candidates}; {evidence}"
         )
+
+
+def extract_pdf(
+    source_pdf: Path,
+    document_path: Path,
+    segments_path: Path,
+    media_dir: Path,
+) -> PdfDocument:
+    """Extract deterministic logical blocks and shared translation segments."""
+    source = Path(source_pdf)
+    inspection = inspect_pdf(source)
+    reject_unsupported_pdf(inspection)
+    page_lines = _extract_page_lines(source, inspection)
+    classified_pages = classify_document_lines(
+        [
+            (lines, evidence.height)
+            for lines, evidence in zip(
+                page_lines, inspection.pages, strict=True
+            )
+        ]
+    )
+
+    blocks: list[PdfBlock] = []
+    assigned_by_page: list[int] = []
+    for evidence, lines in zip(inspection.pages, classified_pages, strict=True):
+        ordered = order_page_lines(lines, evidence.width)
+        assigned_by_page.append(sum(line.character_count for line in ordered))
+        page_blocks = build_text_blocks(ordered, evidence.number)
+        first_order = len(blocks)
+        blocks.extend(
+            replace(block, order=first_order + index)
+            for index, block in enumerate(page_blocks)
+        )
+
+    _validate_character_assignment(inspection, assigned_by_page)
+    _validate_peer_overlap(blocks)
+    blocks, segments = _build_segments(blocks)
+    document = PdfDocument(
+        schema_version="1.0",
+        source_sha256=_sha256(source),
+        page_count=inspection.page_count,
+        selectable_characters=inspection.selectable_characters,
+        scan_candidate_pages=list(inspection.scan_candidate_pages),
+        pages=[
+            PdfPage(
+                number=evidence.number,
+                width=evidence.width,
+                height=evidence.height,
+                rotation=evidence.rotation,
+            )
+            for evidence in inspection.pages
+        ],
+        blocks=blocks,
+        table_cells=[],
+    )
+    try:
+        PdfDocument.from_dict(document.to_dict())
+        Path(document_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(segments_path).parent.mkdir(parents=True, exist_ok=True)
+        media = Path(media_dir)
+        media.mkdir(parents=True, exist_ok=True)
+        if not media.is_dir():
+            raise PdfExtractionError(f"PDF media path is not a directory: {media}")
+        Path(document_path).write_text(
+            json.dumps(document.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        write_segments(Path(segments_path), segments)
+    except PdfExtractionError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise PdfExtractionError(f"cannot write PDF extraction outputs: {error}") from error
+    return document
+
+
+def _extract_page_lines(
+    source: Path, inspection: PdfInspection
+) -> list[list[PdfLine]]:
+    try:
+        with pdfplumber.open(source) as document:
+            if len(document.pages) != inspection.page_count:
+                raise PdfExtractionError("PDF readers disagree on page count")
+            result: list[list[PdfLine]] = []
+            for page, evidence in zip(document.pages, inspection.pages, strict=True):
+                raw_words = page.extract_words(
+                    return_chars=True,
+                    extra_attrs=["fontname", "size"],
+                )
+                if not isinstance(raw_words, list):
+                    raise PdfExtractionError(
+                        f"page {evidence.number} did not produce word evidence"
+                    )
+                result.append(
+                    [
+                        line.with_page_geometry(evidence.width, evidence.height)
+                        for line in group_words_into_lines(raw_words)
+                    ]
+                )
+            return result
+    except PdfExtractionError:
+        raise
+    except Exception as error:
+        raise PdfExtractionError(f"cannot extract PDF words: {error}") from error
+
+
+def _validate_character_assignment(
+    inspection: PdfInspection, assigned_by_page: list[int]
+) -> None:
+    assigned = sum(assigned_by_page)
+    selectable = inspection.selectable_characters
+    if assigned > selectable:
+        raise PdfExtractionError(
+            "PDF character assignment exceeds selectable evidence: "
+            f"assigned {assigned}, selectable {selectable}"
+        )
+    if selectable == 0 or assigned / selectable < 0.99:
+        details = "; ".join(
+            f"page {page.number}: unmatched "
+            f"{max(0, page.selectable_characters - page_assigned)}"
+            for page, page_assigned in zip(
+                inspection.pages, assigned_by_page, strict=True
+            )
+        )
+        raise PdfExtractionError(
+            "PDF character assignment below 99 percent: "
+            f"assigned {assigned} of {selectable}; {details}"
+        )
+
+
+def _validate_peer_overlap(blocks: list[PdfBlock]) -> None:
+    by_page: dict[int, list[PdfBlock]] = {}
+    for block in blocks:
+        by_page.setdefault(block.page_number, []).append(block)
+    for page_number, page_blocks in by_page.items():
+        for index, left in enumerate(page_blocks):
+            for right in page_blocks[index + 1 :]:
+                intersection = _intersection_area(left.bbox, right.bbox)
+                if intersection == 0:
+                    continue
+                smaller_area = min(_bbox_area(left.bbox), _bbox_area(right.bbox))
+                if smaller_area > 0 and intersection / smaller_area > 0.10 + 1e-9:
+                    raise PdfExtractionError(
+                        "PDF peer text blocks overlap above 10 percent on page "
+                        f"{page_number}: {left.id}, {right.id}"
+                    )
+
+
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _intersection_area(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+    height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    return width * height
+
+
+def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segment]]:
+    target_kinds = {
+        "heading",
+        "paragraph",
+        "list-item",
+        "caption",
+        "footnote",
+        "table-cell",
+    }
+    target_blocks = [
+        block
+        for block in blocks
+        if block.kind in target_kinds and block.source_text.strip()
+    ]
+    identifiers = [
+        f"seg-{index:06d}" for index in range(1, len(target_blocks) + 1)
+    ]
+    heading_sizes = sorted(
+        {
+            round(block.style.font_size)
+            for block in target_blocks
+            if block.kind == "heading"
+        },
+        reverse=True,
+    )
+    headings: list[str] = []
+    drafts: list[tuple[PdfBlock, list[str], str, list[ProtectedToken]]] = []
+    segment_by_block: dict[str, str] = {}
+    for identifier, block in zip(identifiers, target_blocks, strict=True):
+        source_text, protected = protect_fragment(block.source_text)
+        drafts.append((block, list(headings), source_text, list(protected)))
+        segment_by_block[block.id] = identifier
+        if block.kind == "heading":
+            level = _block_heading_level(block, heading_sizes)
+            headings = headings[: level - 1]
+            while len(headings) < level - 1:
+                headings.append("")
+            headings.append(block.source_text)
+
+    segments: list[Segment] = []
+    for index, (block, heading_path, source_text, protected) in enumerate(drafts):
+        identifier = identifiers[index]
+        context_ids = identifiers[max(0, index - 1) : index] + identifiers[
+            index + 1 : index + 2
+        ]
+        segments.append(
+            Segment(
+                id=identifier,
+                locator=block.id,
+                semantic_type=block.kind,
+                heading_path=heading_path,
+                source_text=source_text,
+                protected=protected,
+                context_ids=context_ids,
+                target=True,
+            )
+        )
+    return [
+        replace(block, segment_id=segment_by_block.get(block.id)) for block in blocks
+    ], segments
+
+
+def _block_heading_level(block: PdfBlock, heading_sizes: list[int]) -> int:
+    numbered = re.match(r"^(\d+(?:\.\d+)*)[.)]?\s+", block.source_text)
+    if numbered is not None:
+        return numbered.group(1).count(".") + 1
+    rounded_size = round(block.style.font_size)
+    return heading_sizes.index(rounded_size) + 1 if rounded_size in heading_sizes else 1
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise PdfExtractionError(f"cannot hash PDF source: {error}") from error
+    return digest.hexdigest()
 
 
 def _reject_oversized_source(source: Path) -> None:

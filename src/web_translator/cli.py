@@ -38,7 +38,8 @@ from web_translator.models import (
 )
 from web_translator.paths import validate_public_url
 from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
-from web_translator.pdf_models import PdfSourceRecord
+from web_translator.pdf_extract import PdfExtractionError, extract_pdf
+from web_translator.pdf_models import PdfContractError, PdfSourceRecord
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -128,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(command, EXIT_INVALID_ARGUMENTS, error)
     except (CaptureError, PdfAcquireError) as error:
         return _fail(command, EXIT_CAPTURE_FAILURE, error)
-    except (CLIContractError, TranslationContractError) as error:
+    except (CLIContractError, PdfExtractionError, TranslationContractError) as error:
         return _fail(command, EXIT_CONTRACT_FAILURE, error)
     except AssemblyError as error:
         return _fail(command, EXIT_ASSEMBLY_FAILURE, error)
@@ -161,6 +162,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pdf_acquire.add_argument("source")
     _add_run_dir(pdf_acquire)
     pdf_acquire.set_defaults(handler=_pdf_acquire_command)
+
+    pdf_extract = subparsers.add_parser(
+        "pdf-extract", help="Extract PDF logical blocks and translation segments."
+    )
+    _add_run_dir(pdf_extract)
+    pdf_extract.set_defaults(handler=_pdf_extract_command)
 
     extract = subparsers.add_parser("extract", help="Extract translation segments.")
     _add_run_dir(extract)
@@ -249,6 +256,111 @@ def _pdf_acquire_command(args: argparse.Namespace) -> None:
         )
     except (CLIContractError, OSError) as error:
         raise PdfAcquireError(str(error)) from error
+
+
+def _pdf_extract_command(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir)
+    try:
+        _validate_run_root(run_dir)
+        source = run_dir / "source.pdf"
+        source_record_path = run_dir / "source.json"
+        _require_safe_file(source)
+        _require_safe_file(source_record_path)
+        _validate_pdf_source_record(source, source_record_path)
+        destinations = (
+            run_dir / "document.json",
+            run_dir / "segments.jsonl",
+            run_dir / "media",
+        )
+        _validate_pdf_extraction_destinations(destinations)
+        with tempfile.TemporaryDirectory(
+            prefix=".pdf-extracting-", dir=run_dir
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            staged_document = temporary / "document.json"
+            staged_segments = temporary / "segments.jsonl"
+            staged_media = temporary / "media"
+            extract_pdf(
+                source,
+                staged_document,
+                staged_segments,
+                staged_media,
+            )
+            _publish_pdf_extraction(
+                (
+                    (staged_document, destinations[0]),
+                    (staged_segments, destinations[1]),
+                    (staged_media, destinations[2]),
+                ),
+                temporary / "rollback",
+            )
+    except PdfExtractionError:
+        raise
+    except (CLIContractError, PdfContractError, OSError, UnicodeError) as error:
+        raise CLIContractError(f"cannot extract PDF source: {error}") from error
+
+
+def _validate_pdf_source_record(source: Path, record_path: Path) -> None:
+    record = PdfSourceRecord.from_dict(_read_json_object(record_path))
+    try:
+        byte_length = source.stat().st_size
+    except OSError as error:
+        raise CLIContractError(f"cannot inspect source.pdf: {error}") from error
+    if record.byte_length != byte_length:
+        raise CLIContractError("source.json byte_length does not match source.pdf")
+    if record.sha256 != _sha256_file(source):
+        raise CLIContractError("source.json sha256 does not match source.pdf")
+
+
+def _validate_pdf_extraction_destinations(
+    destinations: tuple[Path, Path, Path],
+) -> None:
+    document, segments, media = destinations
+    for destination in (document, segments):
+        if destination.exists():
+            _require_safe_file(destination)
+        else:
+            _reject_if_link(destination)
+    if media.exists():
+        _require_safe_directory(media)
+    else:
+        _reject_if_link(media)
+
+
+def _publish_pdf_extraction(
+    publications: tuple[tuple[Path, Path], ...], rollback_dir: Path
+) -> None:
+    """Publish all staged PDF artifacts, restoring every prior artifact on failure."""
+    rollback_dir.mkdir()
+    backups: list[tuple[Path, Path]] = []
+    published: list[tuple[Path, Path]] = []
+    try:
+        for _, destination in publications:
+            if destination.exists() or destination.is_symlink():
+                backup = rollback_dir / f"original-{destination.name}"
+                os.replace(destination, backup)
+                backups.append((backup, destination))
+        for staged, destination in publications:
+            os.replace(staged, destination)
+            published.append((destination, rollback_dir / f"new-{destination.name}"))
+    except BaseException as publish_error:
+        try:
+            for destination, discarded in reversed(published):
+                if destination.exists() or destination.is_symlink():
+                    os.replace(destination, discarded)
+            for backup, destination in reversed(backups):
+                if backup.exists() or backup.is_symlink():
+                    os.replace(backup, destination)
+        except OSError as rollback_error:
+            raise CLIContractError(
+                "PDF extraction publication and rollback both failed: "
+                f"publish={publish_error}; rollback={rollback_error}"
+            ) from publish_error
+        if isinstance(publish_error, OSError):
+            raise CLIContractError(
+                f"cannot publish PDF extraction: {publish_error}"
+            ) from publish_error
+        raise
 
 
 def _extract_command(args: argparse.Namespace) -> None:
