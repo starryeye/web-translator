@@ -419,16 +419,27 @@ def _has_tight_numbered_list_peer(
     family = _numbered_list_family(line)
     if family is None:
         return False
-    for peer_index in (index - 1, index + 1):
-        if peer_index < 0 or peer_index >= len(lines):
+    same_band_peers = [
+        peer
+        for peer_index, peer in enumerate(lines)
+        if peer_index != index
+        and _numbered_list_family(peer) == family
+        and abs(line.x0 - peer.x0) <= max(line.size, peer.size) * 0.5
+    ]
+    previous = max(
+        (peer for peer in same_band_peers if peer.top < line.top),
+        key=lambda peer: (peer.bottom, peer.top, peer.text),
+        default=None,
+    )
+    following = min(
+        (peer for peer in same_band_peers if peer.top > line.top),
+        key=lambda peer: (peer.top, peer.bottom, peer.text),
+        default=None,
+    )
+    for peer in (previous, following):
+        if peer is None:
             continue
-        peer = lines[peer_index]
-        if _numbered_list_family(peer) != family:
-            continue
-        indent_tolerance = max(line.size, peer.size) * 0.5
-        if abs(line.x0 - peer.x0) > indent_tolerance:
-            continue
-        if peer_index < index:
+        if peer.top < line.top:
             gap = max(0.0, line.top - peer.bottom)
         else:
             gap = max(0.0, peer.top - line.bottom)

@@ -478,6 +478,139 @@ def test_styled_ordered_list_edge_uses_tight_same_indent_peer_context(
     ]
 
 
+@pytest.mark.parametrize(
+    ("styled_position", "list_bounds", "opposite_bounds"),
+    [
+        ("first", (20, 90), (130, 200)),
+        ("last", (20, 90), (130, 200)),
+        ("first", (130, 200), (20, 90)),
+        ("last", (130, 200), (20, 90)),
+    ],
+    ids=["left-first", "left-last", "right-first", "right-last"],
+)
+def test_styled_ordered_list_edge_skips_interleaved_opposite_column_lines(
+    styled_position: str,
+    list_bounds: tuple[float, float],
+    opposite_bounds: tuple[float, float],
+) -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    list_x0, list_x1 = list_bounds
+    opposite_x0, opposite_x1 = opposite_bounds
+    if styled_position == "first":
+        first_top, first_bottom = 50, 62
+        opposite_top, opposite_bottom = 63, 73
+        last_top, last_bottom = 65, 75
+        following_top = 85
+    else:
+        first_top, first_bottom = 50, 60
+        opposite_top, opposite_bottom = 61, 71
+        last_top, last_bottom = 63, 75
+        following_top = 110
+    lines = group_words_into_lines(
+        [
+            _word(
+                "Surrounding prose makes the body font cluster dominant.",
+                x0=list_x0,
+                x1=list_x1,
+                top=10,
+                bottom=20,
+            ),
+            _word(
+                "1. First ordered item",
+                x0=list_x0,
+                x1=list_x1,
+                top=first_top,
+                bottom=first_bottom,
+                size=12 if styled_position == "first" else 10,
+                fontname=(
+                    "Helvetica-Bold"
+                    if styled_position == "first"
+                    else "Helvetica"
+                ),
+            ),
+            _word(
+                "Opposite column prose interleaves raw line order.",
+                x0=opposite_x0,
+                x1=opposite_x1,
+                top=opposite_top,
+                bottom=opposite_bottom,
+            ),
+            _word(
+                "2. Last ordered item",
+                x0=list_x0,
+                x1=list_x1,
+                top=last_top,
+                bottom=last_bottom,
+                size=12 if styled_position == "last" else 10,
+                fontname=(
+                    "Helvetica-Bold"
+                    if styled_position == "last"
+                    else "Helvetica"
+                ),
+            ),
+            _word(
+                "Following prose stays outside the ordered list sequence.",
+                x0=list_x0,
+                x1=list_x1,
+                top=following_top,
+                bottom=following_top + 10,
+            ),
+        ]
+    )
+    pages = [([line.with_page_geometry(220, 200) for line in lines], 200.0)]
+
+    classified = classify_document_lines(pages)[0]
+    kinds = {line.text: line.kind for line in classified}
+
+    assert kinds["1. First ordered item"] == "list-item"
+    assert kinds["2. Last ordered item"] == "list-item"
+
+
+def test_distant_same_indent_numbered_line_does_not_suppress_heading() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word(
+                "1. Architecture",
+                x0=20,
+                x1=150,
+                top=10,
+                bottom=26,
+                size=16,
+                fontname="Helvetica-Bold",
+            ),
+            _word(
+                "Body prose separates the heading from a later numeric marker.",
+                x0=20,
+                x1=190,
+                top=50,
+                bottom=60,
+            ),
+            _word(
+                "2. Later ordered marker",
+                x0=20,
+                x1=150,
+                top=100,
+                bottom=110,
+            ),
+        ]
+    )
+    pages = [([line.with_page_geometry(220, 200) for line in lines], 200.0)]
+
+    classified = classify_document_lines(pages)[0]
+
+    assert classified[0].kind == "heading"
+    assert classified[2].kind == "list-item"
+
+
 def test_repeated_band_classification_accepts_exactly_sixty_percent() -> None:
     from web_translator.pdf_layout import (
         classify_document_lines,
