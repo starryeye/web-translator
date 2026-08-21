@@ -127,6 +127,41 @@ def test_pdf_acquire_cli_rolls_back_source_when_metadata_destination_races(
     }
 
 
+def test_pdf_acquire_cli_maps_windows_fallback_link_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    import web_translator.pdf_acquire as acquire_module
+
+    monkeypatch.setattr(
+        acquire_module, "_supports_descriptor_relative_operations", lambda: False
+    )
+    original_link = acquire_module.os.link
+
+    def fail_final_source_link(
+        source_path: str | Path, destination: str | Path, **kwargs: object
+    ) -> None:
+        if Path(destination) == tmp_path / "run" / "source.pdf":
+            raise NotImplementedError()
+        original_link(source_path, destination, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        acquire_module.os,
+        "link",
+        fail_final_source_link,
+    )
+
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(tmp_path / "run")])
+
+    assert exit_code == cli_module.EXIT_CAPTURE_FAILURE
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-acquire",
+        "exit_code": cli_module.EXIT_CAPTURE_FAILURE,
+        "status": "error",
+    }
+
+
 def _zone(zone_id: str = "zone-001") -> Zone:
     return Zone(
         id=zone_id,

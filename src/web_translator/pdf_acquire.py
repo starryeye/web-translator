@@ -34,13 +34,17 @@ MAX_DOWNLOAD_SECONDS = 120.0
 _REPARSE_POINT = 0x400
 _CHUNK_SIZE = 1024 * 1024
 _GENERIC_BINARY_TYPES = {"application/octet-stream", "binary/octet-stream"}
+_DESCRIPTOR_RELATIVE_OPERATIONS_SUPPORTED = all(
+    operation in os.supports_dir_fd
+    for operation in (os.link, os.stat, os.unlink)
+)
 MetadataWriter = Callable[[PdfSourceRecord, Path], None]
 
 
 @dataclass(slots=True)
 class _RunDirectory:
     path: Path
-    descriptor: int
+    descriptor: int | None
     identity: tuple[int, int]
     published: dict[str, tuple[int, int]] = field(default_factory=dict)
 
@@ -88,7 +92,8 @@ def acquire_pdf(
         _rollback_published(run)
         raise
     finally:
-        os.close(run.descriptor)
+        if run.descriptor is not None:
+            os.close(run.descriptor)
 
 
 def _acquire_local_pdf(
@@ -101,7 +106,9 @@ def _acquire_local_pdf(
     initial = _regular_file_lstat(source)
     descriptor: int | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix=".pdf-acquiring-", dir=run.path) as name:
+        with tempfile.TemporaryDirectory(
+            prefix=".pdf-acquiring-", dir=run.path.parent
+        ) as name:
             staging = Path(name)
             flags = (
                 os.O_RDONLY
@@ -190,7 +197,7 @@ def _acquire_public_pdf(
     )
     try:
         with tempfile.TemporaryDirectory(
-            prefix=".pdf-acquiring-", dir=run.path
+            prefix=".pdf-acquiring-", dir=run.path.parent
         ) as name:
             staging = Path(name)
             atomic_write(staging / "source.pdf", content)
@@ -246,13 +253,24 @@ def _publish_staged_file(
     _verify_run_identity(run)
     source = _regular_file_lstat(temporary)
     source_identity = (source.st_dev, source.st_ino)
+    run.published[destination.name] = source_identity
     try:
-        os.link(temporary, destination.name, dst_dir_fd=run.descriptor)
+        if _supports_descriptor_relative_operations():
+            assert run.descriptor is not None
+            os.link(temporary, destination.name, dst_dir_fd=run.descriptor)
+        else:
+            _require_absent_destination(destination)
+            os.link(temporary, destination)
     except FileExistsError as error:
         raise PdfAcquireError(f"PDF destination already exists: {destination}") from error
-    run.published[destination.name] = source_identity
+    except (NotImplementedError, OSError) as error:
+        raise PdfAcquireError(
+            f"safe PDF publication unavailable: {destination}: {error}"
+        ) from error
     if not _matches_identity_at(run, destination.name, source_identity):
-        raise PdfAcquireError(f"PDF destination changed identity during publication: {destination}")
+        raise PdfAcquireError(
+            f"PDF destination changed identity during publication: {destination}"
+        )
     _verify_run_identity(run)
     return source_identity
 
@@ -269,7 +287,7 @@ def _publish_artifacts(
         try:
             metadata_writer(record, staged_metadata)
             _regular_file_lstat(staged_metadata)
-        except OSError as error:
+        except (NotImplementedError, OSError) as error:
             raise PdfAcquireError(f"cannot stage PDF metadata: {error}") from error
 
     source_destination = run.path / "source.pdf"
@@ -305,6 +323,12 @@ def _prepare_destination(run_dir: Path) -> _RunDirectory:
         raise PdfAcquireError(
             f"cannot create PDF run directory {run_dir}: {error}"
         ) from error
+    if not _supports_descriptor_relative_operations():
+        result = _require_safe_directory(run_dir)
+        run = _RunDirectory(run_dir, None, (result.st_dev, result.st_ino))
+        _assert_run_contents(run_dir, None, set(), run)
+        return run
+
     descriptor = _open_run_directory(run_dir)
     try:
         result = os.fstat(descriptor)
@@ -364,7 +388,6 @@ def _assert_run_contents(
     expected = set(allowed)
     if staging is not None:
         _require_safe_directory(staging)
-        expected.add(staging.name)
     if names != expected:
         raise PdfAcquireError(f"PDF run directory must be empty: {run_dir}")
 
@@ -388,6 +411,26 @@ def _open_run_directory(path: Path) -> int:
     return descriptor
 
 
+def _supports_descriptor_relative_operations() -> bool:
+    return _DESCRIPTOR_RELATIVE_OPERATIONS_SUPPORTED
+
+
+def _require_absent_destination(destination: Path) -> None:
+    try:
+        result = os.lstat(destination)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PdfAcquireError(
+            f"cannot inspect PDF destination {destination}: {error}"
+        ) from error
+    if stat.S_ISLNK(result.st_mode) or _is_reparse_point(result):
+        raise PdfAcquireError(
+            f"PDF destination is a link or reparse point: {destination}"
+        )
+    raise PdfAcquireError(f"PDF destination already exists: {destination}")
+
+
 def _verify_run_identity(run: _RunDirectory) -> None:
     current = _require_safe_directory(run.path)
     if (current.st_dev, current.st_ino) != run.identity:
@@ -398,8 +441,12 @@ def _matches_identity_at(
     run: _RunDirectory, name: str, identity: tuple[int, int]
 ) -> bool:
     try:
-        result = os.stat(name, dir_fd=run.descriptor, follow_symlinks=False)
-    except OSError:
+        if _supports_descriptor_relative_operations():
+            assert run.descriptor is not None
+            result = os.stat(name, dir_fd=run.descriptor, follow_symlinks=False)
+        else:
+            result = os.lstat(run.path / name)
+    except (PdfAcquireError, OSError, NotImplementedError):
         return False
     return (
         stat.S_ISREG(result.st_mode)
@@ -410,13 +457,43 @@ def _matches_identity_at(
 
 def _rollback_published(run: _RunDirectory) -> None:
     for name, identity in reversed(tuple(run.published.items())):
-        if not _matches_identity_at(run, name, identity):
+        if _supports_descriptor_relative_operations():
+            if not _matches_identity_at(run, name, identity):
+                continue
+            try:
+                assert run.descriptor is not None
+                os.unlink(name, dir_fd=run.descriptor)
+            except (OSError, NotImplementedError):
+                continue
             continue
-        try:
-            os.unlink(name, dir_fd=run.descriptor)
-        except OSError:
-            continue
+        for candidate in _fallback_run_paths(run):
+            destination = candidate / name
+            try:
+                result = _regular_file_lstat(destination)
+            except PdfAcquireError:
+                continue
+            if (result.st_dev, result.st_ino) != identity:
+                continue
+            try:
+                destination.unlink()
+            except OSError:
+                continue
     run.published.clear()
+
+
+def _fallback_run_paths(run: _RunDirectory) -> list[Path]:
+    candidates = [run.path]
+    try:
+        for sibling in run.path.parent.iterdir():
+            try:
+                result = _require_safe_directory(sibling)
+            except PdfAcquireError:
+                continue
+            if (result.st_dev, result.st_ino) == run.identity:
+                candidates.append(sibling)
+    except (PdfAcquireError, OSError):
+        return candidates
+    return list(dict.fromkeys(candidates))
 
 
 def _require_pdf_signature(content: bytes, source: str) -> None:

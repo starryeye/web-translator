@@ -243,6 +243,7 @@ def test_acquire_pdf_rejects_run_directory_swap_after_source_publication(
         acquire_pdf(str(source), run_dir, now=FIXED_TIME)
 
     assert not (replacement_dir / "source.pdf").exists()
+    assert list(replacement_dir.glob(".pdf-acquiring-*")) == []
     assert run_dir.is_symlink()
 
 
@@ -267,6 +268,90 @@ def test_acquire_pdf_rejects_destination_replaced_before_identity_verification(
         acquire_pdf(str(source), run_dir, now=FIXED_TIME)
 
     assert (run_dir / "source.pdf").read_bytes() == b"racer"
+
+
+def test_acquire_pdf_rolls_back_link_when_interrupted_before_post_link_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    original_link = acquire_module.os.link
+
+    def interrupt_after_link(source: Path, destination: str, **kwargs: object) -> None:
+        original_link(source, destination, **kwargs)  # type: ignore[arg-type]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(acquire_module.os, "link", interrupt_after_link)
+
+    with pytest.raises(KeyboardInterrupt):
+        acquire_pdf(str(source), run_dir, now=FIXED_TIME)
+
+    assert not (run_dir / "source.pdf").exists()
+    assert not (run_dir / "source.json").exists()
+
+
+def test_acquire_pdf_uses_windows_fallback_with_korean_space_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "입력 자료" / "보고서.pdf"
+    source.parent.mkdir()
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "실행 공간"
+
+    monkeypatch.setattr(
+        acquire_module, "_supports_descriptor_relative_operations", lambda: False
+    )
+
+    record = acquire_pdf(str(source), run_dir, now=FIXED_TIME)
+
+    assert record.input_kind == "local"
+    assert (run_dir / "source.pdf").read_bytes() == PDF
+
+
+def test_windows_fallback_maps_unsupported_link_to_pdf_acquire_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+
+    monkeypatch.setattr(
+        acquire_module, "_supports_descriptor_relative_operations", lambda: False
+    )
+
+    def unsupported_link(*args: object, **kwargs: object) -> None:
+        raise NotImplementedError("link unavailable")
+
+    monkeypatch.setattr(acquire_module.os, "link", unsupported_link)
+
+    with pytest.raises(PdfAcquireError, match="safe PDF publication unavailable"):
+        acquire_pdf(str(source), tmp_path / "run", now=FIXED_TIME)
+
+
+def test_windows_fallback_rolls_back_owned_source_after_run_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(PDF)
+    run_dir = tmp_path / "run"
+    moved = tmp_path / "moved-run"
+    original_link = acquire_module.os.link
+
+    monkeypatch.setattr(
+        acquire_module, "_supports_descriptor_relative_operations", lambda: False
+    )
+
+    def swap_after_link(source_path: Path, destination: Path, **kwargs: object) -> None:
+        original_link(source_path, destination, **kwargs)  # type: ignore[arg-type]
+        run_dir.replace(moved)
+        run_dir.symlink_to(tmp_path / "attacker", target_is_directory=True)
+
+    monkeypatch.setattr(acquire_module.os, "link", swap_after_link)
+
+    with pytest.raises(PdfAcquireError, match="link or reparse|changed identity"):
+        acquire_pdf(str(source), run_dir, now=FIXED_TIME)
+
+    assert not (moved / "source.pdf").exists()
 
 
 def test_acquire_public_pdf_records_redirect_chain_and_accepts_generic_binary_type(
