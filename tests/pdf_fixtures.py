@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from PIL import Image
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject, NumberObject
+from reportlab.pdfgen.canvas import Canvas
+
 from web_translator.pdf_models import (
     PdfBlock,
     PdfBlockStyle,
@@ -100,3 +107,99 @@ def make_pdf_layout_review() -> PdfLayoutReview:
         },
         unresolved_required=[],
     )
+
+
+def make_text_pdf(path: Path, *, pages: int = 1) -> Path:
+    """Create a PDF whose pages each contain more than 100 selectable characters."""
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    text = "Selectable document text. " * 8
+    for _ in range(pages):
+        canvas.drawString(72, 720, text)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
+def make_image_only_pdf(path: Path, *, pages: int = 1) -> Path:
+    """Create pages whose dominant content is one full-page raster image."""
+    image_path = path.with_suffix(".png")
+    Image.new("RGB", (612, 792), "white").save(image_path)
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    for _ in range(pages):
+        canvas.drawImage(str(image_path), 0, 0, width=612, height=792)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
+def make_mixed_pdf(path: Path, *, scanned_pages: int, text_pages: int) -> Path:
+    """Create a document with image-only pages before selectable-text pages."""
+    image_path = path.with_suffix(".png")
+    Image.new("RGB", (612, 792), "white").save(image_path)
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    for _ in range(scanned_pages):
+        canvas.drawImage(str(image_path), 0, 0, width=612, height=792)
+        canvas.showPage()
+    text = "Selectable document text. " * 8
+    for _ in range(text_pages):
+        canvas.drawString(72, 720, text)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
+def make_encrypted_pdf(path: Path) -> Path:
+    """Create a password-protected PDF without depending on external tools."""
+    clear_path = path.with_name(f"{path.stem}-clear.pdf")
+    make_text_pdf(clear_path)
+    writer = PdfWriter()
+    writer.append(PdfReader(clear_path))
+    writer.encrypt("secret")
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_malformed_pdf(path: Path) -> Path:
+    path.write_bytes(b"%PDF-1.7\nnot a valid PDF")
+    return path
+
+
+def make_zero_page_pdf(path: Path) -> Path:
+    writer = PdfWriter()
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_rotated_pdf(path: Path, *, rotation: int) -> Path:
+    make_text_pdf(path)
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    page = reader.pages[0]
+    if rotation % 90 == 0:
+        page.rotate(rotation)
+    else:
+        page[NameObject("/Rotate")] = NumberObject(rotation)
+    writer.add_page(page)
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_many_pages_pdf(path: Path, *, pages: int = 101) -> Path:
+    return make_text_pdf(path, pages=pages)
+
+
+def make_oversized_dimension_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(14_401, 792))
+    canvas.drawString(72, 720, "Selectable document text. " * 8)
+    canvas.save()
+    return path
+
+
+def make_oversized_pdf(path: Path) -> Path:
+    make_text_pdf(path)
+    with path.open("ab") as destination:
+        destination.truncate(50 * 1024 * 1024 + 1)
+    return path
