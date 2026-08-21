@@ -15,12 +15,15 @@ from tests.pdf_fixtures import (
     make_malformed_pdf,
     make_many_pages_pdf,
     make_mixed_pdf,
+    make_nonzero_origin_image_pdf,
     make_oversized_dimension_pdf,
     make_oversized_pdf,
     make_pdf_at_size,
     make_rotated_pdf,
     make_text_pdf,
     make_truncated_eof_pdf,
+    make_string_catalog_type_pdf,
+    make_string_pages_type_pdf,
     make_zero_page_pdf,
 )
 from web_translator.pdf_acquire import MAX_PDF_BYTES
@@ -78,6 +81,8 @@ def test_rejects_documents_with_too_little_selectable_text(tmp_path: Path) -> No
         (make_oversized_pdf, "size limit"),
         (make_truncated_eof_pdf, "final %%EOF"),
         (make_inconsistent_page_tree_pdf, "page tree count"),
+        (make_string_catalog_type_pdf, "catalog has an unsupported type"),
+        (make_string_pages_type_pdf, "page tree node has an unsupported type"),
     ],
 )
 def test_inspect_pdf_rejects_unsupported_document_structure(
@@ -206,3 +211,10 @@ def test_inspect_pdf_clips_off_page_image_coverage(tmp_path: Path) -> None:
     )
 
     assert inspection.pages[0].image_coverage == 1.0
+
+
+def test_inspect_pdf_clips_against_nonzero_page_bbox(tmp_path: Path) -> None:
+    inspection = inspect_pdf(make_nonzero_origin_image_pdf(tmp_path / "nonzero-origin.pdf"))
+
+    assert inspection.pages[0].image_coverage == 0.5
+    assert inspection.scan_candidate_pages == [1]

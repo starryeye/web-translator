@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pdfplumber
 from pypdf import PdfReader
-from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NumberObject
+from pypdf.generic import (
+    ArrayObject,
+    DictionaryObject,
+    IndirectObject,
+    NameObject,
+    NumberObject,
+)
 
 from web_translator.pdf_acquire import MAX_PDF_BYTES
 from web_translator.pdf_models import PdfPageEvidence
@@ -117,7 +123,7 @@ def _read_structure(source: Path) -> tuple[int, list[int]]:
 
 def _validated_page_tree_count(reader: PdfReader) -> int:
     catalog = _dictionary_node(reader.trailer.get("/Root"), "catalog")
-    if str(catalog.get("/Type")) != "/Catalog":
+    if not _has_name(catalog.get("/Type"), "/Catalog"):
         raise PdfExtractionError("PDF catalog has an unsupported type")
     pages = catalog.get("/Pages")
     if pages is None:
@@ -134,7 +140,9 @@ def _count_page_tree_leaves(
         raise PdfExtractionError("PDF page tree contains a cycle or repeated node")
     seen_nodes.add(identity)
 
-    node_type = str(node.get("/Type"))
+    node_type = node.get("/Type")
+    if not isinstance(node_type, NameObject):
+        raise PdfExtractionError("PDF page tree node has an unsupported type")
     if node_type == "/Page":
         if "/Kids" in node:
             raise PdfExtractionError("PDF page leaf must not contain /Kids")
@@ -157,6 +165,10 @@ def _count_page_tree_leaves(
             "page tree count disagrees with recursively validated leaf pages"
         )
     return leaf_count
+
+
+def _has_name(value: object, expected: str) -> bool:
+    return isinstance(value, NameObject) and value == expected
 
 
 def _dictionary_node(value: object, context: str) -> DictionaryObject:
@@ -217,6 +229,7 @@ def _read_page_evidence(
 def _inspect_page(number: int, page: object, rotation: int) -> PdfPageEvidence:
     width = _valid_dimension(getattr(page, "width"), number, "width")
     height = _valid_dimension(getattr(page, "height"), number, "height")
+    page_bbox = _valid_page_bbox(getattr(page, "bbox"), number)
     selectable = sum(
         1
         for char in getattr(page, "chars")
@@ -224,12 +237,14 @@ def _inspect_page(number: int, page: object, rotation: int) -> PdfPageEvidence:
     )
     largest_image_area = max(
         (
-            _image_area(image, width, height, number)
+            _image_area(image, page_bbox, number)
             for image in getattr(page, "images")
         ),
         default=0.0,
     )
-    coverage = largest_image_area / (width * height)
+    coverage = largest_image_area / (
+        (page_bbox[2] - page_bbox[0]) * (page_bbox[3] - page_bbox[1])
+    )
     if not math.isfinite(coverage):
         raise PdfExtractionError(f"page {number} has nonfinite image coverage")
     return PdfPageEvidence(
@@ -253,21 +268,40 @@ def _valid_dimension(value: object, number: int, name: str) -> float:
     return dimension
 
 
-def _image_area(image: object, page_width: float, page_height: float, number: int) -> float:
+def _valid_page_bbox(value: object, number: int) -> tuple[float, float, float, float]:
+    if not isinstance(value, tuple) or len(value) != 4:
+        raise PdfExtractionError(f"page {number} has invalid bounding box")
+    try:
+        x0, y0, x1, y1 = (float(coordinate) for coordinate in value)
+    except (TypeError, ValueError) as error:
+        raise PdfExtractionError(f"page {number} has invalid bounding box") from error
+    if not all(math.isfinite(coordinate) for coordinate in (x0, y0, x1, y1)):
+        raise PdfExtractionError(f"page {number} has invalid bounding box")
+    if x1 <= x0 or y1 <= y0:
+        raise PdfExtractionError(f"page {number} has invalid bounding box")
+    return x0, y0, x1, y1
+
+
+def _image_area(
+    image: object,
+    page_bbox: tuple[float, float, float, float],
+    number: int,
+) -> float:
     try:
         x0 = float(image["x0"])
         x1 = float(image["x1"])
-        top = float(image["top"])
-        bottom = float(image["bottom"])
+        y0 = float(image["y0"])
+        y1 = float(image["y1"])
     except (KeyError, TypeError, ValueError) as error:
         raise PdfExtractionError(f"page {number} has invalid image dimensions") from error
-    coordinates = (x0, x1, top, bottom)
+    coordinates = (x0, x1, y0, y1)
     if not all(math.isfinite(coordinate) for coordinate in coordinates):
         raise PdfExtractionError(f"page {number} has invalid image dimensions")
-    if x1 < x0 or bottom < top:
+    if x1 < x0 or y1 < y0:
         raise PdfExtractionError(f"page {number} has invalid image dimensions")
-    visible_width = max(0.0, min(page_width, x1) - max(0.0, x0))
-    visible_height = max(0.0, min(page_height, bottom) - max(0.0, top))
+    page_x0, page_y0, page_x1, page_y1 = page_bbox
+    visible_width = max(0.0, min(page_x1, x1) - max(page_x0, x0))
+    visible_height = max(0.0, min(page_y1, y1) - max(page_y0, y0))
     return visible_width * visible_height
 
 

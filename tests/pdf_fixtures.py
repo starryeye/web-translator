@@ -6,7 +6,13 @@ from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DecodedStreamObject, NameObject, NumberObject
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    NameObject,
+    NumberObject,
+    TextStringObject,
+)
 from reportlab.pdfgen.canvas import Canvas
 
 from web_translator.pdf_models import (
@@ -267,4 +273,40 @@ def make_image_text_pdf(
     canvas.drawImage(str(image_path), image_x, 0, width=image_width, height=792)
     canvas.drawString(72, 720, "x" * characters)
     canvas.save()
+    return path
+
+
+def make_string_catalog_type_pdf(path: Path) -> Path:
+    make_text_pdf(path)
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    writer._root_object[NameObject("/Type")] = TextStringObject("/Catalog")
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_string_pages_type_pdf(path: Path) -> Path:
+    make_text_pdf(path)
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    pages = writer._root_object["/Pages"].get_object()
+    pages[NameObject("/Type")] = TextStringObject("/Pages")
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_nonzero_origin_image_pdf(path: Path) -> Path:
+    make_image_text_pdf(path, characters=19, image_x=-100, image_width=306)
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    writer.pages[0][NameObject("/MediaBox")] = ArrayObject(
+        [NumberObject(-100), NumberObject(-200), NumberObject(512), NumberObject(592)]
+    )
+    with path.open("wb") as destination:
+        writer.write(destination)
     return path
