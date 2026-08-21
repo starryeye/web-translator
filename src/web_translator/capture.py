@@ -5,22 +5,27 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import ipaddress
 import posixpath
 import re
-import socket
-import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote_to_bytes, urldefrag, urljoin
 
 import httpx
-import httpcore
 import tinycss2
 from bs4 import BeautifulSoup
 from tinycss2.ast import AtRule, FunctionBlock, ParseError, StringToken, URLToken
 
 from web_translator.assets import atomic_write, local_asset_name, sha256_bytes
+from web_translator.network import (
+    NetworkBudget,
+    NetworkError,
+    _assert_transport_compatibility,
+    _read_limited,
+    _resolve_public_addresses as _network_resolve_public_addresses,
+    build_public_client,
+    fetch_limited,
+)
 from web_translator.paths import validate_public_url
 
 
@@ -34,7 +39,6 @@ MAX_TOTAL_REDIRECTS = 32
 MAX_TOTAL_DOWNLOADED_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_EMITTED_BYTES = 128 * 1024 * 1024
 MAX_CAPTURE_SECONDS = 120.0
-USER_AGENT = "web-translator/0.1 (+https://github.com/starryeye/web-translator)"
 
 
 class CaptureError(RuntimeError):
@@ -45,17 +49,26 @@ class _CaptureBudgetError(CaptureError):
     """A whole-run capture resource budget was exhausted."""
 
 
+def _capture_network_error(error: NetworkError) -> CaptureError:
+    message = str(error)
+    if message.startswith("capture resource budget exceeded:"):
+        return _CaptureBudgetError(message)
+    return CaptureError(message)
+
+
+def _resolve_public_addresses(host: str, port: int) -> list[str]:
+    """Capture compatibility seam around the shared DNS resolver."""
+    return _network_resolve_public_addresses(host, port)
+
+
 class _CaptureBudget:
-    def __init__(self) -> None:
-        self.deadline = time.monotonic() + MAX_CAPTURE_SECONDS
+    def __init__(self, network_budget: NetworkBudget) -> None:
+        self.network_budget = network_budget
         self.request_urls: set[str] = set()
-        self.redirects = 0
-        self.downloaded_bytes = 0
         self.emitted_bytes = 0
 
     def check_deadline(self) -> None:
-        if time.monotonic() > self.deadline:
-            raise _CaptureBudgetError("capture resource budget exceeded: deadline")
+        self.network_budget.check_deadline()
 
     def before_request(self, request: httpx.Request) -> None:
         self.check_deadline()
@@ -67,27 +80,6 @@ class _CaptureBudget:
                 )
             self.request_urls.add(url)
 
-    def after_response(self, response: httpx.Response) -> None:
-        self.check_deadline()
-        if response.has_redirect_location:
-            if self.redirects >= MAX_TOTAL_REDIRECTS:
-                raise _CaptureBudgetError(
-                    "capture resource budget exceeded: redirects"
-                )
-            self.redirects += 1
-            if response.is_stream_consumed:
-                self.add_downloaded(len(response.content))
-            else:
-                response.stream = _BudgetedResponseStream(response.stream, self)
-
-    def add_downloaded(self, size: int) -> None:
-        self.check_deadline()
-        if self.downloaded_bytes + size > MAX_TOTAL_DOWNLOADED_BYTES:
-            raise _CaptureBudgetError(
-                "capture resource budget exceeded: downloaded bytes"
-            )
-        self.downloaded_bytes += size
-
     def add_emitted(self, size: int) -> None:
         self.check_deadline()
         if self.emitted_bytes + size > MAX_TOTAL_EMITTED_BYTES:
@@ -95,27 +87,6 @@ class _CaptureBudget:
                 "capture resource budget exceeded: emitted bytes"
             )
         self.emitted_bytes += size
-
-    def request_timeout(self) -> float:
-        self.check_deadline()
-        remaining = self.deadline - time.monotonic()
-        return min(30.0, max(0.001, remaining))
-
-
-class _BudgetedResponseStream(httpx.SyncByteStream):
-    def __init__(
-        self, stream: httpx.SyncByteStream, budget: _CaptureBudget
-    ) -> None:
-        self.stream = stream
-        self.budget = budget
-
-    def __iter__(self):
-        for chunk in self.stream:
-            self.budget.add_downloaded(len(chunk))
-            yield chunk
-
-    def close(self) -> None:
-        self.stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,8 +107,6 @@ def capture_page(
     transport: httpx.BaseTransport | None = None,
 ) -> CaptureResult:
     """Capture one public HTML page and rewrite its static dependencies offline."""
-    if transport is not None and type(transport) is not httpx.MockTransport:
-        raise CaptureError("transport injection accepts only non-network httpx.MockTransport instances")
     try:
         requested = validate_public_url(url)
     except ValueError as error:
@@ -148,22 +117,24 @@ def capture_page(
     source_path = run_dir / "source.html"
     if source_path.exists():
         raise CaptureError(f"capture target already exists: {source_path}")
-    budget = _CaptureBudget()
-    hooks = {
-        "request": [_validate_network_boundary, budget.before_request],
-        "response": [budget.after_response],
-    }
-    selected_transport = transport if transport is not None else _PinnedHTTPTransport()
-    with httpx.Client(
-        follow_redirects=True,
+    network_budget = NetworkBudget(
+        max_bytes=MAX_TOTAL_DOWNLOADED_BYTES,
         max_redirects=MAX_REDIRECTS,
-        timeout=30.0,
-        transport=selected_transport,
-        trust_env=False,
-        headers={"user-agent": USER_AGENT, "accept-encoding": "identity"},
-        event_hooks=hooks,
-    ) as client:
-        capture = _Capture(client, run_dir, budget)
+        max_total_redirects=MAX_TOTAL_REDIRECTS,
+        deadline_seconds=MAX_CAPTURE_SECONDS,
+        error_prefix="capture resource budget exceeded",
+        resolve_public_addresses=lambda host, port: _resolve_public_addresses(
+            host, port
+        ),
+    )
+    budget = _CaptureBudget(network_budget)
+    try:
+        client = build_public_client(budget=network_budget, transport=transport)
+    except NetworkError as error:
+        raise CaptureError(str(error)) from error
+    client.event_hooks["request"].append(budget.before_request)
+    with client:
+        capture = _Capture(client, run_dir, budget, network_budget)
         response, html_bytes = capture.fetch(str(requested), MAX_HTML_BYTES, "HTML document")
         media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
         if media_type != "text/html":
@@ -199,11 +170,16 @@ def capture_page(
 
 class _Capture:
     def __init__(
-        self, client: httpx.Client, run_dir: Path, budget: _CaptureBudget
+        self,
+        client: httpx.Client,
+        run_dir: Path,
+        budget: _CaptureBudget,
+        network_budget: NetworkBudget,
     ) -> None:
         self.client = client
         self.run_dir = run_dir
         self.budget = budget
+        self.network_budget = network_budget
         self.asset_map: dict[str, str] = {}
         self.fingerprints: dict[str, str] = {}
         self.missing_optional_assets: set[str] = set()
@@ -214,11 +190,9 @@ class _Capture:
 
     def fetch(self, url: str, limit: int, label: str) -> tuple[httpx.Response, bytes]:
         try:
-            with self.client.stream(
-                "GET", url, timeout=self.budget.request_timeout()
-            ) as response:
-                response.raise_for_status()
-                return response, _read_limited(response, limit, label, self.budget)
+            return fetch_limited(self.client, url, limit, label)
+        except NetworkError as error:
+            raise _capture_network_error(error) from error
         except CaptureError:
             raise
         except (httpx.HTTPError, OSError) as error:
@@ -234,7 +208,7 @@ class _Capture:
                     "GET",
                     current,
                     follow_redirects=False,
-                    timeout=self.budget.request_timeout(),
+                    timeout=self.network_budget.request_timeout(),
                 ) as response:
                     if response.has_redirect_location:
                         if redirect_count == MAX_REDIRECTS:
@@ -256,9 +230,14 @@ class _Capture:
                         continue
                     response.raise_for_status()
                     content = _read_limited(
-                        response, MAX_ASSET_BYTES, f"asset {url}", self.budget
+                        response,
+                        MAX_ASSET_BYTES,
+                        f"asset {url}",
+                        self.network_budget,
                     )
                     return response, content, None
+        except NetworkError as error:
+            raise _capture_network_error(error) from error
         except CaptureError:
             raise
         except (httpx.HTTPError, OSError) as error:
@@ -570,121 +549,6 @@ class _Capture:
         path, separator, fragment = target.partition("#")
         relative = posixpath.relpath(path, start=str(PurePosixPath(css_local_path).parent))
         return relative + (separator + fragment if separator else "")
-
-
-def _validate_network_boundary(request: httpx.Request) -> None:
-    """Resolve and reject unsafe addresses immediately before transport handles a request."""
-    try:
-        url = validate_public_url(str(request.url))
-    except ValueError as error:
-        raise CaptureError(f"unsafe request URL: {request.url}") from error
-    host = url.host
-    assert host is not None
-    port = url.port or (443 if url.scheme == "https" else 80)
-    _resolve_public_addresses(host, port)
-
-
-def _resolve_public_addresses(host: str, port: int) -> list[str]:
-    try:
-        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as error:
-        raise CaptureError(f"DNS resolution failed for {host}: {error}") from error
-    if not answers:
-        raise CaptureError(f"DNS resolution returned no addresses for {host}")
-    public_addresses: list[str] = []
-    for answer in answers:
-        raw_address = str(answer[4][0]).partition("%")[0]
-        try:
-            address = ipaddress.ip_address(raw_address)
-        except ValueError as error:
-            raise CaptureError(f"DNS returned an invalid address for {host}") from error
-        if not address.is_global or address.is_multicast:
-            raise CaptureError(f"non-public DNS result for {host}: {address}")
-        normalized = str(address)
-        if normalized not in public_addresses:
-            public_addresses.append(normalized)
-    return public_addresses
-
-
-class _PinnedNetworkBackend(httpcore.SyncBackend):
-    """Resolve once per connection and connect only to the approved numeric IPs."""
-
-    def connect_tcp(
-        self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: object = None,
-    ) -> httpcore.NetworkStream:
-        addresses = _resolve_public_addresses(host, port)
-        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
-        for address in addresses:
-            try:
-                return super().connect_tcp(
-                    address,
-                    port,
-                    timeout=timeout,
-                    local_address=local_address,
-                    socket_options=socket_options,
-                )
-            except (httpcore.ConnectError, httpcore.ConnectTimeout) as error:
-                last_error = error
-        assert last_error is not None
-        raise last_error
-
-
-class _PinnedHTTPTransport(httpx.HTTPTransport):
-    """HTTP transport whose connection pool cannot re-resolve approved hosts."""
-
-    def __init__(self) -> None:
-        _assert_transport_compatibility(httpx.__version__, httpcore.__version__)
-        super().__init__(trust_env=False)
-        if not hasattr(self._pool, "_network_backend"):
-            raise RuntimeError("httpx/httpcore transport adapter is incompatible: missing network backend seam")
-        self._pool._network_backend = _PinnedNetworkBackend()
-
-
-def _assert_transport_compatibility(httpx_version: str, httpcore_version: str) -> None:
-    if not ((0, 28) <= _major_minor(httpx_version) < (0, 29)):
-        raise RuntimeError(f"unsupported httpx version for pinned transport: {httpx_version}")
-    if not ((1, 0) <= _major_minor(httpcore_version) < (1, 1)):
-        raise RuntimeError(f"unsupported httpcore version for pinned transport: {httpcore_version}")
-
-
-def _major_minor(version: str) -> tuple[int, int]:
-    try:
-        major, minor, *_ = version.split(".")
-        return int(major), int(minor)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError(f"invalid dependency version: {version}") from error
-
-
-def _read_limited(
-    response: httpx.Response,
-    limit: int,
-    label: str,
-    budget: _CaptureBudget,
-) -> bytes:
-    content_encoding = response.headers.get("content-encoding", "identity").strip().lower()
-    if content_encoding not in {"", "identity"}:
-        raise CaptureError(f"{label} returned unsupported Content-Encoding: {content_encoding}")
-    declared = response.headers.get("content-length")
-    if declared is not None:
-        try:
-            if int(declared) > limit:
-                raise CaptureError(f"{label} exceeds the {limit}-byte size limit")
-        except ValueError:
-            pass
-    chunks: list[bytes] = []
-    size = 0
-    for chunk in response.iter_bytes():
-        size += len(chunk)
-        if size > limit:
-            raise CaptureError(f"{label} exceeds the {limit}-byte size limit")
-        budget.add_downloaded(len(chunk))
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _decode_data_stylesheet(reference: str) -> bytes:
