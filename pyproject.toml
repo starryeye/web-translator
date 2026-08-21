@@ -15,12 +15,17 @@ dependencies = [
     "tinycss2",
     "langdetect",
     "playwright",
+    "pdfplumber>=0.11,<0.12",
+    "pypdf>=6,<7",
+    "reportlab>=4,<5",
+    "Pillow>=11,<13",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest",
     "pytest-httpx",
+    "fonttools>=4,<5",
 ]
 
 [project.scripts]

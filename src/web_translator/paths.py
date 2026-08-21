@@ -41,11 +41,26 @@ def validate_public_url(url: str) -> httpx.URL:
 def create_run_paths(workspace: Path, url: str, now: datetime) -> RunPaths:
     """Allocate a unique work directory and an unused output directory path."""
     parsed = validate_public_url(url)
-    workspace = Path(workspace)
     timestamp = _utc_timestamp(now)
     base_run_id = _run_id(parsed, timestamp)
+    return _allocate_run_paths(Path(workspace), base_run_id, Path("translated-pages"))
+
+
+def create_pdf_run_paths(workspace: Path, source_label: str, now: datetime) -> RunPaths:
+    """Allocate one private run directory and a reserved PDF output path."""
+    source_name = Path(source_label).name
+    stem = Path(source_name).stem or "document"
+    base_run_id = "-".join(
+        part for part in (_slugify(stem), _utc_timestamp(now)) if part
+    )
+    return _allocate_run_paths(
+        Path(workspace), base_run_id, Path("translated-pdfs")
+    )
+
+
+def _allocate_run_paths(workspace: Path, base_run_id: str, output_root: Path) -> RunPaths:
     runs_dir = workspace / ".web-translator" / "runs"
-    outputs_dir = workspace / "translated-pages"
+    outputs_dir = workspace / output_root
 
     suffix = 1
     while True:
