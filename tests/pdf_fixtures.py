@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, NumberObject
+from pypdf.generic import DecodedStreamObject, NameObject, NumberObject
 from reportlab.pdfgen.canvas import Canvas
 
 from web_translator.pdf_models import (
@@ -199,7 +199,72 @@ def make_oversized_dimension_pdf(path: Path) -> Path:
 
 
 def make_oversized_pdf(path: Path) -> Path:
+    return make_pdf_at_size(path, 50 * 1024 * 1024 + 1)
+
+
+def make_pdf_at_size(path: Path, byte_length: int) -> Path:
+    """Create a valid PDF with an exact size and an immediately reachable EOF marker."""
+    clear_path = path.with_name(f"{path.stem}-clear.pdf")
+    make_text_pdf(clear_path)
+    padding = 0
+    for _ in range(4):
+        reader = PdfReader(clear_path)
+        writer = PdfWriter()
+        writer.append(reader)
+        unused_stream = DecodedStreamObject()
+        unused_stream.set_data(b" " * padding)
+        writer._add_object(unused_stream)
+        with path.open("wb") as destination:
+            writer.write(destination)
+        difference = byte_length - path.stat().st_size
+        if difference == 0:
+            return path
+        padding += difference
+        if padding < 0:
+            raise ValueError("requested PDF size is smaller than the fixture")
+    raise AssertionError("could not create exact-size PDF fixture")
+
+
+def make_truncated_eof_pdf(path: Path) -> Path:
     make_text_pdf(path)
-    with path.open("ab") as destination:
-        destination.truncate(50 * 1024 * 1024 + 1)
+    data = path.read_bytes().rstrip()
+    if not data.endswith(b"%%EOF"):
+        raise ValueError("fixture PDF does not end with %%EOF")
+    path.write_bytes(data[:-1])
+    return path
+
+
+def make_inconsistent_page_tree_pdf(path: Path) -> Path:
+    make_text_pdf(path)
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    pages = writer._root_object["/Pages"].get_object()
+    pages[NameObject("/Count")] = NumberObject(2)
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def make_dimension_pdf(path: Path, *, width: float, height: float) -> Path:
+    canvas = Canvas(str(path), pagesize=(width, height))
+    canvas.drawString(0, max(0, height - 12), "x" * 100)
+    canvas.save()
+    return path
+
+
+def make_image_text_pdf(
+    path: Path,
+    *,
+    characters: int,
+    image_x: float = 0,
+    image_width: float = 612,
+) -> Path:
+    """Create a page with a precise text count and an image rectangle."""
+    image_path = path.with_suffix(".png")
+    Image.new("RGB", (612, 792), "white").save(image_path)
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.drawImage(str(image_path), image_x, 0, width=image_width, height=792)
+    canvas.drawString(72, 720, "x" * characters)
+    canvas.save()
     return path

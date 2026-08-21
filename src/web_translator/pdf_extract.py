@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pdfplumber
 from pypdf import PdfReader
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NumberObject
 
 from web_translator.pdf_acquire import MAX_PDF_BYTES
 from web_translator.pdf_models import PdfPageEvidence
@@ -37,6 +38,7 @@ def inspect_pdf(source_pdf: Path) -> PdfInspection:
     """Inspect *source_pdf* without attempting logical document extraction."""
     source = Path(source_pdf)
     _reject_oversized_source(source)
+    _require_final_eof(source)
     page_count, rotations = _read_structure(source)
     if page_count == 0:
         raise PdfExtractionError("PDF has zero pages")
@@ -87,18 +89,98 @@ def _reject_oversized_source(source: Path) -> None:
         )
 
 
+def _require_final_eof(source: Path) -> None:
+    try:
+        final_content = source.read_bytes().rstrip(b" \t\r\n\f\x00")
+    except OSError as error:
+        raise PdfExtractionError(f"cannot inspect PDF source: {error}") from error
+    if not final_content.endswith(b"%%EOF"):
+        raise PdfExtractionError("PDF does not end with a final %%EOF marker")
+
+
 def _read_structure(source: Path) -> tuple[int, list[int]]:
     try:
         with source.open("rb") as stream:
             reader = PdfReader(stream, strict=True)
             if reader.is_encrypted:
                 raise PdfExtractionError("encrypted PDF inputs are unsupported")
+            tree_page_count = _validated_page_tree_count(reader)
             pages = list(reader.pages)
+            if len(pages) != tree_page_count:
+                raise PdfExtractionError("page tree count disagrees with flattened pages")
             return len(pages), [_normalized_rotation(page.get("/Rotate", 0)) for page in pages]
     except PdfExtractionError:
         raise
     except Exception as error:
         raise PdfExtractionError(f"cannot inspect PDF structure: {error}") from error
+
+
+def _validated_page_tree_count(reader: PdfReader) -> int:
+    catalog = _dictionary_node(reader.trailer.get("/Root"), "catalog")
+    if str(catalog.get("/Type")) != "/Catalog":
+        raise PdfExtractionError("PDF catalog has an unsupported type")
+    pages = catalog.get("/Pages")
+    if pages is None:
+        raise PdfExtractionError("PDF catalog has no page tree")
+    return _count_page_tree_leaves(pages, set())
+
+
+def _count_page_tree_leaves(
+    value: object,
+    seen_nodes: set[tuple[str, int, int] | tuple[str, int]],
+) -> int:
+    node, identity = _dictionary_node_with_identity(value, "page tree")
+    if identity in seen_nodes:
+        raise PdfExtractionError("PDF page tree contains a cycle or repeated node")
+    seen_nodes.add(identity)
+
+    node_type = str(node.get("/Type"))
+    if node_type == "/Page":
+        if "/Kids" in node:
+            raise PdfExtractionError("PDF page leaf must not contain /Kids")
+        return 1
+    if node_type != "/Pages":
+        raise PdfExtractionError("PDF page tree node has an unsupported type")
+
+    children = node.get("/Kids")
+    if not isinstance(children, ArrayObject):
+        raise PdfExtractionError("PDF /Pages node has invalid /Kids")
+    declared_count = node.get("/Count")
+    if isinstance(declared_count, bool) or not isinstance(declared_count, NumberObject):
+        raise PdfExtractionError("PDF /Pages node has invalid /Count")
+    if int(declared_count) < 0:
+        raise PdfExtractionError("PDF /Pages node has invalid /Count")
+
+    leaf_count = sum(_count_page_tree_leaves(child, seen_nodes) for child in children)
+    if int(declared_count) != leaf_count:
+        raise PdfExtractionError(
+            "page tree count disagrees with recursively validated leaf pages"
+        )
+    return leaf_count
+
+
+def _dictionary_node(value: object, context: str) -> DictionaryObject:
+    node, _ = _dictionary_node_with_identity(value, context)
+    return node
+
+
+def _dictionary_node_with_identity(
+    value: object,
+    context: str,
+) -> tuple[DictionaryObject, tuple[str, int, int] | tuple[str, int]]:
+    if isinstance(value, IndirectObject):
+        identity: tuple[str, int, int] | tuple[str, int] = (
+            "indirect", value.idnum, value.generation
+        )
+        try:
+            value = value.get_object()
+        except Exception as error:
+            raise PdfExtractionError(f"cannot resolve {context} node") from error
+    else:
+        identity = ("direct", id(value))
+    if not isinstance(value, DictionaryObject):
+        raise PdfExtractionError(f"{context} node must be a dictionary")
+    return value, identity
 
 
 def _normalized_rotation(value: object) -> int:
@@ -142,7 +224,7 @@ def _inspect_page(number: int, page: object, rotation: int) -> PdfPageEvidence:
     )
     largest_image_area = max(
         (
-            _image_area(image, number)
+            _image_area(image, width, height, number)
             for image in getattr(page, "images")
         ),
         default=0.0,
@@ -171,16 +253,22 @@ def _valid_dimension(value: object, number: int, name: str) -> float:
     return dimension
 
 
-def _image_area(image: object, number: int) -> float:
+def _image_area(image: object, page_width: float, page_height: float, number: int) -> float:
     try:
-        width = float(image["width"])
-        height = float(image["height"])
+        x0 = float(image["x0"])
+        x1 = float(image["x1"])
+        top = float(image["top"])
+        bottom = float(image["bottom"])
     except (KeyError, TypeError, ValueError) as error:
         raise PdfExtractionError(f"page {number} has invalid image dimensions") from error
-    area = width * height
-    if not math.isfinite(area) or area < 0:
+    coordinates = (x0, x1, top, bottom)
+    if not all(math.isfinite(coordinate) for coordinate in coordinates):
         raise PdfExtractionError(f"page {number} has invalid image dimensions")
-    return area
+    if x1 < x0 or bottom < top:
+        raise PdfExtractionError(f"page {number} has invalid image dimensions")
+    visible_width = max(0.0, min(page_width, x1) - max(0.0, x0))
+    visible_height = max(0.0, min(page_height, bottom) - max(0.0, top))
+    return visible_width * visible_height
 
 
 def _format_evidence(pages: list[PdfPageEvidence]) -> str:
