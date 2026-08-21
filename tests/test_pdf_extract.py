@@ -255,6 +255,28 @@ def test_order_page_lines_places_spanning_headings_before_column_regions() -> No
     ]
 
 
+def test_order_page_lines_sections_columns_around_a_spanning_rich_region() -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("L1", x0=10, x1=90, top=10, bottom=20),
+            _word("R1", x0=110, x1=190, top=10, bottom=20),
+            _word("L2", x0=10, x1=90, top=60, bottom=70),
+            _word("R2", x0=110, x1=190, top=60, bottom=70),
+        ]
+    )
+
+    assert [
+        line.text
+        for line in order_page_lines(
+            lines,
+            200,
+            spanning_bboxes=[(0.0, 30.0, 200.0, 50.0)],
+        )
+    ] == ["L1", "R1", "L2", "R2"]
+
+
 def test_order_page_lines_rejects_crossing_non_heading_evidence() -> None:
     from web_translator.pdf_layout import group_words_into_lines, order_page_lines
 
@@ -1039,6 +1061,21 @@ def _text_aligned_table_pdf(path: Path) -> Path:
     return path
 
 
+def _sparse_text_aligned_table_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    rows = [
+        ("Name", "Value", "Unit"),
+        ("Alpha", "10", "kg"),
+        ("Beta", "", "m"),
+    ]
+    for row, y in zip(rows, (300, 280, 260), strict=True):
+        for value, x in zip(row, (50, 180, 280), strict=True):
+            if value:
+                canvas.drawString(x, y, value)
+    canvas.save()
+    return path
+
+
 def _mixed_table_pdf(path: Path) -> Path:
     canvas = Canvas(str(path), pagesize=(500, 500))
     for x in (300, 375, 450):
@@ -1057,6 +1094,24 @@ def _mixed_table_pdf(path: Path) -> Path:
     canvas.drawString(160, 240, "10")
     canvas.drawString(50, 220, "Beta")
     canvas.drawString(160, 220, "20")
+    canvas.save()
+    return path
+
+
+def _column_rich_order_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(30, 340, "Left above the spanning table region")
+    canvas.drawString(245, 340, "Right above the table")
+    canvas.rect(30, 170, 340, 60, stroke=1, fill=0)
+    canvas.line(200, 170, 200, 230)
+    canvas.line(30, 200, 370, 200)
+    canvas.drawString(40, 210, "A1")
+    canvas.drawString(210, 210, "B1")
+    canvas.drawString(40, 180, "A2")
+    canvas.drawString(210, 180, "B2")
+    canvas.drawString(30, 100, "Left below the spanning table region")
+    canvas.drawString(245, 100, "Right below the table")
     canvas.save()
     return path
 
@@ -1111,7 +1166,7 @@ def _rich_layout_pdf(path: Path) -> Path:
     canvas.drawString(72, 40, "1 Footnote evidence remains linked to its marker.")
 
     canvas.showPage()
-    canvas.bookmarkPage("internal-target")
+    canvas.bookmarkPage("internal-target", fit="XYZ", left=100, top=725, zoom=0)
     canvas.setFont("Helvetica-Bold", 16)
     canvas.drawString(72, 720, "Internal Destination")
     canvas.setFont("Helvetica", 11)
@@ -1160,6 +1215,35 @@ def _ambiguous_link_pdf(path: Path) -> Path:
     return path
 
 
+def _orphan_visible_link_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    canvas.drawString(50, 300, "Visible orphan link")
+    canvas.linkURL("https://example.com/orphan", (50, 298, 150, 312), relative=0)
+    canvas.save()
+    return path
+
+
+def _nonzero_origin_link_pdf(path: Path) -> Path:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, NameObject, NumberObject
+
+    canvas = Canvas(str(path), pagesize=(200, 100))
+    canvas.drawString(0, 50, "Target link")
+    canvas.linkURL("https://example.com/nonzero", (0, 48, 60, 62), relative=0)
+    canvas.save()
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    bounds = ArrayObject(
+        [NumberObject(-50), NumberObject(-25), NumberObject(150), NumberObject(75)]
+    )
+    writer.pages[0][NameObject("/MediaBox")] = bounds
+    writer.pages[0][NameObject("/CropBox")] = ArrayObject(bounds)
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
 def test_detect_tables_preserves_merged_spans_and_empty_structural_cells(
     tmp_path: Path,
 ) -> None:
@@ -1200,6 +1284,29 @@ def test_detect_tables_falls_back_to_aligned_text_without_synthetic_blank_rows(
     assert [cell.is_header for cell in result.cells] == [True, True, False, False, False, False]
 
 
+def test_detect_tables_preserves_sparse_aligned_text_cells(tmp_path: Path) -> None:
+    from web_translator.pdf_layout import detect_tables
+
+    with pdfplumber.open(
+        _sparse_text_aligned_table_pdf(tmp_path / "sparse-aligned.pdf")
+    ) as document:
+        result = detect_tables(document.pages[0], page_number=1)
+
+    assert [
+        (block.row, block.column, block.source_text) for block in result.blocks
+    ] == [
+        (0, 0, "Name"),
+        (0, 1, "Value"),
+        (0, 2, "Unit"),
+        (1, 0, "Alpha"),
+        (1, 1, "10"),
+        (1, 2, "kg"),
+        (2, 0, "Beta"),
+        (2, 1, ""),
+        (2, 2, "m"),
+    ]
+
+
 def test_detect_tables_keeps_nonoverlapping_text_table_after_ruled_table(
     tmp_path: Path,
 ) -> None:
@@ -1212,6 +1319,28 @@ def test_detect_tables_keeps_nonoverlapping_text_table_after_ruled_table(
         ["pdf:page-0001:table-0001"] * 4
         + ["pdf:page-0001:table-0002"] * 6
     )
+
+
+def test_extract_pdf_orders_both_columns_around_a_full_width_table(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    document = extract_pdf(
+        _column_rich_order_pdf(tmp_path / "column-rich-order.pdf"),
+        tmp_path / "column-rich-document.json",
+        tmp_path / "column-rich-segments.jsonl",
+        tmp_path / "column-rich-media",
+    )
+    positions = {
+        label: next(
+            block.order for block in document.blocks if label in block.source_text
+        )
+        for label in ("Left above", "Right above", "A1", "Left below", "Right below")
+    }
+
+    assert positions["Left above"] < positions["Right above"] < positions["A1"]
+    assert positions["A1"] < positions["Left below"] < positions["Right below"]
 
 
 def test_detect_tables_rejects_character_crossing_an_internal_border(
@@ -1301,6 +1430,173 @@ def test_extract_pdf_rejects_ambiguous_figure_caption_pairing(
         )
 
 
+def test_detect_footnotes_rejects_two_bodies_claiming_one_marker() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 50.0, 4.0)
+    small = PdfBlockStyle(7.0, False, "left", 50.0, 2.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(50.0, 100.0, 220.0, 112.0),
+        style=normal,
+        source_text="One marker has one footnote body",
+    )
+    context = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="paragraph",
+        bbox=(50.0, 140.0, 220.0, 152.0),
+        style=normal,
+        source_text="Additional body-sized context",
+    )
+    bodies = [
+        PdfBlock(
+            id=f"pdf:page-0001:block-{index:04d}",
+            page_number=1,
+            order=index - 1,
+            kind="paragraph",
+            bbox=(50.0, top, 250.0, top + 9.0),
+            style=small,
+            source_text=text,
+        )
+        for index, top, text in (
+            (3, 650.0, "1 First footnote body"),
+            (4, 670.0, "1 Duplicate footnote body"),
+        )
+    ]
+    marker = {
+        "text": "1",
+        "x0": 205.0,
+        "x1": 209.0,
+        "top": 100.0,
+        "bottom": 106.0,
+        "size": 7.0,
+    }
+
+    with pytest.raises(PdfExtractionError, match="ambiguous footnote"):
+        detect_footnotes([owner, context, *bodies], [marker], page_height=792.0)
+
+
+@pytest.mark.parametrize(
+    "destination_kind",
+    ["FitH", "FitV", "FitR", "Destination"],
+)
+def test_internal_destination_uses_available_coordinates(
+    tmp_path: Path,
+    destination_kind: str,
+) -> None:
+    from pypdf import PdfReader
+    from pypdf.generic import (
+        ArrayObject,
+        Destination,
+        Fit,
+        FloatObject,
+        NameObject,
+    )
+
+    from web_translator.pdf_layout import _map_internal_destination
+
+    reader = PdfReader(
+        make_dimension_pdf(
+            tmp_path / f"destination-{destination_kind}.pdf",
+            width=400,
+            height=400,
+        )
+    )
+    page_reference = reader.pages[0].indirect_reference
+    if destination_kind == "FitH":
+        destination = ArrayObject(
+            [page_reference, NameObject("/FitH"), FloatObject(300)]
+        )
+    elif destination_kind == "FitV":
+        destination = ArrayObject(
+            [page_reference, NameObject("/FitV"), FloatObject(250)]
+        )
+    elif destination_kind == "FitR":
+        destination = ArrayObject(
+            [
+                page_reference,
+                NameObject("/FitR"),
+                FloatObject(200),
+                FloatObject(280),
+                FloatObject(300),
+                FloatObject(320),
+            ]
+        )
+    else:
+        destination = Destination(
+            "coordinate-target",
+            page_reference,
+            Fit.xyz(left=250, top=300),
+        )
+    style = PdfBlockStyle(10.0, False, "left", 20.0, 2.0)
+    decoy = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(20.0, 250.0, 120.0, 280.0),
+        style=style,
+        source_text="Earlier logical block",
+    )
+    target = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="heading",
+        bbox=(200.0, 80.0, 300.0, 120.0),
+        style=style,
+        source_text="Coordinate destination",
+    )
+
+    assert _map_internal_destination(
+        reader,
+        destination,
+        {1: [decoy, target]},
+    ) == target
+
+
+def test_link_coordinates_match_emitted_blocks_with_nonzero_page_origin(
+    tmp_path: Path,
+) -> None:
+    from pypdf import PdfReader
+    from pypdf.generic import ArrayObject, FloatObject, NameObject
+
+    from web_translator.pdf_layout import (
+        _map_internal_destination,
+        extract_link_evidence,
+    )
+
+    source = _nonzero_origin_link_pdf(tmp_path / "nonzero-link.pdf")
+    target = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 40.0, 60.0, 53.0),
+        style=PdfBlockStyle(12.0, False, "left", 0.0, 0.0),
+        source_text="Target link",
+    )
+    evidence = extract_link_evidence(source, [target])
+    reader = PdfReader(source)
+    destination = ArrayObject(
+        [
+            reader.pages[0].indirect_reference,
+            NameObject("/XYZ"),
+            FloatObject(0),
+            FloatObject(60),
+            FloatObject(0),
+        ]
+    )
+
+    assert evidence.blocks[0].uri == "https://example.com/nonzero"
+    assert _map_internal_destination(reader, destination, {1: [target]}) == target
+
+
 def test_extract_link_evidence_warns_and_fails_closed_for_ambiguous_source(
     tmp_path: Path,
 ) -> None:
@@ -1331,3 +1627,15 @@ def test_extract_link_evidence_warns_and_fails_closed_for_ambiguous_source(
     assert evidence.warnings == (
         "page 1 link 1: unresolved visible link source",
     )
+
+
+def test_extract_link_evidence_rejects_visible_text_without_an_emitted_owner(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    with pytest.raises(PdfExtractionError, match="visible link text has no emitted owner"):
+        extract_link_evidence(
+            _orphan_visible_link_pdf(tmp_path / "orphan-visible-link.pdf"),
+            [],
+        )

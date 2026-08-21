@@ -152,7 +152,14 @@ def extract_pdf(
     for evidence, lines, material in zip(
         inspection.pages, classified_pages, materials, strict=True
     ):
-        ordered = order_page_lines(lines, evidence.width)
+        ordered = order_page_lines(
+            lines,
+            evidence.width,
+            spanning_bboxes=[
+                *_table_region_bboxes(material.table_blocks),
+                *(region.bbox for region in material.figure_regions),
+            ],
+        )
         assigned_by_page.append(
             sum(line.character_count for line in ordered)
             + material.table_character_count
@@ -382,6 +389,17 @@ def _insert_rich_blocks(
         )
         result[insertion:insertion] = group
     return result
+
+
+def _table_region_bboxes(
+    table_blocks: Sequence[PdfBlock],
+) -> list[tuple[float, float, float, float]]:
+    by_table: dict[str, list[PdfBlock]] = {}
+    for block in table_blocks:
+        if block.table_id is None:
+            raise PdfExtractionError(f"table cell {block.id} has no table ID")
+        by_table.setdefault(block.table_id, []).append(block)
+    return [_union_block_bbox(cells) for cells in by_table.values()]
 
 
 def _union_block_bbox(

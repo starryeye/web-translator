@@ -154,23 +154,49 @@ def detect_figure_regions(
     """Group raster objects and connected vector objects into graphical regions."""
     page_width = _positive_number(getattr(page, "width", None), "page width")
     page_height = _positive_number(getattr(page, "height", None), "page height")
+    page_x0, page_top = _page_origin(page)
     raster = [
         bbox
         for item in getattr(page, "images", ())
-        if (bbox := _object_bbox(item)) is not None
+        if (
+            bbox := _object_bbox(
+                item,
+                page_x0=page_x0,
+                page_top=page_top,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+        is not None
         and not _excluded(bbox, excluded_bboxes)
     ]
     vector = [
         bbox
         for collection in ("lines", "rects", "curves")
         for item in getattr(page, collection, ())
-        if (bbox := _object_bbox(item)) is not None
+        if (
+            bbox := _object_bbox(
+                item,
+                page_x0=page_x0,
+                page_top=page_top,
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+        is not None
         and not _excluded(bbox, excluded_bboxes)
     ]
     vector_groups = [
         group
         for group in _connected_groups(vector)
-        if len(group) >= 2 and _usable_vector_bbox(_union_bbox(group))
+        if (
+            len(group) >= 2 and _usable_vector_bbox(_union_bbox(group))
+        )
+        or any(
+            _bbox_distance(vector_bbox, raster_bbox) <= _GRAPHIC_JOIN_TOLERANCE
+            for vector_bbox in group
+            for raster_bbox in raster
+        )
     ]
     candidates = [*raster, *(_union_bbox(group) for group in vector_groups)]
     merged = [_union_bbox(group) for group in _connected_groups(candidates)]
@@ -256,7 +282,14 @@ def _crop_rendered_region(
         raise PdfMediaError(f"cannot crop figure region {index}: {error}") from error
 
 
-def _object_bbox(item: object) -> tuple[float, float, float, float] | None:
+def _object_bbox(
+    item: object,
+    *,
+    page_x0: float,
+    page_top: float,
+    page_width: float,
+    page_height: float,
+) -> tuple[float, float, float, float] | None:
     if not isinstance(item, Mapping):
         return None
     try:
@@ -266,10 +299,33 @@ def _object_bbox(item: object) -> tuple[float, float, float, float] | None:
         bottom = float(item["bottom"])
     except (KeyError, TypeError, ValueError):
         return None
-    bbox = (min(x0, x1), min(top, bottom), max(x0, x1), max(top, bottom))
+    bbox = (
+        max(0.0, min(page_width, min(x0, x1) - page_x0)),
+        max(0.0, min(page_height, min(top, bottom) - page_top)),
+        max(0.0, min(page_width, max(x0, x1) - page_x0)),
+        max(0.0, min(page_height, max(top, bottom) - page_top)),
+    )
     if not all(math.isfinite(value) for value in bbox):
         return None
     return bbox
+
+
+def _page_origin(page: object) -> tuple[float, float]:
+    bbox = getattr(page, "bbox", None)
+    if (
+        not isinstance(bbox, Sequence)
+        or isinstance(bbox, (str, bytes))
+        or len(bbox) != 4
+    ):
+        return (0.0, 0.0)
+    try:
+        x0 = float(bbox[0])
+        top = float(bbox[1])
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+    if not math.isfinite(x0) or not math.isfinite(top):
+        return (0.0, 0.0)
+    return (x0, top)
 
 
 def _connected_groups(

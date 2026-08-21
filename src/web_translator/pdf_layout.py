@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import re
 
+import pdfplumber
 from pypdf import PdfReader
 
 from web_translator.pdf_models import (
@@ -305,7 +306,12 @@ def find_clear_gutter(
     return evidence[0]
 
 
-def order_page_lines(lines: Sequence[PdfLine], page_width: float) -> list[PdfLine]:
+def order_page_lines(
+    lines: Sequence[PdfLine],
+    page_width: float,
+    *,
+    spanning_bboxes: Sequence[tuple[float, float, float, float]] = (),
+) -> list[PdfLine]:
     """Order a single page top-to-bottom or by an unambiguous two-column gutter."""
     gutter = find_clear_gutter(lines, page_width, minimum_width=_MINIMUM_GUTTER)
     if gutter is None:
@@ -316,29 +322,51 @@ def order_page_lines(lines: Sequence[PdfLine], page_width: float) -> list[PdfLin
     if conflicting:
         evidence = ", ".join(repr(line.text) for line in conflicting[:3])
         raise PdfExtractionError(f"conflicting column evidence: {evidence}")
-    return order_column_regions(lines, gutter)
+    return order_column_regions(lines, gutter, spanning_bboxes=spanning_bboxes)
 
 
 def order_column_regions(
-    lines: Sequence[PdfLine], gutter: tuple[float, float]
+    lines: Sequence[PdfLine],
+    gutter: tuple[float, float],
+    *,
+    spanning_bboxes: Sequence[tuple[float, float, float, float]] = (),
 ) -> list[PdfLine]:
-    """Order each region between spanning headings left-column then right-column."""
+    """Order each region between spanning content left-column then right-column."""
     spanning = sorted(
         (line for line in lines if line.crosses(gutter) and line.is_heading),
         key=lambda item: (item.top, item.x0, item.text),
     )
     ordinary = [line for line in lines if line not in spanning]
+    events: list[tuple[float, float, PdfLine | None]] = [
+        (line.top, line.bottom, line) for line in spanning
+    ]
+    events.extend(
+        (bbox[1], bbox[3], None)
+        for bbox in spanning_bboxes
+        if bbox[0] < gutter[0]
+        and bbox[2] > gutter[1]
+        and bbox[3] > bbox[1]
+        and all(math.isfinite(value) for value in bbox)
+    )
     result: list[PdfLine] = []
     previous_bottom = -math.inf
-    for heading in spanning:
+    for top, bottom, heading in sorted(
+        events,
+        key=lambda item: (
+            item[0],
+            0 if item[2] is not None else 1,
+            item[2].x0 if item[2] is not None else 0.0,
+        ),
+    ):
         region = [
             line
             for line in ordinary
-            if line.top >= previous_bottom and line.top < heading.top
+            if line.top >= previous_bottom and line.top < top
         ]
         result.extend(_order_two_columns(region, gutter))
-        result.append(heading)
-        previous_bottom = heading.bottom
+        if heading is not None:
+            result.append(heading)
+        previous_bottom = max(previous_bottom, bottom)
     result.extend(
         _order_two_columns(
             [line for line in ordinary if line.top >= previous_bottom], gutter
@@ -774,6 +802,7 @@ def detect_footnotes(
 
     replacements: dict[str, PdfBlock] = {}
     removed: set[str] = set()
+    claimed_owners: dict[str, str] = {}
     for body, marker in bodies:
         owners = [
             block
@@ -836,12 +865,21 @@ def detect_footnotes(
         if not owners:
             continue
         owner = owners[0]
-        if owner.destination is not None and owner.destination != body.id:
+        if owner.id in claimed_owners and claimed_owners[owner.id] != body.id:
+            raise PdfExtractionError(
+                f"ambiguous footnote owner {owner.id} on page {body.page_number}"
+            )
+        current_owner = replacements.get(owner.id, owner)
+        if (
+            current_owner.destination is not None
+            and current_owner.destination != body.id
+        ):
             raise PdfExtractionError(
                 f"ambiguous footnote destination for block {owner.id}"
             )
+        claimed_owners[owner.id] = body.id
         replacements[body.id] = replace(body, kind="footnote")
-        replacements[owner.id] = replace(owner, destination=body.id)
+        replacements[owner.id] = replace(current_owner, destination=body.id)
     return [
         replacements.get(block.id, block)
         for block in blocks
@@ -899,8 +937,20 @@ def extract_link_evidence(
     """Attach clear URI/internal annotations and return unresolved warnings."""
     try:
         reader = PdfReader(Path(source_pdf), strict=True)
+        with pdfplumber.open(Path(source_pdf)) as layout_document:
+            visible_characters = [
+                tuple(
+                    character
+                    for character in page.chars
+                    if isinstance(character, Mapping)
+                    and str(character.get("text", "")).strip()
+                )
+                for page in layout_document.pages
+            ]
     except Exception as error:
         raise PdfExtractionError(f"cannot inspect PDF link annotations: {error}") from error
+    if len(visible_characters) != len(reader.pages):
+        raise PdfExtractionError("PDF readers disagree on link-evidence page count")
     replacements = {block.id: block for block in blocks}
     warnings: list[str] = []
     by_page: dict[int, list[PdfBlock]] = defaultdict(list)
@@ -928,6 +978,15 @@ def extract_link_evidence(
                     f"page {page_number} link {annotation_index}: malformed annotation"
                 )
                 continue
+            if not owners and any(
+                (character_bbox := _character_bbox(character)) is not None
+                and _bbox_intersection(character_bbox, source_bbox) > 0
+                for character in visible_characters[page_index]
+            ):
+                raise PdfExtractionError(
+                    f"page {page_number} link {annotation_index}: "
+                    "visible link text has no emitted owner"
+                )
             if len(owners) != 1:
                 warnings.append(
                     f"page {page_number} link {annotation_index}: "
@@ -979,15 +1038,36 @@ def _usable_table(table: object, strategy: str) -> bool:
         for row in extracted
         if any(isinstance(value, str) and value.strip() for value in row)
     ]
-    if strategy == "text" and (
-        len(occupied) < 2
-        or any(
-            len(row) != columns
-            or any(not isinstance(value, str) or not value.strip() for value in row)
+    if strategy == "text":
+        if len(occupied) < 2 or any(len(row) != columns for row in occupied):
+            return False
+        present = [
+            [isinstance(value, str) and bool(value.strip()) for value in row]
             for row in occupied
-        )
-    ):
-        return False
+        ]
+        if any(sum(row) < 2 for row in present):
+            return False
+        if any(sum(row[column] for row in present) < 2 for column in range(columns)):
+            return False
+        occupied_indexes = [
+            index
+            for index, row in enumerate(extracted)
+            if any(isinstance(value, str) and value.strip() for value in row)
+        ]
+        cells = [
+            tuple(float(value) for value in cell)
+            for index in occupied_indexes
+            for cell in rows[index].cells
+            if cell is not None
+        ]
+        table_bbox = tuple(float(value) for value in table.bbox)
+        for character in getattr(table.page, "chars", ()):
+            if not str(character.get("text", "")).strip() or not (
+                _character_center_inside_bbox(character, table_bbox)
+            ):
+                continue
+            if sum(_character_fully_inside_bbox(character, cell) for cell in cells) != 1:
+                return False
     return True
 
 
@@ -1324,41 +1404,111 @@ def _map_internal_destination(
             page_index = reader.get_destination_page_number(destination)  # type: ignore[arg-type]
         except Exception:
             return None
-        candidates = sorted(by_page.get(page_index + 1, ()), key=lambda block: block.order)
-        return candidates[0] if candidates else None
-    if (
-        not isinstance(destination, Sequence)
-        or isinstance(destination, (str, bytes))
-        or not destination
-    ):
-        return None
-    try:
-        page_object = destination[0]
-        if hasattr(page_object, "get_object"):
-            page_object = page_object.get_object()
-        page_index = reader.get_page_number(page_object)
-    except Exception:
-        return None
+        mode = str(getattr(destination, "typ", ""))
+        values = {
+            "/Left": getattr(destination, "left", None),
+            "/Bottom": getattr(destination, "bottom", None),
+            "/Right": getattr(destination, "right", None),
+            "/Top": getattr(destination, "top", None),
+        }
+    else:
+        if (
+            not isinstance(destination, Sequence)
+            or isinstance(destination, (str, bytes))
+            or not destination
+        ):
+            return None
+        try:
+            page_object = destination[0]
+            if hasattr(page_object, "get_object"):
+                page_object = page_object.get_object()
+            page_index = reader.get_page_number(page_object)
+        except Exception:
+            return None
+        mode = str(destination[1]) if len(destination) > 1 else "/Fit"
+        arguments = list(destination[2:])
+        values = _destination_array_values(mode, arguments)
     candidates = sorted(by_page.get(page_index + 1, ()), key=lambda block: block.order)
     if not candidates:
         return None
-    mode = str(destination[1]) if len(destination) > 1 else "/Fit"
-    if mode != "/XYZ" or len(destination) < 4:
-        return candidates[0]
     try:
-        x = float(destination[2])
-        source_top = float(destination[3])
-        page_height = float(reader.pages[page_index].mediabox.height)
-        y = page_height - source_top
-    except (TypeError, ValueError):
-        return candidates[0]
-    matches = [
-        block
-        for block in candidates
-        if block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6
-        and block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6
-    ]
+        media_box = reader.pages[page_index].mediabox
+        page_height = float(media_box.height)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    left = _destination_number(values.get("/Left"))
+    right = _destination_number(values.get("/Right"))
+    top = _destination_number(values.get("/Top"))
+    bottom = _destination_number(values.get("/Bottom"))
+    if mode in {"/Fit", "/FitB"}:
+        matches = candidates if len(candidates) == 1 else []
+    elif mode in {"/FitH", "/FitBH"}:
+        if top is None:
+            return candidates[0] if len(candidates) == 1 else None
+        y = page_height - top
+        matches = [
+            block
+            for block in candidates
+            if block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6
+        ]
+    elif mode in {"/FitV", "/FitBV"}:
+        if left is None:
+            return candidates[0] if len(candidates) == 1 else None
+        x = left
+        matches = [
+            block
+            for block in candidates
+            if block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6
+        ]
+    elif mode == "/FitR":
+        if None in {left, bottom, right, top}:
+            return None
+        target_bbox = (
+            min(left, right),
+            page_height - max(bottom, top),
+            max(left, right),
+            page_height - min(bottom, top),
+        )
+        matches = _blocks_intersecting_bbox(candidates, target_bbox)
+    elif mode == "/XYZ":
+        x = left
+        y = None if top is None else page_height - top
+        matches = [
+            block
+            for block in candidates
+            if (x is None or block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6)
+            and (y is None or block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6)
+        ]
+    else:
+        return None
     return matches[0] if len(matches) == 1 else None
+
+
+def _destination_array_values(
+    mode: str, arguments: Sequence[object]
+) -> dict[str, object]:
+    if mode == "/XYZ":
+        names = ("/Left", "/Top")
+    elif mode in {"/FitH", "/FitBH"}:
+        names = ("/Top",)
+    elif mode in {"/FitV", "/FitBV"}:
+        names = ("/Left",)
+    elif mode == "/FitR":
+        names = ("/Left", "/Bottom", "/Right", "/Top")
+    else:
+        names = ()
+    return dict(zip(names, arguments, strict=False))
+
+
+def _destination_number(value: object) -> float | None:
+    if value is None or value.__class__.__name__ == "NullObject":
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _bbox_intersection(
