@@ -14,6 +14,7 @@ from web_translator.cli import (
     _detect_source_language,
     _read_capture,
     _read_review,
+    main,
 )
 from web_translator.models import MasterReview, QAResult, Segment
 from web_translator.zones import Zone
@@ -27,6 +28,47 @@ REVIEW_DIMENSIONS = (
     "boundary_consistency",
     "protected_content",
 )
+
+
+def test_pdf_acquire_cli_requires_an_empty_run_directory_and_writes_source_metadata(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    run_dir = tmp_path / "run"
+
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
+
+    assert exit_code == 0
+    assert (run_dir / "source.pdf").read_bytes() == source.read_bytes()
+    source_json = json.loads((run_dir / "source.json").read_text(encoding="utf-8"))
+    assert source_json["input_kind"] == "local"
+    assert source_json["requested_source"] == "source.pdf"
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-acquire", "exit_code": 0, "status": "ok"
+    }
+
+
+def test_pdf_acquire_cli_rejects_nonempty_directory_without_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    existing = run_dir / "keep.txt"
+    existing.write_text("keep", encoding="utf-8")
+
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
+
+    assert exit_code == cli_module.EXIT_CAPTURE_FAILURE
+    assert existing.read_text(encoding="utf-8") == "keep"
+    assert not (run_dir / "source.pdf").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-acquire",
+        "exit_code": cli_module.EXIT_CAPTURE_FAILURE,
+        "status": "error",
+    }
 
 
 def _zone(zone_id: str = "zone-001") -> Zone:

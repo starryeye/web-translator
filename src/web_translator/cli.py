@@ -37,6 +37,7 @@ from web_translator.models import (
     read_segments,
 )
 from web_translator.paths import validate_public_url
+from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -124,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         handler(namespace)
     except InvalidArgumentsError as error:
         return _fail(command, EXIT_INVALID_ARGUMENTS, error)
-    except CaptureError as error:
+    except (CaptureError, PdfAcquireError) as error:
         return _fail(command, EXIT_CAPTURE_FAILURE, error)
     except (CLIContractError, TranslationContractError) as error:
         return _fail(command, EXIT_CONTRACT_FAILURE, error)
@@ -152,6 +153,13 @@ def _build_parser() -> argparse.ArgumentParser:
     capture.add_argument("url")
     _add_run_dir(capture)
     capture.set_defaults(handler=_capture_command)
+
+    pdf_acquire = subparsers.add_parser(
+        "pdf-acquire", help="Acquire one local or public PDF."
+    )
+    pdf_acquire.add_argument("source")
+    _add_run_dir(pdf_acquire)
+    pdf_acquire.set_defaults(handler=_pdf_acquire_command)
 
     extract = subparsers.add_parser("extract", help="Extract translation segments.")
     _add_run_dir(extract)
@@ -226,6 +234,21 @@ def _capture_command(args: argparse.Namespace) -> None:
         _write_json_atomic(args.run_dir / "capture.json", payload)
     except OSError as error:
         raise CaptureError(f"cannot write capture metadata: {error}") from error
+
+
+def _pdf_acquire_command(args: argparse.Namespace) -> None:
+    try:
+        _validate_run_root(args.run_dir)
+        if args.run_dir.exists() and any(args.run_dir.iterdir()):
+            raise CLIContractError(
+                f"PDF acquire run directory must be empty: {args.run_dir}"
+            )
+        _reject_if_link(args.run_dir / "source.pdf")
+        _reject_if_link(args.run_dir / "source.json")
+        record = acquire_pdf(str(args.source), args.run_dir)
+        _write_json_atomic(args.run_dir / "source.json", record.to_dict())
+    except (CLIContractError, OSError) as error:
+        raise PdfAcquireError(str(error)) from error
 
 
 def _extract_command(args: argparse.Namespace) -> None:
