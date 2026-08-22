@@ -487,6 +487,13 @@ def test_assemble_pdf_preserves_list_marker_family_and_relative_nesting(
         ("1. RootOrdered", 72.0),
         ("1.2) NestedOrdered", 90.0),
         ("- NestedBullet", 90.0),
+        ("A. AlphaDot", 72.0),
+        ("A) AlphaParen", 72.0),
+        ("iv) RomanOrdered", 90.0),
+        ("‣ TriangleBullet", 72.0),
+        ("◦ WhiteBullet", 90.0),
+        ("⁃ HyphenBullet", 90.0),
+        ("∙ DotBullet", 72.0),
     ]
     blocks = [
         PdfBlock(
@@ -530,19 +537,174 @@ def test_assemble_pdf_preserves_list_marker_family_and_relative_nesting(
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
-    assert "•" not in extracted
+    expected_markers = {
+        "TriangleBullet": "•",
+        "WhiteBullet": "•",
+        "HyphenBullet": "•",
+        "DotBullet": "•",
+    }
     for marker_and_body, _indentation in entries:
-        assert extracted.count(marker_and_body) == 1
+        source_marker, body = marker_and_body.split(" ", 1)
+        rendered_marker = expected_markers.get(body, source_marker)
+        assert extracted.count(f"{rendered_marker} {body}") == 1
+        assert extracted.count(body) == 1
     with pdfplumber.open(staged) as document_reader:
         words = document_reader.pages[0].extract_words()
     x_by_body = {
         str(word["text"]): float(word["x0"])
         for word in words
-        if str(word["text"]) in {"RootBullet", "RootOrdered", "NestedOrdered", "NestedBullet"}
+        if str(word["text"])
+        in {
+            "RootBullet",
+            "RootOrdered",
+            "NestedOrdered",
+            "NestedBullet",
+            "AlphaDot",
+            "AlphaParen",
+            "RomanOrdered",
+            "TriangleBullet",
+            "WhiteBullet",
+            "HyphenBullet",
+            "DotBullet",
+        }
     }
     assert x_by_body["RootBullet"] == pytest.approx(x_by_body["RootOrdered"], abs=0.5)
     assert x_by_body["NestedBullet"] == pytest.approx(x_by_body["NestedOrdered"], abs=0.5)
     assert x_by_body["NestedBullet"] - x_by_body["RootBullet"] == pytest.approx(18.0, abs=1.0)
+
+
+def test_assemble_pdf_creates_children_only_in_held_run_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    moved_run = run_dir.with_name("moved-run")
+    original_open = pdf_assemble_module._open_directory_anchor
+    swapped = False
+
+    def open_then_swap(
+        path: Path,
+        label: str,
+        **kwargs: object,
+    ) -> object:
+        nonlocal swapped
+        anchor = original_open(path, label, **kwargs)
+        if label == "run" and not swapped:
+            swapped = True
+            run_dir.rename(moved_run)
+            run_dir.mkdir()
+        return anchor
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_open_directory_anchor",
+        open_then_swap,
+    )
+
+    with pytest.raises(PdfAssemblyError, match="run directory changed identity"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert list(run_dir.iterdir()) == []
+    assert not (moved_run / "staged-output").exists()
+    assert not (moved_run / "layout.json").exists()
+    assert not any(
+        child.name.startswith(".pdf-assembling-") for child in moved_run.iterdir()
+    )
+
+
+def test_assemble_pdf_writes_reportlab_through_open_anchored_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_document = pdf_assemble_module.SimpleDocTemplate
+    swapped = False
+
+    def swap_staging_before_reportlab(destination: object, **kwargs: object) -> object:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            temporary = next(
+                child
+                for child in run_dir.iterdir()
+                if child.name.startswith(".pdf-assembling-")
+            )
+            staging = temporary / "staged-output"
+            staging.rename(temporary / "moved-staged-output")
+            staging.symlink_to(outside, target_is_directory=True)
+        return original_document(destination, **kwargs)
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "SimpleDocTemplate",
+        swap_staging_before_reportlab,
+    )
+
+    with pytest.raises(PdfAssemblyError):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert list(outside.iterdir()) == []
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_cleans_child_if_mkdir_interrupts_after_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    original_mkdir = pdf_assemble_module.os.mkdir
+
+    def create_then_interrupt(
+        path: str | Path,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        if dir_fd is not None and str(path).startswith(".pdf-assembling-"):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(pdf_assemble_module.os, "mkdir", create_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not any(
+        child.name.startswith(".pdf-assembling-") for child in run_dir.iterdir()
+    )
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_cleans_file_if_open_interrupts_after_exclusive_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    original_open = pdf_assemble_module.os.open
+
+    def create_then_interrupt(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd is not None and path == "translated.pdf":
+            os.close(descriptor)
+            raise KeyboardInterrupt()
+        return descriptor
+
+    monkeypatch.setattr(pdf_assemble_module.os, "open", create_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not any(
+        child.name.startswith(".pdf-assembling-") for child in run_dir.iterdir()
+    )
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
 
 
 def test_assemble_pdf_anchors_publication_against_staging_directory_swap(
@@ -714,7 +876,12 @@ def test_assemble_pdf_cleans_owned_partial_staging_on_base_exception(
     def interrupt_layout(*args: object, **kwargs: object) -> None:
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(pdf_assemble_module, "write_pdf_layout", interrupt_layout)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_write_layout_stream",
+        interrupt_layout,
+        raising=False,
+    )
 
     with pytest.raises(KeyboardInterrupt):
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
@@ -834,52 +1001,24 @@ def test_assemble_pdf_does_not_replace_raced_staged_file(
     assert not (run_dir / "layout.json").exists()
 
 
-def test_assemble_pdf_uses_no_hard_link_fallback_for_windows_compatibility(
+def test_assemble_pdf_fails_closed_without_anchored_child_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, translations, glossary = _assembly_run(tmp_path)
-    import web_translator.pdf_flowables as flowables_module
-
-    rename_destinations: list[Path] = []
-    anchored_destinations: list[Path] = []
-    original_rename = pdf_assemble_module.os.rename
-
-    def unsupported_link(*args: object, **kwargs: object) -> None:
-        raise NotImplementedError()
-
-    def tracked_rename(source: str | Path, destination: str | Path) -> None:
-        rename_destinations.append(Path(destination))
-        original_rename(source, destination)
-
-    def tracked_windows_move(
-        source_directory: object,
-        source_name: str,
-        destination_directory: object,
-        destination_name: str,
-    ) -> None:
-        source_path = source_directory.current_path() / source_name  # type: ignore[attr-defined]
-        destination_path = destination_directory.current_path() / destination_name  # type: ignore[attr-defined]
-        anchored_destinations.append(destination_path)
-        original_rename(source_path, destination_path)
-
-    monkeypatch.setattr(pdf_assemble_module.os, "link", unsupported_link)
-    monkeypatch.setattr(pdf_assemble_module.os, "rename", tracked_rename)
-    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True, raising=False)
     monkeypatch.setattr(
         pdf_assemble_module,
-        "_windows_move_anchored_file",
-        tracked_windows_move,
-        raising=False,
+        "_DIRFD_PUBLICATION_SUPPORTED",
+        False,
     )
-    monkeypatch.setattr(flowables_module.os, "link", unsupported_link)
-    monkeypatch.setattr(flowables_module, "_IS_WINDOWS", True, raising=False)
 
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    with pytest.raises(PdfAssemblyError, match="anchored child creation unavailable"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
-    assert staged.is_file()
-    assert (run_dir / "layout.json").is_file()
-    assert len(rename_destinations) == 1
-    assert anchored_destinations == [staged, run_dir / "layout.json"]
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+    assert not any(
+        child.name.startswith(".pdf-assembling-") for child in run_dir.iterdir()
+    )
 
 
 @pytest.mark.parametrize(
@@ -910,6 +1049,421 @@ def test_windows_file_rename_info_uses_relative_no_replace_contract(
     assert struct.unpack_from(pointer_format, payload, root_offset) == (root_handle,)
     assert struct.unpack_from("<I", payload, length_offset) == (len(encoded),)
     assert payload[name_offset:] == encoded
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        (
+            "_windows_create_relative_directory",
+            {
+                "create_disposition": 2,
+                "create_options": 0x00000001 | 0x00000020 | 0x00200000,
+                "file_attributes": 0x00000010,
+            },
+        ),
+        (
+            "_windows_create_relative_file",
+            {
+                "create_disposition": 2,
+                "create_options": 0x00000020 | 0x00000040 | 0x00200000,
+                "file_attributes": 0x00000080,
+            },
+        ),
+        (
+            "_windows_open_relative_file",
+            {
+                "create_disposition": 1,
+                "create_options": 0x00000020 | 0x00000040 | 0x00200000,
+                "file_attributes": 0,
+            },
+        ),
+    ],
+)
+def test_windows_relative_open_contract_is_rooted_and_no_follow(
+    operation: str,
+    expected: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, str, dict[str, int]]] = []
+
+    def capture(root_handle: int, name: str, **kwargs: int) -> int:
+        calls.append((root_handle, name, kwargs))
+        return 707
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_nt_create_relative",
+        capture,
+    )
+
+    result = getattr(pdf_assemble_module, operation)(41, "translated.pdf")
+
+    assert result == 707
+    assert len(calls) == 1
+    root_handle, name, contract = calls[0]
+    assert root_handle == 41
+    assert name == "translated.pdf"
+    assert contract["create_disposition"] == expected["create_disposition"]
+    assert contract["create_options"] == expected["create_options"]
+    assert contract["file_attributes"] == expected["file_attributes"]
+    assert contract["desired_access"] & 0x00100000
+
+
+def test_windows_nt_create_passes_relative_root_name_and_create_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    captured: dict[str, object] = {}
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    def capture_create(
+        output_handle: object,
+        desired_access: object,
+        object_attributes: object,
+        _status_block: object,
+        _allocation_size: object,
+        file_attributes: object,
+        share_access: object,
+        create_disposition: object,
+        create_options: object,
+        _ea_buffer: object,
+        _ea_length: object,
+    ) -> int:
+        attributes = object_attributes._obj  # type: ignore[attr-defined]
+        unicode_name = attributes.object_name.contents
+        captured.update(
+            root_directory=int(attributes.root_directory),
+            name=unicode_name.buffer,
+            attributes=int(attributes.attributes),
+            desired_access=int(desired_access),
+            file_attributes=int(file_attributes),
+            share_access=int(share_access),
+            create_disposition=int(create_disposition),
+            create_options=int(create_options),
+        )
+        output_handle._obj.value = 505  # type: ignore[attr-defined]
+        return 0
+
+    class FakeNtdll:
+        NtCreateFile = FakeCall(capture_create)
+
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeNtdll(),
+        raising=False,
+    )
+
+    handle = pdf_assemble_module._windows_nt_create_relative(
+        0x01020304,
+        "translated.pdf",
+        desired_access=0x001F01FF,
+        create_disposition=2,
+        create_options=0x00200060,
+        file_attributes=0x80,
+    )
+
+    assert handle == 505
+    assert captured == {
+        "root_directory": 0x01020304,
+        "name": "translated.pdf",
+        "attributes": 0x40,
+        "desired_access": 0x001F01FF,
+        "file_attributes": 0x80,
+        "share_access": 0x7,
+        "create_disposition": 2,
+        "create_options": 0x00200060,
+    }
+
+
+def test_windows_relative_open_closes_handle_if_native_call_interrupts_after_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    closed: list[int] = []
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    def create_then_interrupt(output_handle: object, *_args: object) -> int:
+        pointer = ctypes.cast(output_handle, ctypes.POINTER(ctypes.c_void_p))
+        pointer[0] = ctypes.c_void_p(909)
+        raise KeyboardInterrupt()
+
+    class FakeNtdll:
+        NtCreateFile = FakeCall(create_then_interrupt)
+
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeNtdll(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pdf_assemble_module._windows_nt_create_relative(
+            41,
+            "translated.pdf",
+            desired_access=0x00100080,
+            create_disposition=1,
+            create_options=0x00200060,
+            file_attributes=0,
+        )
+
+    assert closed == [909]
+
+
+def test_windows_child_creation_closes_handle_if_anchor_construction_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    result = directory.lstat()
+    closed: list[int] = []
+    deleted: list[int] = []
+
+    class FakeAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return directory
+
+        def close(self) -> None:
+            return None
+
+    parent = pdf_assemble_module._DirectoryAnchor(
+        directory,
+        "run",
+        (result.st_dev, result.st_ino),
+        None,
+        FakeAnchor(),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_create_relative_directory",
+        lambda _root, _name: 919,
+    )
+
+    def interrupt_anchor(_handle: int) -> object:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_WindowsDirectoryPathAnchor",
+        interrupt_anchor,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_delete_open_file",
+        deleted.append,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pdf_assemble_module._create_child_directory(parent, "child", "child")
+
+    assert deleted == [919]
+    assert closed == [919]
+
+
+def test_windows_publication_closes_source_handle_on_rename_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+
+    class FakeAnchor:
+        def __init__(self, handle: int) -> None:
+            self.handle = handle
+
+        def current_path(self) -> Path:
+            return tmp_path
+
+        def close(self) -> None:
+            return None
+
+    source_anchor = pdf_assemble_module._DirectoryAnchor(
+        tmp_path / "source", "source", (1, 1), None, FakeAnchor(41)
+    )
+    destination_anchor = pdf_assemble_module._DirectoryAnchor(
+        tmp_path / "destination", "destination", (1, 2), None, FakeAnchor(42)
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_file",
+        lambda _root, _name: 808,
+    )
+
+    def interrupt_rename(_source: int, _root: int, _name: str) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_rename_open_file",
+        interrupt_rename,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pdf_assemble_module._windows_move_anchored_file(
+            source_anchor,
+            "translated.pdf",
+            destination_anchor,
+            "translated.pdf",
+        )
+
+    assert closed == [808]
+
+
+def test_windows_publication_opens_source_relative_to_held_directory_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    source = tmp_path / "source"
+    source.mkdir()
+    moved_source = tmp_path / "moved-source"
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (source / "translated.pdf").write_bytes(b"owned translated PDF")
+    paths_by_handle: dict[int, Path] = {}
+    swapped = False
+
+    class FakeAnchor:
+        def __init__(self, handle: int, current: Path) -> None:
+            self.handle = handle
+            self._current = current
+
+        def current_path(self) -> Path:
+            return self._current
+
+        def close(self) -> None:
+            return None
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    def swap_source_directory() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        source.rename(moved_source)
+        source.mkdir()
+        (source / "translated.pdf").write_bytes(b"foreign translated PDF")
+
+    def path_based_open(*_args: object) -> int:
+        swap_source_directory()
+        paths_by_handle[101] = source / "translated.pdf"
+        return 101
+
+    def path_based_rename(
+        handle: object,
+        _information_class: object,
+        _payload: object,
+        _payload_size: object,
+    ) -> int:
+        os.rename(paths_by_handle[int(handle)], destination / "translated.pdf")
+        return 1
+
+    class FakeKernel32:
+        CreateFileW = FakeCall(path_based_open)
+        SetFileInformationByHandle = FakeCall(path_based_rename)
+
+    def relative_open(root_handle: int, name: str) -> int:
+        assert root_handle == 41
+        assert name == "translated.pdf"
+        swap_source_directory()
+        paths_by_handle[202] = moved_source / name
+        return 202
+
+    def relative_rename(handle: int, root_handle: int, name: str) -> None:
+        assert root_handle == 42
+        os.rename(paths_by_handle[handle], destination / name)
+
+    source_anchor = pdf_assemble_module._DirectoryAnchor(
+        source,
+        "source",
+        (1, 1),
+        None,
+        FakeAnchor(41, source),
+    )
+    destination_anchor = pdf_assemble_module._DirectoryAnchor(
+        destination,
+        "destination",
+        (1, 2),
+        None,
+        FakeAnchor(42, destination),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeKernel32(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_file",
+        relative_open,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_rename_open_file",
+        relative_rename,
+        raising=False,
+    )
+
+    published_handle = pdf_assemble_module._windows_move_anchored_file(
+        source_anchor,
+        "translated.pdf",
+        destination_anchor,
+        "translated.pdf",
+    )
+
+    assert published_handle == 202
+    assert (destination / "translated.pdf").read_bytes() == b"owned translated PDF"
+    assert (source / "translated.pdf").read_bytes() == b"foreign translated PDF"
 
 
 @pytest.mark.parametrize("existing", ["staged-output", "layout.json", "final"])

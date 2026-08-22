@@ -24,9 +24,10 @@ _VERTICAL_OVERLAP = 0.60
 _MINIMUM_GUTTER = 18.0
 _WORD_GAP_FONT_MULTIPLIER = 1.5
 _PARAGRAPH_GAP_FONT_MULTIPLIER = 1.6
-_LIST_PATTERN = re.compile(
-    r"^(?:[\u2022\u2023\u25e6\u2043\u2219*+-]|"
-    r"\d+(?:\.\d+)*[.)]|[A-Za-z][.)]|[ivxlcdmIVXLCDM]+[.)])\s+"
+_LIST_MARKER_PATTERN = re.compile(
+    r"^\s*(?P<marker>[\u2022\u2023\u25e6\u2043\u2219*+-]|"
+    r"\d+(?:\.\d+)*[.)]|[A-Za-z][.)]|[ivxlcdmIVXLCDM]+[.)])"
+    r"\s+(?P<body>.*)\Z"
 )
 _NUMBERED_LIST_PATTERN = re.compile(
     r"^(?P<number>\d+(?:\.\d+)*)(?P<marker>[.)])\s+"
@@ -194,7 +195,7 @@ class PdfLine:
     def is_heading(self) -> bool:
         if self.kind is not None:
             return self.kind == "heading"
-        return self.bold and _LIST_PATTERN.match(self.text) is None
+        return self.bold and split_list_marker(self.text) is None
 
     def vertical_overlap_ratio(self, other: PdfWord | PdfLine) -> float:
         overlap = max(0.0, min(self.bottom, other.bottom) - max(self.top, other.top))
@@ -424,7 +425,7 @@ def classify_document_lines(
                 continue
             rounded_size = round(line.size)
             heading_candidate = rounded_size in heading_sizes or line.bold
-            list_marker = _LIST_PATTERN.match(line.text)
+            list_marker = split_list_marker(line.text)
             number = _HEADING_NUMBER_PATTERN.match(line.text)
             numbered_heading = (
                 heading_candidate
@@ -592,11 +593,19 @@ def classify_line(line: PdfLine) -> tuple[PdfBlockKind, PdfLine]:
     """Classify one already-normalized line without mutating it."""
     if line.kind is not None:
         return line.kind, line
-    if _LIST_PATTERN.match(line.text) is not None:
+    if split_list_marker(line.text) is not None:
         return "list-item", line
     if line.is_heading:
         return "heading", line
     return "paragraph", line
+
+
+def split_list_marker(text: str) -> tuple[str, str] | None:
+    """Return one canonical extractor-supported list marker and its body."""
+    match = _LIST_MARKER_PATTERN.match(text)
+    if match is None:
+        return None
+    return match.group("marker"), match.group("body")
 
 
 def merge_contiguous_paragraph_lines(

@@ -362,6 +362,25 @@ def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "marker",
+    ["-", "1.", "1.2)", "A.", "A)", "iv)", "‣", "◦", "⁃", "∙"],
+)
+def test_list_marker_families_share_extraction_classification(marker: str) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    source_text = f"{marker} Item"
+    lines = group_words_into_lines(
+        [_word(source_text, x0=20, x1=100, top=10, bottom=20)]
+    )
+
+    blocks = build_text_blocks(lines, page_number=1)
+
+    assert [(block.kind, block.source_text) for block in blocks] == [
+        ("list-item", source_text)
+    ]
+
+
 def test_numbered_heading_classification_consumes_style_and_vertical_spacing() -> None:
     from web_translator.pdf_layout import (
         classify_document_lines,
