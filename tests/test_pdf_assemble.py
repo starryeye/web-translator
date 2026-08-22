@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 from importlib.resources import as_file, files
 import json
+import os
 from pathlib import Path
+import shutil
+import struct
 import subprocess
 import sys
 
 from fontTools.ttLib import TTFont
+import pdfplumber
 from pypdf import PdfReader
 import pytest
 
+import scripts.vendor_pdf_fonts as font_vendor
 import web_translator.pdf_assemble as pdf_assemble_module
-from web_translator.models import ProtectedToken, Segment, Translation, write_segments
+from web_translator.models import (
+    ProtectedToken,
+    Segment,
+    Translation,
+    read_segments,
+    write_segments,
+)
 from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
 from web_translator.pdf_flowables import read_pdf_layout
 from web_translator.pdf_models import (
@@ -39,6 +51,7 @@ FONT_LICENSE_URL = (
     "https://raw.githubusercontent.com/notofonts/noto-cjk/"
     "f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE"
 )
+FONT_LICENSE_SHA256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
 UNICODE_RANGES = [
     {"name": "ASCII", "start": "U+0000", "end": "U+007F"},
     {"name": "Latin-1", "start": "U+0080", "end": "U+00FF"},
@@ -196,6 +209,45 @@ def _embedded_font_programs(path: Path) -> dict[str, bytes]:
     return programs
 
 
+def _embedded_font_contracts(path: Path) -> dict[str, tuple[bool, bool]]:
+    contracts: dict[str, tuple[bool, bool]] = {}
+    for page in PdfReader(path).pages:
+        fonts = page["/Resources"].get_object()["/Font"].get_object()
+        for reference in fonts.values():
+            root = reference.get_object()
+            descendants = root.get("/DescendantFonts")
+            font = descendants[0].get_object() if descendants else root
+            descriptor_ref = font.get("/FontDescriptor")
+            if descriptor_ref is None:
+                continue
+            descriptor = descriptor_ref.get_object()
+            name = str(descriptor["/FontName"])
+            contracts[name] = (
+                descriptor.get("/FontFile2") is not None,
+                root.get("/ToUnicode") is not None,
+            )
+    return contracts
+
+
+def _heading_font_sizes(path: Path, labels: list[str]) -> list[float]:
+    found: dict[str, float] = {}
+
+    def visit(
+        text: str,
+        _current_matrix: object,
+        _text_matrix: object,
+        _font: object,
+        font_size: float,
+    ) -> None:
+        for label in labels:
+            if label in text:
+                found[label] = float(font_size)
+
+    for page in PdfReader(path).pages:
+        page.extract_text(visitor_text=visit)
+    return [found[label] for label in labels]
+
+
 def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> None:
     asset_root = files("web_translator").joinpath("font_assets")
     provenance = json.loads(asset_root.joinpath("PROVENANCE.json").read_text("utf-8"))
@@ -214,6 +266,7 @@ def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> Non
     assert provenance["license"] == {
         "planned_url": PLANNED_LICENSE_URL,
         "planned_url_status": 404,
+        "sha256": FONT_LICENSE_SHA256,
         "url": FONT_LICENSE_URL,
     }
     assert provenance["unicode_ranges"] == UNICODE_RANGES
@@ -254,6 +307,7 @@ def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> Non
 
     license_text = asset_root.joinpath("OFL.txt").read_text("utf-8")
     assert "SIL OPEN FONT LICENSE Version 1.1" in license_text
+    assert hashlib.sha256(license_text.encode("utf-8")).hexdigest() == FONT_LICENSE_SHA256
 
 
 def test_vendoring_refuses_source_hash_mismatch_without_outputs(tmp_path: Path) -> None:
@@ -282,6 +336,267 @@ def test_vendoring_refuses_source_hash_mismatch_without_outputs(tmp_path: Path) 
     assert result.returncode == 1
     assert "source SHA-256 mismatch" in result.stderr
     assert not destination.exists()
+
+
+def test_vendoring_refuses_tampered_license_hash_without_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.ttf"
+    source.write_bytes(b"controlled source bytes")
+    monkeypatch.setattr(
+        font_vendor,
+        "FONT_SOURCE_SHA256",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    license_path = tmp_path / "OFL.txt"
+    license_path.write_bytes(
+        files("web_translator").joinpath("font_assets/OFL.txt").read_bytes()
+        + b"\ntampered\n"
+    )
+    destination = tmp_path / "font-assets"
+
+    with pytest.raises(font_vendor.FontVendoringError, match="license SHA-256 mismatch"):
+        font_vendor.vendor_fonts(
+            destination,
+            source_file=source,
+            license_file=license_path,
+        )
+
+    assert not destination.exists()
+
+
+def test_assemble_pdf_rejects_tampered_bundled_license_without_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    package_root = tmp_path / "installed" / "web_translator"
+    with as_file(files("web_translator").joinpath("font_assets")) as original:
+        shutil.copytree(original, package_root / "font_assets")
+    (package_root / "font_assets" / "OFL.txt").write_text(
+        "tampered license", encoding="utf-8"
+    )
+    monkeypatch.setattr(pdf_assemble_module, "files", lambda _name: package_root)
+
+    with pytest.raises(PdfAssemblyError, match="bundled font license hash mismatch"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_embeds_regular_and_bold_with_tounicode_without_headings(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    remaining_blocks = [
+        replace(block, order=index)
+        for index, block in enumerate(document.blocks[1:])
+    ]
+    (run_dir / "document.json").write_text(
+        json.dumps(
+            replace(document, blocks=remaining_blocks).to_dict(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    remaining_segments = [
+        replace(
+            segment,
+            heading_path=[],
+            context_ids=[
+                context
+                for context in segment.context_ids
+                if context != "seg-000001"
+            ],
+        )
+        for segment in read_segments(run_dir / "segments.jsonl")[1:]
+    ]
+    write_segments(run_dir / "segments.jsonl", remaining_segments)
+    translations.pop("seg-000001")
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    contracts = _embedded_font_contracts(staged)
+    assert len(contracts) == 2
+    assert any("Regular" in name for name in contracts)
+    assert any("Bold" in name for name in contracts)
+    assert all(font_file_2 and to_unicode for font_file_2, to_unicode in contracts.values())
+
+
+def test_assemble_pdf_normalizes_heading_levels_from_document_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir, _translations, glossary = _assembly_run(tmp_path)
+    labels = ["Top One", "Child One", "Child Two", "Top Two"]
+    source_sizes = [18.0, 14.0, 14.0, 18.0]
+    heading_paths = [[], ["Top One"], ["Top One", "Child One"], ["Top One", "Child Two"]]
+    blocks = [
+        PdfBlock(
+            id=f"pdf:page-0001:block-{index:04d}",
+            page_number=1,
+            order=index - 1,
+            kind="heading",
+            bbox=(72.0, 48.0 + index * 48.0, 540.0, 72.0 + index * 48.0),
+            style=PdfBlockStyle(size, True, "left", 72.0, 12.0),
+            source_text=label,
+            segment_id=f"seg-{index:06d}",
+        )
+        for index, (label, size) in enumerate(zip(labels, source_sizes, strict=True), start=1)
+    ]
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(replace(document, blocks=blocks).to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    segments = [
+        Segment(
+            id=f"seg-{index:06d}",
+            locator=block.id,
+            semantic_type="heading",
+            heading_path=path,
+            source_text=block.source_text,
+            protected=[],
+            context_ids=[],
+            target=True,
+        )
+        for index, (block, path) in enumerate(zip(blocks, heading_paths, strict=True), start=1)
+    ]
+    write_segments(run_dir / "segments.jsonl", segments)
+    translations = {
+        segment.id: Translation(segment.id, labels[index])
+        for index, segment in enumerate(segments)
+    }
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert _heading_font_sizes(staged, labels) == [18.0, 16.0, 16.0, 18.0]
+
+
+def test_assemble_pdf_preserves_list_marker_family_and_relative_nesting(
+    tmp_path: Path,
+) -> None:
+    run_dir, _translations, glossary = _assembly_run(tmp_path)
+    entries = [
+        ("- RootBullet", 72.0),
+        ("1. RootOrdered", 72.0),
+        ("1.2) NestedOrdered", 90.0),
+        ("- NestedBullet", 90.0),
+    ]
+    blocks = [
+        PdfBlock(
+            id=f"pdf:page-0001:block-{index:04d}",
+            page_number=1,
+            order=index - 1,
+            kind="list-item",
+            bbox=(indentation, 48.0 + index * 36.0, 540.0, 72.0 + index * 36.0),
+            style=PdfBlockStyle(11.0, False, "left", indentation, 5.0),
+            source_text=text,
+            segment_id=f"seg-{index:06d}",
+        )
+        for index, (text, indentation) in enumerate(entries, start=1)
+    ]
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(replace(document, blocks=blocks).to_dict()) + "\n",
+        encoding="utf-8",
+    )
+    segments = [
+        Segment(
+            id=f"seg-{index:06d}",
+            locator=block.id,
+            semantic_type="list-item",
+            heading_path=[],
+            source_text=block.source_text,
+            protected=[],
+            context_ids=[],
+            target=True,
+        )
+        for index, block in enumerate(blocks, start=1)
+    ]
+    write_segments(run_dir / "segments.jsonl", segments)
+    translations = {
+        segment.id: Translation(segment.id, segment.source_text)
+        for segment in segments
+    }
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert "•" not in extracted
+    for marker_and_body, _indentation in entries:
+        assert extracted.count(marker_and_body) == 1
+    with pdfplumber.open(staged) as document_reader:
+        words = document_reader.pages[0].extract_words()
+    x_by_body = {
+        str(word["text"]): float(word["x0"])
+        for word in words
+        if str(word["text"]) in {"RootBullet", "RootOrdered", "NestedOrdered", "NestedBullet"}
+    }
+    assert x_by_body["RootBullet"] == pytest.approx(x_by_body["RootOrdered"], abs=0.5)
+    assert x_by_body["NestedBullet"] == pytest.approx(x_by_body["NestedOrdered"], abs=0.5)
+    assert x_by_body["NestedBullet"] - x_by_body["RootBullet"] == pytest.approx(18.0, abs=1.0)
+
+
+def test_assemble_pdf_anchors_publication_against_staging_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    moved = run_dir / "moved-owned-staging"
+    original_link = pdf_assemble_module.os.link
+    raced = False
+
+    def swap_before_link(
+        source: str | Path, destination: str | Path, **kwargs: object
+    ) -> None:
+        nonlocal raced
+        if not raced and Path(destination).name == "translated.pdf":
+            raced = True
+            (run_dir / "staged-output").rename(moved)
+            (run_dir / "staged-output").symlink_to(outside, target_is_directory=True)
+        original_link(source, destination, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pdf_assemble_module.os, "link", swap_before_link)
+
+    with pytest.raises(PdfAssemblyError, match="staging directory changed identity"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert list(outside.iterdir()) == []
+    if moved.exists():
+        assert list(moved.iterdir()) == []
+    assert (run_dir / "staged-output").is_symlink()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_cleans_anchored_link_if_syscall_interrupts_after_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    original_link = pdf_assemble_module.os.link
+
+    def publish_then_interrupt(
+        source: str | Path, destination: str | Path, **kwargs: object
+    ) -> None:
+        original_link(source, destination, **kwargs)  # type: ignore[arg-type]
+        if Path(destination).name == "translated.pdf":
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(pdf_assemble_module.os, "link", publish_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
 
 
 def test_assemble_pdf_stages_selectable_korean_without_publishing(
@@ -418,9 +733,19 @@ def test_assemble_pdf_cleans_run_visible_staging_on_publication_base_exception(
     keep.write_text("unrelated", encoding="utf-8")
     original_publish = pdf_assemble_module._publish_new_file
 
-    def interrupt_publication(source: Path, destination: Path) -> object:
-        if destination.name == "translated.pdf":
-            return original_publish(source, destination)
+    def interrupt_publication(
+        source_directory: object,
+        source_name: str,
+        destination_directory: object,
+        destination_name: str,
+    ) -> object:
+        if destination_name == "translated.pdf":
+            return original_publish(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
         assert (run_dir / "staged-output" / "translated.pdf").is_file()
         raise KeyboardInterrupt()
 
@@ -441,9 +766,20 @@ def test_assemble_pdf_base_exception_does_not_delete_replaced_staged_file(
     run_dir, translations, glossary = _assembly_run(tmp_path)
     original_publish = pdf_assemble_module._publish_new_file
 
-    def replace_then_interrupt(source: Path, destination: Path) -> object:
-        if destination.name == "translated.pdf":
-            identity = original_publish(source, destination)
+    def replace_then_interrupt(
+        source_directory: object,
+        source_name: str,
+        destination_directory: object,
+        destination_name: str,
+    ) -> object:
+        destination = run_dir / "staged-output" / destination_name
+        if destination_name == "translated.pdf":
+            identity = original_publish(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
             destination.unlink()
             destination.write_bytes(b"unrelated racer")
             return identity
@@ -472,7 +808,20 @@ def test_assemble_pdf_does_not_replace_raced_staged_file(
     ) -> None:
         destination_path = Path(destination)
         if destination_path.name == "translated.pdf":
-            destination_path.write_bytes(b"unrelated racer")
+            destination_directory = kwargs.get("dst_dir_fd")
+            if isinstance(destination_directory, int):
+                descriptor = os.open(
+                    destination_path.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=destination_directory,
+                )
+                try:
+                    os.write(descriptor, b"unrelated racer")
+                finally:
+                    os.close(descriptor)
+            else:
+                destination_path.write_bytes(b"unrelated racer")
         original_link(source, destination, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(pdf_assemble_module.os, "link", race_staged_destination)
@@ -492,6 +841,7 @@ def test_assemble_pdf_uses_no_hard_link_fallback_for_windows_compatibility(
     import web_translator.pdf_flowables as flowables_module
 
     rename_destinations: list[Path] = []
+    anchored_destinations: list[Path] = []
     original_rename = pdf_assemble_module.os.rename
 
     def unsupported_link(*args: object, **kwargs: object) -> None:
@@ -501,9 +851,26 @@ def test_assemble_pdf_uses_no_hard_link_fallback_for_windows_compatibility(
         rename_destinations.append(Path(destination))
         original_rename(source, destination)
 
+    def tracked_windows_move(
+        source_directory: object,
+        source_name: str,
+        destination_directory: object,
+        destination_name: str,
+    ) -> None:
+        source_path = source_directory.current_path() / source_name  # type: ignore[attr-defined]
+        destination_path = destination_directory.current_path() / destination_name  # type: ignore[attr-defined]
+        anchored_destinations.append(destination_path)
+        original_rename(source_path, destination_path)
+
     monkeypatch.setattr(pdf_assemble_module.os, "link", unsupported_link)
     monkeypatch.setattr(pdf_assemble_module.os, "rename", tracked_rename)
     monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_move_anchored_file",
+        tracked_windows_move,
+        raising=False,
+    )
     monkeypatch.setattr(flowables_module.os, "link", unsupported_link)
     monkeypatch.setattr(flowables_module, "_IS_WINDOWS", True, raising=False)
 
@@ -511,8 +878,38 @@ def test_assemble_pdf_uses_no_hard_link_fallback_for_windows_compatibility(
 
     assert staged.is_file()
     assert (run_dir / "layout.json").is_file()
-    assert len(rename_destinations) == 3
-    assert rename_destinations[-2:] == [staged, run_dir / "layout.json"]
+    assert len(rename_destinations) == 1
+    assert anchored_destinations == [staged, run_dir / "layout.json"]
+
+
+@pytest.mark.parametrize(
+    ("pointer_size", "root_handle", "root_offset", "length_offset", "name_offset"),
+    [
+        (8, 0x0102030405060708, 8, 16, 20),
+        (4, 0x01020304, 4, 8, 12),
+    ],
+)
+def test_windows_file_rename_info_uses_relative_no_replace_contract(
+    pointer_size: int,
+    root_handle: int,
+    root_offset: int,
+    length_offset: int,
+    name_offset: int,
+) -> None:
+    name = "translated.pdf"
+    encoded = name.encode("utf-16-le")
+
+    payload = pdf_assemble_module._windows_file_rename_information(
+        root_handle,
+        name,
+        pointer_size=pointer_size,
+    )
+
+    assert struct.unpack_from("<I", payload, 0) == (0,)
+    pointer_format = "<Q" if pointer_size == 8 else "<I"
+    assert struct.unpack_from(pointer_format, payload, root_offset) == (root_handle,)
+    assert struct.unpack_from("<I", payload, length_offset) == (len(encoded),)
+    assert payload[name_offset:] == encoded
 
 
 @pytest.mark.parametrize("existing", ["staged-output", "layout.json", "final"])

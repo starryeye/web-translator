@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 from importlib.resources import as_file, files
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
+import struct
 import tempfile
 from typing import Any
 from xml.sax.saxutils import escape
@@ -23,6 +26,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
+import web_translator.pdf_acquire as pdf_acquire_module
 from web_translator.models import Segment, Translation, read_segments
 from web_translator.pdf_flowables import (
     PdfAssemblyError,
@@ -41,8 +45,13 @@ REGULAR_FONT_NAME = "WT-NotoSansKR"
 BOLD_FONT_NAME = "WT-NotoSansKR-Bold"
 BODY_FONT_SIZE = 11.0
 MINIMUM_FONT_SIZE = 9.0
+FONT_LICENSE_SHA256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
 _REPARSE_POINT = 0x400
 _IS_WINDOWS = os.name == "nt"
+_DIRFD_PUBLICATION_SUPPORTED = all(
+    operation in os.supports_dir_fd
+    for operation in (os.link, os.open, os.stat, os.unlink)
+)
 _BASIC_KINDS = {"heading", "paragraph", "list-item"}
 _IGNORED_KINDS = {"header", "footer", "page-number"}
 _ALIGNMENTS = {
@@ -51,6 +60,66 @@ _ALIGNMENTS = {
     "right": TA_RIGHT,
     "justify": TA_JUSTIFY,
 }
+_LIST_MARKER = re.compile(r"^\s*(?P<marker>[-+*•]|\d+(?:\.\d+)*[.)])\s+")
+_LIST_INDENT_TOLERANCE = 3.0
+
+
+@dataclass(slots=True)
+class _DirectoryAnchor:
+    path: Path
+    label: str
+    identity: tuple[int, int]
+    descriptor: int | None
+    path_anchor: object | None = None
+
+    def current_path(self) -> Path:
+        if self.descriptor is not None:
+            resolver = pdf_acquire_module._PosixDirectoryPathAnchor(self.descriptor)
+            return resolver.current_path()
+        if self.path_anchor is None:
+            raise PdfAssemblyError(
+                f"safe {self.label} directory anchor is unavailable: {self.path}"
+            )
+        try:
+            return self.path_anchor.current_path()  # type: ignore[attr-defined]
+        except pdf_acquire_module.PdfAcquireError as error:
+            raise PdfAssemblyError(str(error)) from error
+
+    def verify_visible(self) -> None:
+        try:
+            result = self.path.lstat()
+        except OSError as error:
+            raise PdfAssemblyError(
+                f"{self.label} directory changed identity: {self.path}: {error}"
+            ) from error
+        if (
+            not stat.S_ISDIR(result.st_mode)
+            or _is_reparse_stat(result)
+            or (result.st_dev, result.st_ino) != self.identity
+        ):
+            raise PdfAssemblyError(
+                f"{self.label} directory changed identity: {self.path}"
+            )
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = None
+        if self.path_anchor is not None:
+            try:
+                self.path_anchor.close()  # type: ignore[attr-defined]
+            except (AttributeError, OSError):
+                pass
+            self.path_anchor = None
+
+
+@dataclass(slots=True)
+class _PublishedFile:
+    identity: tuple[int, int]
+    windows_handle: int | None = None
 
 
 def assemble_pdf(
@@ -77,15 +146,23 @@ def assemble_pdf(
     page_size = _select_page_size(document)
 
     temporary: Path | None = None
+    run_anchor: _DirectoryAnchor | None = None
+    temporary_anchor: _DirectoryAnchor | None = None
+    temporary_staging_anchor: _DirectoryAnchor | None = None
+    staging_anchor: _DirectoryAnchor | None = None
     owned_staging_identity: tuple[int, int] | None = None
-    owned_pdf_identity: tuple[int, int] | None = None
-    owned_layout_identity: tuple[int, int] | None = None
+    owned_pdf_identity: _PublishedFile | None = None
+    owned_layout_identity: _PublishedFile | None = None
     staging = run_dir / "staged-output"
-    layout_path = run_dir / "layout.json"
     try:
+        run_anchor = _open_directory_anchor(run_dir, "run")
         temporary = Path(tempfile.mkdtemp(prefix=".pdf-assembling-", dir=run_dir))
+        temporary_anchor = _open_directory_anchor(temporary, "temporary assembly")
         temporary_staging = temporary / "staged-output"
         temporary_staging.mkdir()
+        temporary_staging_anchor = _open_directory_anchor(
+            temporary_staging, "temporary PDF staging"
+        )
         temporary_pdf = temporary_staging / "translated.pdf"
         records = _build_basic_document(
             ordered,
@@ -109,10 +186,26 @@ def assemble_pdf(
 
         staging.mkdir()
         owned_staging_identity = _path_identity(staging)
-        owned_pdf_identity = _publish_new_file(
-            temporary_pdf, staging / "translated.pdf"
+        staging_anchor = _open_directory_anchor(
+            staging,
+            "staging",
+            expected_identity=owned_staging_identity,
         )
-        owned_layout_identity = _publish_new_file(temporary_layout, layout_path)
+        assert temporary_staging_anchor is not None
+        owned_pdf_identity = _publish_new_file(
+            temporary_staging_anchor,
+            "translated.pdf",
+            staging_anchor,
+            "translated.pdf",
+        )
+        assert temporary_anchor is not None
+        assert run_anchor is not None
+        owned_layout_identity = _publish_new_file(
+            temporary_anchor,
+            "layout.json",
+            run_anchor,
+            "layout.json",
+        )
         return staging / "translated.pdf"
     except PdfAssemblyError:
         raise
@@ -123,10 +216,26 @@ def assemble_pdf(
     finally:
         active_exception = __import__("sys").exc_info()[0] is not None
         if active_exception:
-            _remove_owned_file(layout_path, owned_layout_identity)
-            _remove_owned_staging(
-                staging, owned_staging_identity, owned_pdf_identity
+            if run_anchor is not None:
+                _remove_owned_file(run_anchor, "layout.json", owned_layout_identity)
+            if staging_anchor is not None:
+                _remove_owned_file(
+                    staging_anchor, "translated.pdf", owned_pdf_identity
+                )
+        if staging_anchor is not None:
+            staging_anchor.close()
+        if active_exception and run_anchor is not None:
+            _remove_owned_directory(
+                run_anchor, "staged-output", owned_staging_identity
             )
+        _close_published_file(owned_layout_identity)
+        _close_published_file(owned_pdf_identity)
+        if temporary_staging_anchor is not None:
+            temporary_staging_anchor.close()
+        if temporary_anchor is not None:
+            temporary_anchor.close()
+        if run_anchor is not None:
+            run_anchor.close()
         if temporary is not None:
             shutil.rmtree(temporary, ignore_errors=True)
 
@@ -280,15 +389,32 @@ def _build_basic_document(
         page_size.height - top_margin - bottom_margin,
     )
     story: list[Any] = []
+    heading_sizes = sorted(
+        {
+            round(block.style.font_size)
+            for block, _segment, _text in ordered
+            if block.kind == "heading"
+        },
+        reverse=True,
+    )
+    list_levels = _relative_list_levels(ordered)
     try:
         with ExitStack() as stack:
             _register_fonts(stack)
-            for block, segment, text in ordered:
-                font_size, style = _style_for_block(block, segment)
+            for block, _segment, text in ordered:
+                bullet_text: str | None = None
+                rendered_text = text
+                if block.kind == "list-item":
+                    bullet_text, rendered_text = _normalized_list_parts(block, text)
+                font_size, style = _style_for_block(
+                    block,
+                    heading_sizes=heading_sizes,
+                    list_level=list_levels.get(block.id, 0),
+                )
                 paragraph = Paragraph(
-                    escape(text),
+                    escape(rendered_text),
                     style,
-                    bulletText=getattr(style, "bulletText", None),
+                    bulletText=escape(bullet_text) if bullet_text is not None else None,
                 )
                 story.append(
                     TrackedFlowable(
@@ -318,7 +444,10 @@ def _build_basic_document(
             )
             story.append(
                 Paragraph(
-                    f"Source: {escape(source_label)}<br/>Generated: {escape(generated)}",
+                    f'<font name="{BOLD_FONT_NAME}">Source:</font> '
+                    f"{escape(source_label)}<br/>"
+                    f'<font name="{BOLD_FONT_NAME}">Generated:</font> '
+                    f"{escape(generated)}",
                     attribution_style,
                 )
             )
@@ -348,11 +477,14 @@ def _build_basic_document(
 
 
 def _style_for_block(
-    block: PdfBlock, segment: Segment
+    block: PdfBlock,
+    *,
+    heading_sizes: Sequence[int],
+    list_level: int,
 ) -> tuple[float, ParagraphStyle]:
     alignment = _ALIGNMENTS[block.style.alignment]
     if block.kind == "heading":
-        level = max(1, min(6, len(segment.heading_path) or 1))
+        level = _normalized_heading_level(block, heading_sizes)
         font_size = {1: 18.0, 2: 16.0, 3: 14.0, 4: 12.5, 5: 11.5, 6: 11.0}[level]
         return font_size, ParagraphStyle(
             f"WT-Heading-{level}",
@@ -365,12 +497,10 @@ def _style_for_block(
             keepWithNext=True,
         )
     left_indent = 0.0
-    first_indent = 0.0
-    bullet_text: str | None = None
+    bullet_indent = 0.0
     if block.kind == "list-item":
-        left_indent = 18.0 + max(0.0, min(54.0, block.style.indentation))
-        first_indent = -10.0
-        bullet_text = "•"
+        left_indent = (max(0, list_level) + 1) * 18.0
+        bullet_indent = left_indent - BODY_FONT_SIZE * 0.6
     style = ParagraphStyle(
         f"WT-{block.kind}-{block.order}",
         fontName=REGULAR_FONT_NAME,
@@ -380,14 +510,66 @@ def _style_for_block(
         leading=15.0,
         alignment=alignment,
         leftIndent=left_indent,
-        firstLineIndent=first_indent,
+        firstLineIndent=0.0,
+        bulletIndent=bullet_indent,
+        bulletAnchor="end",
         spaceAfter=max(4.0, min(14.0, block.style.space_after)),
     )
-    if bullet_text is not None:
-        # Paragraph accepts bullet text at construction time; keep it on the style
-        # as a private, assembly-only marker consumed by the caller below.
-        style.bulletText = bullet_text
     return BODY_FONT_SIZE, style
+
+
+def _normalized_heading_level(
+    block: PdfBlock, heading_sizes: Sequence[int]
+) -> int:
+    numbered = re.match(r"^(\d+(?:\.\d+)*)[.)]?\s+", block.source_text)
+    if numbered is not None:
+        return max(1, min(6, numbered.group(1).count(".") + 1))
+    rounded_size = round(block.style.font_size)
+    if rounded_size in heading_sizes:
+        return max(1, min(6, heading_sizes.index(rounded_size) + 1))
+    return 1
+
+
+def _normalized_list_parts(block: PdfBlock, text: str) -> tuple[str, str]:
+    source_match = _LIST_MARKER.match(block.source_text)
+    marker = source_match.group("marker") if source_match is not None else "•"
+    translated_match = _LIST_MARKER.match(text)
+    body = text[translated_match.end() :] if translated_match is not None else text
+    if not body.strip():
+        raise PdfAssemblyError(
+            f"translated list item is empty after marker normalization: {block.id}"
+        )
+    return marker, body
+
+
+def _relative_list_levels(
+    ordered: Sequence[tuple[PdfBlock, Segment, str]],
+) -> dict[str, int]:
+    levels: dict[str, int] = {}
+    run: list[PdfBlock] = []
+
+    def assign() -> None:
+        if not run:
+            return
+        clusters: list[float] = []
+        for indentation in sorted(block.style.indentation for block in run):
+            if not clusters or indentation - clusters[-1] > _LIST_INDENT_TOLERANCE:
+                clusters.append(indentation)
+        for block in run:
+            level = min(
+                range(len(clusters)),
+                key=lambda index: abs(block.style.indentation - clusters[index]),
+            )
+            levels[block.id] = level
+        run.clear()
+
+    for block, _segment, _text in ordered:
+        if block.kind == "list-item":
+            run.append(block)
+        else:
+            assign()
+    assign()
+    return levels
 
 
 def _register_fonts(stack: ExitStack) -> None:
@@ -408,6 +590,22 @@ def _register_fonts(stack: ExitStack) -> None:
     outputs = provenance.get("outputs")
     if not isinstance(outputs, Mapping):
         raise PdfAssemblyError("bundled font provenance outputs are invalid")
+    license_record = provenance.get("license")
+    if not isinstance(license_record, Mapping) or set(license_record) != {
+        "planned_url",
+        "planned_url_status",
+        "sha256",
+        "url",
+    }:
+        raise PdfAssemblyError("bundled font provenance license is invalid")
+    if license_record.get("sha256") != FONT_LICENSE_SHA256:
+        raise PdfAssemblyError("bundled font license provenance hash is invalid")
+    try:
+        license_data = root.joinpath("OFL.txt").read_bytes()
+    except OSError as error:
+        raise PdfAssemblyError(f"cannot read bundled font license: {error}") from error
+    if hashlib.sha256(license_data).hexdigest() != FONT_LICENSE_SHA256:
+        raise PdfAssemblyError("bundled font license hash mismatch")
     for registered_name, filename in (
         (REGULAR_FONT_NAME, "NotoSansKR-Regular.ttf"),
         (BOLD_FONT_NAME, "NotoSansKR-Bold.ttf"),
@@ -482,9 +680,11 @@ def _is_link_or_reparse(path: Path) -> bool:
         metadata = path.lstat()
     except OSError:
         return False
-    return stat.S_ISLNK(metadata.st_mode) or bool(
-        getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT
-    )
+    return stat.S_ISLNK(metadata.st_mode) or _is_reparse_stat(metadata)
+
+
+def _is_reparse_stat(metadata: os.stat_result) -> bool:
+    return bool(getattr(metadata, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def _path_identity(path: Path) -> tuple[int, int]:
@@ -492,63 +692,356 @@ def _path_identity(path: Path) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
-def _publish_new_file(source: Path, destination: Path) -> tuple[int, int]:
-    source_identity = _path_identity(source)
+def _open_directory_anchor(
+    path: Path,
+    label: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> _DirectoryAnchor:
     try:
-        os.link(source, destination)
-        return source_identity
-    except FileExistsError as error:
-        raise PdfAssemblyError(f"assembly destination already exists: {destination}") from error
-    except (AttributeError, NotImplementedError, OSError) as link_error:
-        if not _IS_WINDOWS:
-            raise PdfAssemblyError(
-                f"safe assembly publication unavailable: {destination}: {link_error}"
-            ) from link_error
-    try:
-        # Windows rename is atomic and refuses an existing destination. It is
-        # the no-overwrite fallback when hard links are unavailable there.
-        os.rename(source, destination)
-        return source_identity
-    except FileExistsError as error:
-        raise PdfAssemblyError(f"assembly destination already exists: {destination}") from error
+        visible = path.lstat()
     except OSError as error:
-        if destination.exists() or destination.is_symlink():
+        raise PdfAssemblyError(f"cannot inspect {label} directory {path}: {error}") from error
+    identity = (visible.st_dev, visible.st_ino)
+    if (
+        not stat.S_ISDIR(visible.st_mode)
+        or _is_reparse_stat(visible)
+        or (expected_identity is not None and identity != expected_identity)
+    ):
+        raise PdfAssemblyError(f"{label} directory changed identity: {path}")
+
+    descriptor: int | None = None
+    path_anchor: object | None = None
+    try:
+        if os.name != "nt" and _DIRFD_PUBLICATION_SUPPORTED:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or _is_reparse_stat(opened)
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise PdfAssemblyError(f"{label} directory changed identity: {path}")
+        else:
+            path_anchor = pdf_acquire_module._open_fallback_run_anchor(path)
+            current = path_anchor.current_path()  # type: ignore[attr-defined]
+            opened = current.lstat()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or _is_reparse_stat(opened)
+                or (opened.st_dev, opened.st_ino) != identity
+            ):
+                raise PdfAssemblyError(f"{label} directory changed identity: {path}")
+        return _DirectoryAnchor(path, label, identity, descriptor, path_anchor)
+    except PdfAssemblyError:
+        if descriptor is not None:
+            os.close(descriptor)
+        if path_anchor is not None:
+            path_anchor.close()  # type: ignore[attr-defined]
+        raise
+    except (pdf_acquire_module.PdfAcquireError, NotImplementedError, OSError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if path_anchor is not None:
+            path_anchor.close()  # type: ignore[attr-defined]
+        raise PdfAssemblyError(
+            f"safe {label} directory anchor unavailable: {path}: {error}"
+        ) from error
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if path_anchor is not None:
+            path_anchor.close()  # type: ignore[attr-defined]
+        raise
+
+
+def _anchored_entry_stat(anchor: _DirectoryAnchor, name: str) -> os.stat_result:
+    if Path(name).name != name:
+        raise PdfAssemblyError(f"unsafe anchored assembly name: {name}")
+    try:
+        if anchor.descriptor is not None:
+            return os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
+        return os.lstat(anchor.current_path() / name)
+    except (NotImplementedError, OSError) as error:
+        raise PdfAssemblyError(
+            f"cannot inspect anchored assembly artifact {anchor.path / name}: {error}"
+        ) from error
+
+
+def _anchored_regular_file_stat(
+    anchor: _DirectoryAnchor, name: str
+) -> os.stat_result:
+    result = _anchored_entry_stat(anchor, name)
+    if not stat.S_ISREG(result.st_mode) or _is_reparse_stat(result):
+        raise PdfAssemblyError(
+            f"anchored assembly artifact is not a regular file: {anchor.path / name}"
+        )
+    return result
+
+
+def _publish_new_file(
+    source_directory: _DirectoryAnchor,
+    source_name: str,
+    destination_directory: _DirectoryAnchor,
+    destination_name: str,
+) -> _PublishedFile:
+    source = _anchored_regular_file_stat(source_directory, source_name)
+    source_identity = (source.st_dev, source.st_ino)
+    destination = destination_directory.path / destination_name
+    published = _PublishedFile(source_identity)
+    visible = False
+    try:
+        # Treat the destination name as potentially owned before entering the
+        # publication syscall so a post-syscall BaseException still cleans by
+        # exact source inode/handle. A raced foreign inode never matches.
+        visible = True
+        if _IS_WINDOWS:
+            published.windows_handle = _windows_move_anchored_file(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
+        elif (
+            source_directory.descriptor is not None
+            and destination_directory.descriptor is not None
+        ):
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_directory.descriptor,
+                dst_dir_fd=destination_directory.descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            raise PdfAssemblyError(
+                f"safe anchored assembly publication unavailable: {destination}"
+            )
+        result = _anchored_regular_file_stat(
+            destination_directory, destination_name
+        )
+        if (result.st_dev, result.st_ino) != source_identity:
+            raise PdfAssemblyError(
+                f"assembly destination changed identity: {destination}"
+            )
+        destination_directory.verify_visible()
+        return published
+    except FileExistsError as error:
+        raise PdfAssemblyError(f"assembly destination already exists: {destination}") from error
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError) as error:
+        raise PdfAssemblyError(
+            f"safe anchored assembly publication unavailable: {destination}: {error}"
+        ) from error
+    finally:
+        if visible and __import__("sys").exc_info()[0] is not None:
+            _remove_owned_file(destination_directory, destination_name, published)
+
+
+def _windows_move_anchored_file(
+    source_directory: _DirectoryAnchor,
+    source_name: str,
+    destination_directory: _DirectoryAnchor,
+    destination_name: str,
+) -> int:
+    destination = destination_directory.path / destination_name
+    if os.name != "nt":
+        raise PdfAssemblyError("Windows anchored publication is unavailable")
+    path_anchor = destination_directory.path_anchor
+    destination_handle = getattr(path_anchor, "handle", None)
+    if not isinstance(destination_handle, int):
+        raise PdfAssemblyError(
+            f"safe Windows destination handle unavailable: {destination_directory.path}"
+        )
+    source_path = source_directory.current_path() / source_name
+    source_handle: int | None = None
+    keep_handle = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        raw_handle = create_file(
+            str(source_path),
+            0x00010000 | 0x00000080,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x00000080 | 0x00200000,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if raw_handle in (None, invalid_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        source_handle = int(raw_handle)
+
+        payload = _windows_file_rename_information(
+            destination_handle,
+            destination_name,
+        )
+        buffer_size = len(payload)
+        buffer = ctypes.create_string_buffer(payload, buffer_size)
+        set_information = kernel32.SetFileInformationByHandle
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        if not set_information(source_handle, 3, buffer, buffer_size):
+            raise ctypes.WinError(ctypes.get_last_error())
+        keep_handle = True
+        return source_handle
+    except OSError as error:
+        if getattr(error, "winerror", None) in {80, 183}:
             raise PdfAssemblyError(
                 f"assembly destination already exists: {destination}"
             ) from error
-        raise PdfAssemblyError(f"cannot publish assembly artifact: {error}") from error
+        raise PdfAssemblyError(
+            f"safe Windows anchored publication unavailable: {destination}: {error}"
+        ) from error
+    except (AttributeError, NotImplementedError) as error:
+        raise PdfAssemblyError(
+            f"safe Windows anchored publication unavailable: {destination}: {error}"
+        ) from error
+    finally:
+        if source_handle is not None and not keep_handle:
+            pdf_acquire_module._close_windows_handle(source_handle)
 
 
-def _remove_owned_file(path: Path, identity: tuple[int, int] | None) -> None:
-    if identity is None:
+def _windows_file_rename_information(
+    root_handle: int,
+    destination_name: str,
+    *,
+    pointer_size: int | None = None,
+) -> bytes:
+    if Path(destination_name).name != destination_name:
+        raise PdfAssemblyError(
+            f"unsafe Windows anchored assembly name: {destination_name}"
+        )
+    if pointer_size is None:
+        import ctypes
+
+        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    if pointer_size not in {4, 8}:
+        raise PdfAssemblyError(
+            f"unsupported Windows pointer size for assembly: {pointer_size}"
+        )
+    encoded_name = destination_name.encode("utf-16-le")
+    root_offset = 4 if pointer_size == 4 else 8
+    length_offset = root_offset + pointer_size
+    name_offset = length_offset + 4
+    payload = bytearray(name_offset + len(encoded_name))
+    struct.pack_into("<I", payload, 0, 0)
+    struct.pack_into(
+        "<I" if pointer_size == 4 else "<Q",
+        payload,
+        root_offset,
+        root_handle,
+    )
+    struct.pack_into("<I", payload, length_offset, len(encoded_name))
+    payload[name_offset:] = encoded_name
+    return bytes(payload)
+
+
+def _windows_delete_open_file(handle: int) -> None:
+    if os.name != "nt":
         return
     try:
-        if _path_identity(path) == identity and not _is_link_or_reparse(path):
-            path.unlink()
-    except OSError:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileDispositionInfo(ctypes.Structure):
+            _fields_ = (("delete_file", wintypes.BOOL),)
+
+        information = FileDispositionInfo(True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        set_information = kernel32.SetFileInformationByHandle
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        set_information(
+            handle,
+            4,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        )
+    except (AttributeError, OSError):
         return
 
 
-def _remove_owned_staging(
-    path: Path,
+def _close_published_file(published: _PublishedFile | None) -> None:
+    if published is None or published.windows_handle is None:
+        return
+    pdf_acquire_module._close_windows_handle(published.windows_handle)
+    published.windows_handle = None
+
+
+def _remove_owned_file(
+    directory: _DirectoryAnchor,
+    name: str,
+    published: _PublishedFile | None,
+) -> None:
+    if published is None:
+        return
+    if published.windows_handle is not None:
+        _windows_delete_open_file(published.windows_handle)
+        _close_published_file(published)
+        return
+    try:
+        result = _anchored_regular_file_stat(directory, name)
+        if (result.st_dev, result.st_ino) != published.identity:
+            return
+        if directory.descriptor is not None:
+            os.unlink(name, dir_fd=directory.descriptor)
+        else:
+            (directory.current_path() / name).unlink()
+    except (PdfAssemblyError, NotImplementedError, OSError):
+        return
+
+
+def _remove_owned_directory(
+    parent: _DirectoryAnchor,
+    name: str,
     identity: tuple[int, int] | None,
-    translated_identity: tuple[int, int] | None,
 ) -> None:
     if identity is None:
         return
     try:
-        if _path_identity(path) != identity or _is_link_or_reparse(path):
-            return
-        translated = path / "translated.pdf"
+        result = _anchored_entry_stat(parent, name)
         if (
-            translated_identity is not None
-            and translated.is_file()
-            and not _is_link_or_reparse(translated)
-            and _path_identity(translated) == translated_identity
+            not stat.S_ISDIR(result.st_mode)
+            or _is_reparse_stat(result)
+            or (result.st_dev, result.st_ino) != identity
         ):
-            translated.unlink()
-        path.rmdir()
-    except OSError:
+            return
+        if parent.descriptor is not None:
+            os.rmdir(name, dir_fd=parent.descriptor)
+        else:
+            os.rmdir(parent.current_path() / name)
+    except (PdfAssemblyError, NotImplementedError, OSError):
         return
 
 

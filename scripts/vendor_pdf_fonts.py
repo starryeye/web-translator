@@ -35,6 +35,7 @@ FONT_LICENSE_URL = (
     "https://raw.githubusercontent.com/notofonts/noto-cjk/"
     "f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE"
 )
+FONT_LICENSE_SHA256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
 
 UNICODE_RANGES = (
     ("ASCII", 0x0000, 0x007F),
@@ -143,6 +144,12 @@ def vendor_fonts(
             "source SHA-256 mismatch: "
             f"expected {FONT_SOURCE_SHA256}, found {actual_source_hash}"
         )
+    actual_license_hash = _sha256(license_bytes)
+    if actual_license_hash != FONT_LICENSE_SHA256:
+        raise FontVendoringError(
+            "license SHA-256 mismatch: "
+            f"expected {FONT_LICENSE_SHA256}, found {actual_license_hash}"
+        )
     try:
         license_text = license_bytes.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -176,6 +183,7 @@ def vendor_fonts(
             "license": {
                 "planned_url": PLANNED_FONT_LICENSE_URL,
                 "planned_url_status": PLANNED_FONT_LICENSE_URL_STATUS,
+                "sha256": FONT_LICENSE_SHA256,
                 "url": FONT_LICENSE_URL,
             },
             "outputs": outputs,
