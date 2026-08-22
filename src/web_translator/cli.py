@@ -38,6 +38,7 @@ from web_translator.models import (
 )
 from web_translator.paths import validate_public_url
 from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
+from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
 from web_translator.pdf_extract import PdfExtractionError, extract_pdf
 from web_translator.pdf_models import PdfContractError, PdfSourceRecord
 from web_translator.qa import run_qa
@@ -131,7 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(command, EXIT_CAPTURE_FAILURE, error)
     except (CLIContractError, PdfExtractionError, TranslationContractError) as error:
         return _fail(command, EXIT_CONTRACT_FAILURE, error)
-    except AssemblyError as error:
+    except (AssemblyError, PdfAssemblyError) as error:
         return _fail(command, EXIT_ASSEMBLY_FAILURE, error)
     except QAFailure as error:
         return _fail(command, EXIT_QA_FAILURE, error)
@@ -196,6 +197,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_dir(assemble)
     _add_output_dir(assemble)
     assemble.set_defaults(handler=_assemble_command)
+
+    pdf_assemble = subparsers.add_parser(
+        "pdf-assemble", help="Assemble a reviewed PDF into private staging."
+    )
+    _add_run_dir(pdf_assemble)
+    _add_output_dir(pdf_assemble)
+    pdf_assemble.set_defaults(handler=_pdf_assemble_command)
 
     qa = subparsers.add_parser("qa", help="Run deterministic and browser QA.")
     _add_run_dir(qa)
@@ -566,6 +574,22 @@ def _assemble_command(args: argparse.Namespace) -> None:
         args.output_dir,
         capture["final_url"],
     )
+
+
+def _pdf_assemble_command(args: argparse.Namespace) -> None:
+    _validate_run_root(args.run_dir)
+    segments = _read_segments(args.run_dir)
+    zones = _read_zones(args.run_dir)
+    result_dir = _validate_translation_files(args.run_dir, zones)
+    translations = merge_translations(segments, zones, result_dir)
+    review = _read_review(args.run_dir / "review.json", zones)
+    if review.unresolved_required:
+        raise PdfAssemblyError(
+            "semantic review has unresolved required findings: "
+            + ", ".join(review.unresolved_required)
+        )
+    glossary = _read_glossary(args.run_dir / "glossary.json")
+    assemble_pdf(args.run_dir, translations, glossary, args.output_dir)
 
 
 def _qa_command(args: argparse.Namespace) -> None:

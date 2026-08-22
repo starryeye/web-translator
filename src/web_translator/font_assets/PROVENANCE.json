@@ -1,0 +1,71 @@
+{
+  "license": {
+    "planned_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/LICENSE",
+    "planned_url_status": 404,
+    "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE"
+  },
+  "outputs": {
+    "NotoSansKR-Bold.ttf": {
+      "axes": {
+        "wght": 700
+      },
+      "sha256": "df5ef3d0a6d9cca010b8ee2b3b54d901f111a82fc7f62c452756fa779fb2f331"
+    },
+    "NotoSansKR-Regular.ttf": {
+      "axes": {
+        "wght": 400
+      },
+      "sha256": "074380419d8a6980515719cb2db8906164ea003ed021e1454e6f3134a8ac6528"
+    }
+  },
+  "schema_version": "1.0",
+  "source_sha256": "7715af52f5fe77153ce5678546258993982d2da61abea8d25fb89eb5aaec5ca6",
+  "source_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/Variable/TTF/NotoSansCJKkr-VF.ttf",
+  "unicode_ranges": [
+    {
+      "end": "U+007F",
+      "name": "ASCII",
+      "start": "U+0000"
+    },
+    {
+      "end": "U+00FF",
+      "name": "Latin-1",
+      "start": "U+0080"
+    },
+    {
+      "end": "U+11FF",
+      "name": "Hangul Jamo",
+      "start": "U+1100"
+    },
+    {
+      "end": "U+206F",
+      "name": "General Punctuation",
+      "start": "U+2000"
+    },
+    {
+      "end": "U+20CF",
+      "name": "Currency Symbols",
+      "start": "U+20A0"
+    },
+    {
+      "end": "U+21FF",
+      "name": "Arrows",
+      "start": "U+2190"
+    },
+    {
+      "end": "U+303F",
+      "name": "CJK Symbols and Punctuation",
+      "start": "U+3000"
+    },
+    {
+      "end": "U+318F",
+      "name": "Hangul Compatibility Jamo",
+      "start": "U+3130"
+    },
+    {
+      "end": "U+D7A3",
+      "name": "Hangul Syllables",
+      "start": "U+AC00"
+    }
+  ]
+}

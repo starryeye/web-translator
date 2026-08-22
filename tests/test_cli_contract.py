@@ -16,7 +16,14 @@ from web_translator.cli import (
     _read_review,
     main,
 )
-from web_translator.models import MasterReview, QAResult, Segment
+from web_translator.models import MasterReview, QAResult, Segment, Translation, write_segments
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfBlockStyle,
+    PdfDocument,
+    PdfPage,
+    PdfSourceRecord,
+)
 from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
@@ -29,6 +36,173 @@ REVIEW_DIMENSIONS = (
     "boundary_consistency",
     "protected_content",
 )
+
+
+def _write_pdf_assembly_cli_run(run_dir: Path) -> None:
+    run_dir.mkdir()
+    block = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(72.0, 72.0, 540.0, 96.0),
+        style=PdfBlockStyle(11.0, False, "left", 0.0, 8.0),
+        source_text="Selectable text",
+        segment_id="seg-000001",
+    )
+    document = PdfDocument(
+        schema_version="1.0",
+        source_sha256="a" * 64,
+        page_count=1,
+        selectable_characters=15,
+        scan_candidate_pages=[],
+        pages=[PdfPage(number=1, width=612.0, height=792.0, rotation=0)],
+        blocks=[block],
+        table_cells=[],
+    )
+    source = PdfSourceRecord(
+        schema_version="1.0",
+        input_kind="local",
+        requested_source="source.pdf",
+        final_source="source.pdf",
+        content_type="application/pdf",
+        byte_length=123,
+        sha256="a" * 64,
+        acquired_at="2026-08-21T01:02:03Z",
+        redirects=[],
+        warnings=[],
+    )
+    segment = Segment(
+        id="seg-000001",
+        locator=block.id,
+        semantic_type="paragraph",
+        heading_path=[],
+        source_text=block.source_text,
+        protected=[],
+        context_ids=[],
+        target=True,
+    )
+    _write_json(run_dir / "document.json", document.to_dict())
+    _write_json(run_dir / "source.json", source.to_dict())
+    write_segments(run_dir / "segments.jsonl", [segment])
+    _write_json(run_dir / "glossary.json", {})
+    zones = run_dir / "zones"
+    zones.mkdir()
+    _write_json(
+        zones / "zone-001.json",
+        {
+            "attempt": 0,
+            "context_after_ids": [],
+            "context_before_ids": [],
+            "expected_tokens": {"seg-000001": []},
+            "heading_path": [],
+            "id": "zone-001",
+            "target_ids": ["seg-000001"],
+        },
+    )
+    translations = run_dir / "translations"
+    translations.mkdir()
+    (translations / "zone-001.jsonl").write_text(
+        json.dumps(
+            Translation("seg-000001", "한국어 본문").to_dict(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_json(run_dir / "review.json", _review_payload())
+
+
+def test_pdf_assemble_cli_requires_review_and_stages_without_publishing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    _write_pdf_assembly_cli_run(run_dir)
+    final_output = tmp_path / "translated-pdfs" / "result"
+
+    exit_code = main(
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
+    )
+
+    assert exit_code == 0
+    assert (run_dir / "staged-output" / "translated.pdf").is_file()
+    assert (run_dir / "layout.json").is_file()
+    assert not final_output.exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-assemble",
+        "exit_code": 0,
+        "status": "ok",
+    }
+
+
+def test_pdf_assemble_cli_rejects_missing_semantic_review_before_staging(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    _write_pdf_assembly_cli_run(run_dir)
+    (run_dir / "review.json").unlink()
+
+    exit_code = main(
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+    )
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run_dir / "staged-output").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-assemble",
+        "exit_code": cli_module.EXIT_CONTRACT_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_assemble_cli_rejects_unresolved_semantic_review_as_assembly_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    _write_pdf_assembly_cli_run(run_dir)
+    review = _review_payload()
+    review["section_findings"]["zone-001"][0]["verdict"] = "required-fix"
+    review["unresolved_required"] = ["zone-001:semantic_fidelity"]
+    _write_json(run_dir / "review.json", review)
+
+    exit_code = main(
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+    )
+
+    assert exit_code == cli_module.EXIT_ASSEMBLY_FAILURE
+    assert not (run_dir / "staged-output").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-assemble",
+        "exit_code": cli_module.EXIT_ASSEMBLY_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_assemble_cli_maps_pdf_assembly_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    _write_pdf_assembly_cli_run(run_dir)
+
+    def fail_assembly(*args: object, **kwargs: object) -> Path:
+        from web_translator.pdf_assemble import PdfAssemblyError
+
+        raise PdfAssemblyError("font embedding failed")
+
+    monkeypatch.setattr(cli_module, "assemble_pdf", fail_assembly)
+
+    exit_code = main(
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+    )
+
+    assert exit_code == cli_module.EXIT_ASSEMBLY_FAILURE
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-assemble",
+        "exit_code": cli_module.EXIT_ASSEMBLY_FAILURE,
+        "status": "error",
+    }
 
 
 def test_pdf_extract_cli_publishes_document_segments_and_media_atomically(
