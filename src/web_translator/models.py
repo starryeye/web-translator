@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 
 
 class SegmentContractError(ValueError):
@@ -281,23 +281,28 @@ def write_segments(path: Path, segments: Iterable[Segment]) -> None:
 def read_segments(path: Path) -> list[Segment]:
     """Read UTF-8 JSON Lines segments written by :func:`write_segments`."""
     with path.open(encoding="utf-8") as stream:
-        segments: list[Segment] = []
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise SegmentContractError(
-                    f"segments JSONL line {line_number}: invalid JSON"
-                ) from error
-            try:
-                segments.append(Segment.from_dict(record))
-            except ValueError as error:
-                raise SegmentContractError(
-                    f"segments JSONL line {line_number}: {error}"
-                ) from error
-        return segments
+        return read_segments_stream(stream)
+
+
+def read_segments_stream(stream: TextIO) -> list[Segment]:
+    """Read strict UTF-8-decoded JSON Lines from an already-open stream."""
+    segments: list[Segment] = []
+    for line_number, line in enumerate(stream, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SegmentContractError(
+                f"segments JSONL line {line_number}: invalid JSON"
+            ) from error
+        try:
+            segments.append(Segment.from_dict(record))
+        except ValueError as error:
+            raise SegmentContractError(
+                f"segments JSONL line {line_number}: {error}"
+            ) from error
+    return segments
 
 
 def _protected_token_from_dict(data: object, context: str) -> ProtectedToken:

@@ -611,6 +611,256 @@ def test_assemble_pdf_creates_children_only_in_held_run_directory(
     )
 
 
+def test_assemble_pdf_opens_run_anchor_before_reading_any_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    original_run = run_dir.with_name("original-run")
+    original_open = pdf_assemble_module._open_directory_anchor
+    swapped = False
+
+    def swap_before_open(
+        path: Path,
+        label: str,
+        **kwargs: object,
+    ) -> object:
+        nonlocal swapped
+        if label == "run" and not swapped:
+            swapped = True
+            run_dir.rename(original_run)
+            run_dir.mkdir()
+        return original_open(path, label, **kwargs)
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_open_directory_anchor",
+        swap_before_open,
+    )
+
+    with pytest.raises(PdfAssemblyError, match="PDF document"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    for directory in (original_run, run_dir):
+        assert not (directory / "staged-output").exists()
+        assert not (directory / "layout.json").exists()
+        assert not any(
+            child.name.startswith(".pdf-assembling-")
+            for child in directory.iterdir()
+        )
+
+
+def test_assemble_pdf_rejects_symlink_swapped_before_anchored_input_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not pdf_assemble_module._DIRFD_PUBLICATION_SUPPORTED:
+        pytest.skip("POSIX dirfd input-open regression")
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = run_dir / "document.json"
+    original_document = run_dir / "original-document.json"
+    outside_document = tmp_path / "outside-document.json"
+    outside_document.write_bytes(document.read_bytes())
+    original_open = pdf_assemble_module.os.open
+    swapped = False
+
+    def swap_before_input_open(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == "document.json" and dir_fd is not None and not swapped:
+            swapped = True
+            document.rename(original_document)
+            document.symlink_to(outside_document)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pdf_assemble_module.os, "open", swap_before_input_open)
+
+    with pytest.raises(PdfAssemblyError, match="PDF document"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert document.is_symlink()
+    assert outside_document.read_bytes() == original_document.read_bytes()
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_rejects_input_name_swapped_after_anchored_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not pdf_assemble_module._DIRFD_PUBLICATION_SUPPORTED:
+        pytest.skip("POSIX dirfd input-open regression")
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = run_dir / "document.json"
+    opened_document = run_dir / "opened-document.json"
+    original_open = pdf_assemble_module.os.open
+    swapped = False
+
+    def swap_after_input_open(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "document.json" and dir_fd is not None and not swapped:
+            swapped = True
+            payload = document.read_bytes()
+            document.rename(opened_document)
+            document.write_bytes(payload)
+        return descriptor
+
+    monkeypatch.setattr(pdf_assemble_module.os, "open", swap_after_input_open)
+
+    with pytest.raises(PdfAssemblyError, match="changed identity"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert document.read_bytes() == opened_document.read_bytes()
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_rechecks_all_open_input_names_as_one_evidence_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not pdf_assemble_module._DIRFD_PUBLICATION_SUPPORTED:
+        pytest.skip("POSIX dirfd input-open regression")
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = run_dir / "document.json"
+    opened_document = run_dir / "opened-document.json"
+    original_open = pdf_assemble_module.os.open
+    swapped = False
+
+    def swap_document_while_opening_source(
+        path: str | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if path == "source.json" and dir_fd is not None and not swapped:
+            swapped = True
+            payload = document.read_bytes()
+            document.rename(opened_document)
+            document.write_bytes(payload)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        pdf_assemble_module.os,
+        "open",
+        swap_document_while_opening_source,
+    )
+
+    with pytest.raises(PdfAssemblyError, match="document.json"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_posix_anchored_input_closes_descriptor_if_stream_conversion_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not pdf_assemble_module._DIRFD_PUBLICATION_SUPPORTED:
+        pytest.skip("POSIX dirfd input-open regression")
+    run_dir, _translations, _glossary = _assembly_run(tmp_path)
+    anchor = pdf_assemble_module._open_directory_anchor(run_dir, "run")
+    original_fdopen = pdf_assemble_module.os.fdopen
+    captured_descriptor: int | None = None
+
+    def interrupt_fdopen(
+        descriptor: int, mode: str = "r", *args: object, **kwargs: object
+    ) -> object:
+        nonlocal captured_descriptor
+        if mode == "rb":
+            captured_descriptor = descriptor
+            raise KeyboardInterrupt()
+        return original_fdopen(descriptor, mode, *args, **kwargs)
+
+    monkeypatch.setattr(pdf_assemble_module.os, "fdopen", interrupt_fdopen)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            pdf_assemble_module._open_anchored_input_file(
+                anchor,
+                "document.json",
+                "PDF document",
+            )
+        assert captured_descriptor is not None
+        with pytest.raises(OSError):
+            os.fstat(captured_descriptor)
+    finally:
+        anchor.close()
+
+
+def test_assemble_pdf_closes_input_and_run_handles_on_read_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not pdf_assemble_module._DIRFD_PUBLICATION_SUPPORTED:
+        pytest.skip("POSIX dirfd input-open regression")
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    original_anchor_open = pdf_assemble_module._open_directory_anchor
+    original_fdopen = pdf_assemble_module.os.fdopen
+    input_descriptor: int | None = None
+    run_descriptor: int | None = None
+
+    class InterruptingInput:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+
+        @property
+        def closed(self) -> bool:
+            return bool(self.stream.closed)  # type: ignore[attr-defined]
+
+        def read(self, *_args: object, **_kwargs: object) -> bytes:
+            raise KeyboardInterrupt()
+
+        def seek(self, *args: object, **kwargs: object) -> int:
+            return int(self.stream.seek(*args, **kwargs))  # type: ignore[attr-defined]
+
+        def close(self) -> None:
+            self.stream.close()  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return int(self.stream.fileno())  # type: ignore[attr-defined]
+
+    def capture_anchor(path: Path, label: str, **kwargs: object) -> object:
+        nonlocal run_descriptor
+        anchor = original_anchor_open(path, label, **kwargs)
+        if label == "run":
+            run_descriptor = anchor.descriptor
+        return anchor
+
+    def interrupting_fdopen(
+        descriptor: int, mode: str = "r", *args: object, **kwargs: object
+    ) -> object:
+        nonlocal input_descriptor
+        stream = original_fdopen(descriptor, mode, *args, **kwargs)
+        if mode == "rb" and input_descriptor is None:
+            input_descriptor = descriptor
+            return InterruptingInput(stream)
+        return stream
+
+    monkeypatch.setattr(pdf_assemble_module, "_open_directory_anchor", capture_anchor)
+    monkeypatch.setattr(pdf_assemble_module.os, "fdopen", interrupting_fdopen)
+
+    with pytest.raises(KeyboardInterrupt):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert input_descriptor is not None
+    assert run_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(input_descriptor)
+    with pytest.raises(OSError):
+        os.fstat(run_descriptor)
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
 def test_assemble_pdf_writes_reportlab_through_open_anchored_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1001,7 +1251,7 @@ def test_assemble_pdf_does_not_replace_raced_staged_file(
     assert not (run_dir / "layout.json").exists()
 
 
-def test_assemble_pdf_fails_closed_without_anchored_child_creation(
+def test_assemble_pdf_fails_closed_without_anchored_run_operations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir, translations, glossary = _assembly_run(tmp_path)
@@ -1011,7 +1261,7 @@ def test_assemble_pdf_fails_closed_without_anchored_child_creation(
         False,
     )
 
-    with pytest.raises(PdfAssemblyError, match="anchored child creation unavailable"):
+    with pytest.raises(PdfAssemblyError, match="anchored destination check unavailable"):
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert not (run_dir / "staged-output").exists()
@@ -1075,6 +1325,22 @@ def test_windows_file_rename_info_uses_relative_no_replace_contract(
             {
                 "create_disposition": 1,
                 "create_options": 0x00000020 | 0x00000040 | 0x00200000,
+                "file_attributes": 0,
+            },
+        ),
+        (
+            "_windows_open_relative_read_file",
+            {
+                "create_disposition": 1,
+                "create_options": 0x00000020 | 0x00000040 | 0x00200000,
+                "file_attributes": 0,
+            },
+        ),
+        (
+            "_windows_open_relative_entry",
+            {
+                "create_disposition": 1,
+                "create_options": 0x00000020 | 0x00200000,
                 "file_attributes": 0,
             },
         ),
@@ -1187,6 +1453,166 @@ def test_windows_nt_create_passes_relative_root_name_and_create_contract(
     }
 
 
+def test_windows_nt_relative_open_preserves_missing_entry_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    class FakeNtdll:
+        NtCreateFile = FakeCall(lambda *_args: -1)
+        RtlNtStatusToDosError = FakeCall(lambda _status: 2)
+
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeNtdll(),
+        raising=False,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        pdf_assemble_module._windows_nt_create_relative(
+            41,
+            "layout.json",
+            desired_access=0x00100080,
+            create_disposition=1,
+            create_options=0x00200020,
+            file_attributes=0,
+        )
+
+
+def test_windows_anchored_destination_absence_uses_root_handle_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    result = directory.lstat()
+    calls: list[tuple[int, str]] = []
+    closed: list[int] = []
+
+    class FakeAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return directory
+
+        def close(self) -> None:
+            return None
+
+    anchor = pdf_assemble_module._DirectoryAnchor(
+        directory,
+        "run",
+        (result.st_dev, result.st_ino),
+        None,
+        FakeAnchor(),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+
+    def existing(root_handle: int, name: str) -> int:
+        calls.append((root_handle, name))
+        return 707
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_entry",
+        existing,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(PdfAssemblyError, match="already exists"):
+        pdf_assemble_module._require_anchored_name_absent(anchor, "layout.json")
+
+    assert calls == [(41, "layout.json")]
+    assert closed == [707]
+
+    def missing(_root_handle: int, name: str) -> int:
+        raise FileNotFoundError(name)
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_entry",
+        missing,
+        raising=False,
+    )
+    pdf_assemble_module._require_anchored_name_absent(anchor, "staged-output")
+
+
+def test_windows_input_identity_verification_uses_read_only_relative_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    result = directory.lstat()
+    calls: list[tuple[int, str]] = []
+    closed: list[int] = []
+
+    class FakeAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return directory
+
+        def close(self) -> None:
+            return None
+
+    anchor = pdf_assemble_module._DirectoryAnchor(
+        directory,
+        "run",
+        (result.st_dev, result.st_ino),
+        None,
+        FakeAnchor(),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+
+    def read_only_open(root_handle: int, name: str) -> int:
+        calls.append((root_handle, name))
+        return 808
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_read_file",
+        read_only_open,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_file",
+        lambda *_args: pytest.fail("input verification requested DELETE access"),
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_file_identity",
+        lambda _handle, *, require_regular: (7, 11),
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    pdf_assemble_module._verify_anchored_input_identity(
+        anchor,
+        "document.json",
+        (7, 11),
+    )
+
+    assert calls == [(41, "document.json")]
+    assert closed == [808]
+
+
 def test_windows_relative_open_closes_handle_if_native_call_interrupts_after_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1235,6 +1661,65 @@ def test_windows_relative_open_closes_handle_if_native_call_interrupts_after_cre
         )
 
     assert closed == [909]
+
+
+def test_windows_anchored_input_closes_native_handle_if_stream_conversion_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    (directory / "document.json").write_text("{}", encoding="utf-8")
+    result = directory.lstat()
+    closed: list[int] = []
+
+    class FakeAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return directory
+
+        def close(self) -> None:
+            return None
+
+    class FakeMsvcrt:
+        @staticmethod
+        def open_osfhandle(_handle: int, _flags: int) -> int:
+            raise KeyboardInterrupt()
+
+    anchor = pdf_assemble_module._DirectoryAnchor(
+        directory,
+        "run",
+        (result.st_dev, result.st_ino),
+        None,
+        FakeAnchor(),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_read_file",
+        lambda _root, _name: 919,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_file_identity",
+        lambda _handle, *, require_regular: (7, 11),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt())
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pdf_assemble_module._open_anchored_input_file(
+            anchor,
+            "document.json",
+            "PDF document",
+        )
+
+    assert closed == [919]
 
 
 def test_windows_child_creation_closes_handle_if_anchor_construction_interrupts(

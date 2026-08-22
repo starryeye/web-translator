@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
 from importlib.resources import as_file, files
+import io
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,12 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 import web_translator.pdf_acquire as pdf_acquire_module
-from web_translator.models import Segment, Translation, read_segments
+from web_translator.models import (
+    Segment,
+    SegmentContractError,
+    Translation,
+    read_segments_stream,
+)
 from web_translator.pdf_flowables import (
     PdfAssemblyError,
     PdfAssemblyLayout,
@@ -138,22 +144,9 @@ def assemble_pdf(
     """Create only ``run_dir/staged-output/translated.pdf`` and strict layout evidence."""
     run_dir = Path(run_dir)
     output_dir = Path(output_dir)
-    _validate_destinations(run_dir, output_dir)
-    document = _read_pdf_document(run_dir / "document.json")
-    source = _read_pdf_source(run_dir / "source.json")
-    if source.sha256 != document.source_sha256:
-        raise PdfAssemblyError("source.json SHA-256 does not match document.json")
-    segments = _read_pdf_segments(run_dir / "segments.jsonl")
-    ordered = _normalize_pdf_translations(
-        document,
-        segments,
-        translations,
-        glossary,
-    )
-    page_size = _select_page_size(document)
-
     temporary_name: str | None = None
     run_anchor: _DirectoryAnchor | None = None
+    evidence_files: dict[str, _OpenedFile] = {}
     temporary_anchor: _DirectoryAnchor | None = None
     temporary_staging_anchor: _DirectoryAnchor | None = None
     staging_anchor: _DirectoryAnchor | None = None
@@ -165,6 +158,40 @@ def assemble_pdf(
     staging = run_dir / "staged-output"
     try:
         run_anchor = _open_directory_anchor(run_dir, "run")
+        _validate_destinations(run_anchor, output_dir)
+        for name, context in (
+            ("document.json", "PDF document"),
+            ("source.json", "PDF source record"),
+            ("segments.jsonl", "PDF segment manifest"),
+        ):
+            evidence_files[name] = _open_anchored_input_file(
+                run_anchor,
+                name,
+                context,
+            )
+        _verify_anchored_evidence(run_anchor, evidence_files)
+        document = _read_pdf_document(
+            evidence_files["document.json"],
+            run_dir / "document.json",
+        )
+        source = _read_pdf_source(
+            evidence_files["source.json"],
+            run_dir / "source.json",
+        )
+        if source.sha256 != document.source_sha256:
+            raise PdfAssemblyError("source.json SHA-256 does not match document.json")
+        segments = _read_pdf_segments(
+            evidence_files["segments.jsonl"],
+            run_dir / "segments.jsonl",
+        )
+        ordered = _normalize_pdf_translations(
+            document,
+            segments,
+            translations,
+            glossary,
+        )
+        page_size = _select_page_size(document)
+        _verify_anchored_evidence(run_anchor, evidence_files)
         temporary_name, temporary_anchor = _create_unique_child_directory(
             run_anchor,
             ".pdf-assembling-",
@@ -207,6 +234,7 @@ def assemble_pdf(
         temporary_layout.stream.close()
         temporary_anchor.verify_visible()
 
+        _verify_anchored_evidence(run_anchor, evidence_files)
         staging_anchor = _create_child_directory(
             run_anchor,
             "staged-output",
@@ -297,30 +325,35 @@ def assemble_pdf(
             )
         if staging_anchor is not None:
             staging_anchor.close()
+        for opened in evidence_files.values():
+            _close_opened_file(opened)
         if run_anchor is not None:
             run_anchor.close()
 
 
-def _read_pdf_document(path: Path) -> PdfDocument:
-    value = _read_json(path, "PDF document")
+def _read_pdf_document(opened: _OpenedFile, path: Path) -> PdfDocument:
+    value = _read_json(opened, path, "PDF document")
     try:
         return PdfDocument.from_dict(value)
     except (PdfContractError, TypeError, ValueError) as error:
         raise PdfAssemblyError(f"invalid PDF document {path}: {error}") from error
 
 
-def _read_pdf_source(path: Path) -> PdfSourceRecord:
-    value = _read_json(path, "PDF source record")
+def _read_pdf_source(opened: _OpenedFile, path: Path) -> PdfSourceRecord:
+    value = _read_json(opened, path, "PDF source record")
     try:
         return PdfSourceRecord.from_dict(value)
     except (PdfContractError, TypeError, ValueError) as error:
         raise PdfAssemblyError(f"invalid PDF source record {path}: {error}") from error
 
 
-def _read_json(path: Path, context: str) -> Mapping[str, Any]:
-    _require_regular_file(path, context)
+def _read_json(
+    opened: _OpenedFile,
+    path: Path,
+    context: str,
+) -> Mapping[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(_read_opened_utf8(opened, path, context))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PdfAssemblyError(f"cannot read {context} {path}: {error}") from error
     if not isinstance(value, Mapping):
@@ -328,12 +361,27 @@ def _read_json(path: Path, context: str) -> Mapping[str, Any]:
     return value
 
 
-def _read_pdf_segments(path: Path) -> list[Segment]:
-    _require_regular_file(path, "PDF segment manifest")
+def _read_pdf_segments(opened: _OpenedFile, path: Path) -> list[Segment]:
     try:
-        return read_segments(path)
-    except (OSError, UnicodeError, ValueError) as error:
+        text = _read_opened_utf8(opened, path, "PDF segment manifest")
+        return read_segments_stream(io.StringIO(text))
+    except (OSError, UnicodeError, SegmentContractError, ValueError) as error:
         raise PdfAssemblyError(f"cannot read PDF segment manifest {path}: {error}") from error
+
+
+def _read_opened_utf8(
+    opened: _OpenedFile,
+    path: Path,
+    context: str,
+) -> str:
+    try:
+        opened.stream.seek(0)
+        payload = opened.stream.read()
+        if not isinstance(payload, bytes):
+            raise TypeError("anchored evidence stream did not return bytes")
+        return payload.decode("utf-8")
+    except (OSError, UnicodeError, TypeError) as error:
+        raise PdfAssemblyError(f"cannot read {context} {path}: {error}") from error
 
 
 def _normalize_pdf_translations(
@@ -706,23 +754,28 @@ def _select_page_size(document: PdfDocument) -> PdfPageSize:
     return PdfPageSize(name=name, width=width, height=height)  # type: ignore[arg-type]
 
 
-def _validate_destinations(run_dir: Path, output_dir: Path) -> None:
-    if not run_dir.is_dir() or _is_link_or_reparse(run_dir):
-        raise PdfAssemblyError(f"run directory is missing or unsafe: {run_dir}")
-    _reject_linked_ancestors(run_dir)
+def _validate_destinations(
+    run_anchor: _DirectoryAnchor,
+    output_dir: Path,
+) -> None:
+    run_anchor.verify_visible()
+    _reject_linked_ancestors(run_anchor.path)
     _reject_linked_ancestors(output_dir)
-    run_resolved = run_dir.resolve()
+    try:
+        run_resolved = run_anchor.current_path().resolve(strict=True)
+    except OSError as error:
+        raise PdfAssemblyError(
+            f"cannot resolve anchored run directory {run_anchor.path}: {error}"
+        ) from error
     output_resolved = output_dir.resolve(strict=False)
     if output_resolved == run_resolved or run_resolved in output_resolved.parents:
         raise PdfAssemblyError("reserved final output directory must be outside the run directory")
-    for path in (run_dir / "staged-output", run_dir / "layout.json", output_dir):
-        if path.exists() or path.is_symlink():
-            raise PdfAssemblyError(f"assembly destination already exists: {path}")
-
-
-def _require_regular_file(path: Path, context: str) -> None:
-    if not path.is_file() or _is_link_or_reparse(path):
-        raise PdfAssemblyError(f"{context} is missing or unsafe: {path}")
+    for name in ("staged-output", "layout.json"):
+        _require_anchored_name_absent(run_anchor, name)
+    if output_dir.exists() or output_dir.is_symlink():
+        raise PdfAssemblyError(
+            f"assembly destination already exists: {output_dir}"
+        )
 
 
 def _reject_linked_ancestors(path: Path) -> None:
@@ -814,6 +867,159 @@ def _open_directory_anchor(
         if path_anchor is not None:
             path_anchor.close()  # type: ignore[attr-defined]
         raise
+
+
+def _require_anchored_name_absent(
+    directory: _DirectoryAnchor,
+    name: str,
+) -> None:
+    if Path(name).name != name:
+        raise PdfAssemblyError(f"unsafe anchored assembly name: {name}")
+    handle: int | None = None
+    try:
+        if directory.descriptor is not None:
+            os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+        elif _IS_WINDOWS:
+            handle = _windows_open_relative_entry(
+                _windows_anchor_handle(directory),
+                name,
+            )
+        else:
+            raise PdfAssemblyError(
+                f"safe anchored destination check unavailable: "
+                f"{directory.path / name}"
+            )
+    except FileNotFoundError:
+        return
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError) as error:
+        raise PdfAssemblyError(
+            f"cannot inspect anchored assembly destination "
+            f"{directory.path / name}: {error}"
+        ) from error
+    finally:
+        if handle is not None:
+            pdf_acquire_module._close_windows_handle(handle)
+    raise PdfAssemblyError(
+        f"assembly destination already exists: {directory.path / name}"
+    )
+
+
+def _open_anchored_input_file(
+    directory: _DirectoryAnchor,
+    name: str,
+    context: str,
+) -> _OpenedFile:
+    if Path(name).name != name:
+        raise PdfAssemblyError(f"unsafe anchored evidence name: {name}")
+    directory.verify_visible()
+    descriptor: int | None = None
+    windows_handle: int | None = None
+    stream: BinaryIO | None = None
+    try:
+        if directory.descriptor is not None:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory.descriptor,
+            )
+            result = os.fstat(descriptor)
+            if not stat.S_ISREG(result.st_mode) or _is_reparse_stat(result):
+                raise PdfAssemblyError(
+                    f"{context} is not an anchored regular file: "
+                    f"{directory.path / name}"
+                )
+            identity = (result.st_dev, result.st_ino)
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = None
+        elif _IS_WINDOWS:
+            windows_handle = _windows_open_relative_read_file(
+                _windows_anchor_handle(directory),
+                name,
+            )
+            identity = _windows_file_identity(
+                windows_handle,
+                require_regular=True,
+            )
+            import msvcrt
+
+            descriptor = msvcrt.open_osfhandle(
+                windows_handle,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            windows_handle = None
+            stream = os.fdopen(descriptor, "rb")
+            descriptor = None
+        else:
+            raise PdfAssemblyError(
+                f"safe anchored input open unavailable: {directory.path / name}"
+            )
+        opened = _OpenedFile(stream, identity)
+        directory.verify_visible()
+        _verify_anchored_input_identity(directory, name, identity)
+        return opened
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError) as error:
+        raise PdfAssemblyError(
+            f"cannot open {context} {directory.path / name}: {error}"
+        ) from error
+    finally:
+        if sys.exc_info()[0] is not None:
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if windows_handle is not None:
+                pdf_acquire_module._close_windows_handle(windows_handle)
+
+
+def _verify_anchored_evidence(
+    directory: _DirectoryAnchor,
+    evidence_files: Mapping[str, _OpenedFile],
+) -> None:
+    directory.verify_visible()
+    for name, opened in evidence_files.items():
+        _verify_anchored_input_identity(directory, name, opened.identity)
+
+
+def _verify_anchored_input_identity(
+    directory: _DirectoryAnchor,
+    name: str,
+    expected: tuple[int, int],
+) -> None:
+    handle: int | None = None
+    try:
+        if directory.descriptor is not None:
+            result = _anchored_regular_file_stat(directory, name)
+            identity = (result.st_dev, result.st_ino)
+        elif _IS_WINDOWS:
+            handle = _windows_open_relative_read_file(
+                _windows_anchor_handle(directory),
+                name,
+            )
+            identity = _windows_file_identity(handle, require_regular=True)
+        else:
+            raise PdfAssemblyError(
+                f"safe anchored input verification unavailable: "
+                f"{directory.path / name}"
+            )
+    finally:
+        if handle is not None:
+            pdf_acquire_module._close_windows_handle(handle)
+    if identity != expected:
+        raise PdfAssemblyError(
+            f"anchored input changed identity: {directory.path / name}"
+        )
 
 
 def _create_unique_child_directory(
@@ -1347,6 +1553,28 @@ def _windows_open_relative_file(root_handle: int, name: str) -> int:
     )
 
 
+def _windows_open_relative_read_file(root_handle: int, name: str) -> int:
+    return _windows_nt_create_relative(
+        root_handle,
+        name,
+        desired_access=0x00000001 | 0x00000080 | 0x00100000,
+        create_disposition=1,
+        create_options=0x00000020 | 0x00000040 | 0x00200000,
+        file_attributes=0,
+    )
+
+
+def _windows_open_relative_entry(root_handle: int, name: str) -> int:
+    return _windows_nt_create_relative(
+        root_handle,
+        name,
+        desired_access=0x00000080 | 0x00100000,
+        create_disposition=1,
+        create_options=0x00000020 | 0x00200000,
+        file_attributes=0,
+    )
+
+
 def _windows_nt_create_relative(
     root_handle: int,
     name: str,
@@ -1442,6 +1670,12 @@ def _windows_nt_create_relative(
             rtl_error.argtypes = (ctypes.c_long,)
             rtl_error.restype = wintypes.ULONG
             error_code = int(rtl_error(status))
+            if error_code in {2, 3}:
+                raise FileNotFoundError(
+                    error_code,
+                    "Windows anchored entry is missing",
+                    name,
+                )
             if error_code in {80, 183}:
                 raise FileExistsError(error_code, "Windows destination exists", name)
             raise ctypes.WinError(error_code)
@@ -1450,6 +1684,8 @@ def _windows_nt_create_relative(
         handle_value = int(output_handle.value)
         return handle_value
     except PdfAssemblyError:
+        raise
+    except FileNotFoundError:
         raise
     except FileExistsError:
         raise

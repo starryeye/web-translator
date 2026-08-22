@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
+import io
 import json
 from pathlib import Path
 import re
 
 import pytest
 
+import web_translator.models as models_module
 from web_translator.models import ProtectedToken, Segment, read_segments, write_segments
 from web_translator.paths import create_run_paths, validate_public_url
 
@@ -35,6 +37,24 @@ def test_segment_jsonl_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "segments.jsonl"
     write_segments(path, [segment])
     assert read_segments(path) == [segment]
+
+
+def test_segment_jsonl_stream_reader_reuses_strict_contract_without_path_reopen() -> None:
+    payload = {
+        "id": "seg-000001",
+        "locator": "pdf:page-0001:block-0001",
+        "semantic_type": "paragraph",
+        "heading_path": ["Overview"],
+        "source_text": "Source",
+        "protected": [],
+        "context_ids": [],
+        "target": True,
+    }
+    stream = io.StringIO(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    segments = models_module.read_segments_stream(stream)
+
+    assert segments == [Segment.from_dict(payload)]
 
 
 @pytest.mark.parametrize(
