@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
 from numbers import Real
+import os
 from pathlib import Path
 import re
+import shutil
+import tempfile
 import warnings
 
 import pdfplumber
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
     ArrayObject,
     DictionaryObject,
@@ -71,6 +75,8 @@ class PdfInspection:
 
 @dataclass(frozen=True, slots=True)
 class _PageMaterial:
+    page_width: float
+    page_height: float
     lines: list[PdfLine]
     table_blocks: tuple[PdfBlock, ...]
     table_cells: tuple[PdfTableCell, ...]
@@ -78,6 +84,76 @@ class _PageMaterial:
     figure_regions: tuple[FigureRegion, ...]
     figure_character_count: int
     characters: tuple[dict[str, object], ...]
+
+
+@contextmanager
+def _upright_extraction_source(
+    source: Path,
+    staging_parent: Path,
+) -> Iterator[Path]:
+    """Clone one PDF for logical extraction with only page rotation cleared."""
+    reader = PdfReader(Path(source), strict=True)
+    if all(_normalized_rotation(page.get("/Rotate", 0)) == 0 for page in reader.pages):
+        yield Path(source)
+        return
+    staging_parent = Path(staging_parent)
+    remove_empty_parent = not staging_parent.exists()
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=".pdf-upright-", dir=str(staging_parent))
+    )
+    partial = staging_root / "source.partial.pdf"
+    staged = staging_root / "source.pdf"
+    try:
+        writer = PdfWriter()
+        writer.clone_document_from_reader(reader)
+        for page in writer.pages:
+            page[NameObject("/Rotate")] = NumberObject(0)
+        with partial.open("wb") as destination:
+            writer.write(destination)
+        os.replace(partial, staged)
+        yield staged
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        if remove_empty_parent:
+            try:
+                staging_parent.rmdir()
+            except OSError:
+                pass
+
+
+def _region_with_source_crop(
+    region: FigureRegion,
+    rotation: int,
+) -> FigureRegion:
+    """Keep logical geometry upright while mapping only the rendered crop."""
+    crop = region.crop_bbox or region.bbox
+    width = region.page_width
+    height = region.page_height
+    if rotation == 0:
+        return region
+    if rotation == 90:
+        rotated = (height - crop[3], crop[0], height - crop[1], crop[2])
+        rendered_width, rendered_height = height, width
+    elif rotation == 180:
+        rotated = (
+            width - crop[2],
+            height - crop[3],
+            width - crop[0],
+            height - crop[1],
+        )
+        rendered_width, rendered_height = width, height
+    elif rotation == 270:
+        rotated = (crop[1], width - crop[2], crop[3], width - crop[0])
+        rendered_width, rendered_height = height, width
+    else:  # inspection rejects this before extraction
+        raise PdfExtractionError(f"unsupported rotation {rotation!r}")
+    return replace(
+        region,
+        page_width=rendered_width,
+        page_height=rendered_height,
+        crop_bbox=rotated,
+    )
 
 
 def inspect_pdf(source_pdf: Path) -> PdfInspection:
@@ -134,81 +210,77 @@ def extract_pdf(
     source = Path(source_pdf)
     inspection = inspect_pdf(source)
     reject_unsupported_pdf(inspection)
-    materials = _extract_page_materials(source, inspection)
-    classified_pages = classify_document_lines(
-        [
-            (material.lines, evidence.height)
-            for material, evidence in zip(
-                materials, inspection.pages, strict=True
-            )
-        ]
-    )
+    with _upright_extraction_source(source, Path(document_path).parent) as logical_source:
+        materials = _extract_page_materials(logical_source, inspection)
+        classified_pages = classify_document_lines(
+            [(material.lines, material.page_height) for material in materials]
+        )
 
-    blocks: list[PdfBlock] = []
-    table_cells: list[PdfTableCell] = []
-    figure_regions: list[FigureRegion] = []
-    assigned_by_page: list[int] = []
-    figure_number = 0
-    for evidence, lines, material in zip(
-        inspection.pages, classified_pages, materials, strict=True
-    ):
-        ordered = order_page_lines(
-            lines,
-            evidence.width,
-            spanning_bboxes=[
-                *_table_region_bboxes(material.table_blocks),
-                *(region.bbox for region in material.figure_regions),
-            ],
-        )
-        assigned_by_page.append(
-            sum(line.character_count for line in ordered)
-            + material.table_character_count
-            + material.figure_character_count
-        )
-        page_blocks = build_text_blocks(ordered, evidence.number)
-        page_figures: list[PdfBlock] = []
-        for region in material.figure_regions:
-            figure_number += 1
-            page_figures.append(
-                PdfBlock(
-                    id=(
-                        f"pdf:page-{evidence.number:04d}:"
-                        f"block-{len(page_blocks) + len(page_figures) + 1:04d}"
-                    ),
-                    page_number=evidence.number,
-                    order=0,
-                    kind="figure",
-                    bbox=region.bbox,
-                    style=PdfBlockStyle(
-                        font_size=10.0,
-                        bold=False,
-                        alignment="center",
-                        indentation=region.bbox[0],
-                        space_after=0.0,
-                    ),
-                    media_path=f"media/figure-{figure_number:04d}.png",
+        blocks: list[PdfBlock] = []
+        table_cells: list[PdfTableCell] = []
+        figure_regions: list[FigureRegion] = []
+        assigned_by_page: list[int] = []
+        figure_number = 0
+        for evidence, lines, material in zip(
+            inspection.pages, classified_pages, materials, strict=True
+        ):
+            ordered = order_page_lines(
+                lines,
+                material.page_width,
+                spanning_bboxes=[
+                    *_table_region_bboxes(material.table_blocks),
+                    *(region.bbox for region in material.figure_regions),
+                ],
+            )
+            assigned_by_page.append(
+                sum(line.character_count for line in ordered)
+                + material.table_character_count
+                + material.figure_character_count
+            )
+            page_blocks = build_text_blocks(ordered, evidence.number)
+            page_figures: list[PdfBlock] = []
+            for region in material.figure_regions:
+                figure_number += 1
+                page_figures.append(
+                    PdfBlock(
+                        id=(
+                            f"pdf:page-{evidence.number:04d}:"
+                            f"block-{len(page_blocks) + len(page_figures) + 1:04d}"
+                        ),
+                        page_number=evidence.number,
+                        order=0,
+                        kind="figure",
+                        bbox=region.bbox,
+                        style=PdfBlockStyle(
+                            font_size=10.0,
+                            bold=False,
+                            alignment="center",
+                            indentation=region.bbox[0],
+                            space_after=0.0,
+                        ),
+                        media_path=f"media/figure-{figure_number:04d}.png",
+                    )
                 )
+            page_blocks = _insert_rich_blocks(
+                page_blocks,
+                material.table_blocks,
+                page_figures,
             )
-        page_blocks = _insert_rich_blocks(
-            page_blocks,
-            material.table_blocks,
-            page_figures,
-        )
-        page_blocks = detect_footnotes(
-            page_blocks,
-            material.characters,
-            page_height=evidence.height,
-        )
-        page_blocks = pair_figure_captions(page_blocks)
-        blocks.extend(page_blocks)
-        table_cells.extend(material.table_cells)
-        figure_regions.extend(material.figure_regions)
+            page_blocks = detect_footnotes(
+                page_blocks,
+                material.characters,
+                page_height=material.page_height,
+            )
+            page_blocks = pair_figure_captions(page_blocks)
+            blocks.extend(page_blocks)
+            table_cells.extend(material.table_cells)
+            figure_regions.extend(material.figure_regions)
 
-    _validate_character_assignment(inspection, assigned_by_page)
-    blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
-    _validate_peer_overlap(blocks)
-    link_evidence = extract_link_evidence(source, blocks)
-    blocks = list(link_evidence.blocks)
+        _validate_character_assignment(inspection, assigned_by_page)
+        blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
+        _validate_peer_overlap(blocks)
+        link_evidence = extract_link_evidence(logical_source, blocks)
+        blocks = list(link_evidence.blocks)
     for message in link_evidence.warnings:
         warnings.warn(message, PdfExtractionWarning, stacklevel=2)
     blocks, segments = _build_segments(blocks)
@@ -221,11 +293,13 @@ def extract_pdf(
         pages=[
             PdfPage(
                 number=evidence.number,
-                width=evidence.width,
-                height=evidence.height,
+                width=material.page_width,
+                height=material.page_height,
                 rotation=evidence.rotation,
             )
-            for evidence in inspection.pages
+            for evidence, material in zip(
+                inspection.pages, materials, strict=True
+            )
         ],
         blocks=blocks,
         table_cells=table_cells,
@@ -273,6 +347,10 @@ def _extract_page_materials(
                         page_number=evidence.number,
                         excluded_bboxes=tables.bboxes,
                     )
+                    regions = [
+                        _region_with_source_crop(region, evidence.rotation)
+                        for region in regions
+                    ]
                 except PdfMediaError as error:
                     raise PdfExtractionError(str(error)) from error
                 raw_words = page.extract_words(
@@ -288,7 +366,7 @@ def _extract_page_materials(
                     word for word in raw_words if not _word_in_any_bbox(word, excluded)
                 ]
                 lines = [
-                    line.with_page_geometry(evidence.width, evidence.height)
+                    line.with_page_geometry(float(page.width), float(page.height))
                     for line in group_words_into_lines(prose_words)
                 ]
                 lines = [
@@ -312,6 +390,8 @@ def _extract_page_materials(
                 )
                 result.append(
                     _PageMaterial(
+                        page_width=float(page.width),
+                        page_height=float(page.height),
                         lines=lines,
                         table_blocks=tables.blocks,
                         table_cells=tables.cells,

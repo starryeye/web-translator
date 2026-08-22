@@ -1255,6 +1255,12 @@ def _nonzero_rich_coordinates_pdf(path: Path, *, rotation: int = 0) -> Path:
     canvas = Canvas(str(path), pagesize=(400, 500))
     canvas.setFont("Helvetica", 11)
     canvas.drawString(-60, 370, "Introductory prose before the rich regions remains ordered.")
+    canvas.linkURL(
+        "https://example.com/rich",
+        (-60, 368, 250, 382),
+        relative=0,
+    )
+    canvas.bookmarkPage("rich-target", fit="XYZ", left=-60, top=370, zoom=0)
 
     canvas.rect(-60, 220, 140, 80, stroke=1, fill=0)
     canvas.line(10, 220, 10, 300)
@@ -1272,6 +1278,7 @@ def _nonzero_rich_coordinates_pdf(path: Path, *, rotation: int = 0) -> Path:
     canvas.drawString(120, 205, "Figure 1. Nonzero source figure")
     canvas.setFont("Helvetica", 11)
     canvas.drawString(-60, 160, "Following prose after the rich regions remains ordered.")
+    canvas.linkRect("", "rich-target", (-60, 158, 240, 172), relative=0)
     canvas.save()
 
     reader = PdfReader(path)
@@ -1285,9 +1292,86 @@ def _nonzero_rich_coordinates_pdf(path: Path, *, rotation: int = 0) -> Path:
     )
     page[NameObject("/MediaBox")] = bounds
     page[NameObject("/CropBox")] = ArrayObject(bounds)
+    writer.add_named_destination("rich-named-target", 0)
     with path.open("wb") as destination:
         writer.write(destination)
     return path
+
+
+def test_upright_extraction_staging_preserves_pdf_evidence_and_always_cleans(
+    tmp_path: Path,
+) -> None:
+    from pypdf import PdfReader
+
+    from web_translator import pdf_extract
+
+    normalize = getattr(pdf_extract, "_upright_extraction_source", None)
+    assert callable(normalize), "rotated extraction requires isolated upright staging"
+    source = _nonzero_rich_coordinates_pdf(
+        tmp_path / "staging-source.pdf",
+        rotation=90,
+    )
+    original_bytes = source.read_bytes()
+    staging_parent = tmp_path / "run-owned-staging"
+
+    with normalize(source, staging_parent) as staged:
+        staging_root = staged.parent
+        assert staging_root.parent == staging_parent
+        assert staged.parent != source.parent
+        assert sorted(staging_root.iterdir()) == [staged]
+        source_reader = PdfReader(source, strict=True)
+        staged_reader = PdfReader(staged, strict=True)
+        source_page = source_reader.pages[0]
+        staged_page = staged_reader.pages[0]
+
+        assert int(source_page.get("/Rotate", 0)) == 90
+        assert int(staged_page.get("/Rotate", 0)) == 0
+        for box_name in ("mediabox", "cropbox"):
+            assert list(getattr(staged_page, box_name)) == list(
+                getattr(source_page, box_name)
+            )
+        assert staged_page.get_contents().get_data() == source_page.get_contents().get_data()
+        source_resources = source_page["/Resources"].get_object()
+        staged_resources = staged_page["/Resources"].get_object()
+        assert set(staged_resources) == set(source_resources)
+        source_xobjects = source_resources["/XObject"].get_object()
+        staged_xobjects = staged_resources["/XObject"].get_object()
+        assert set(staged_xobjects) == set(source_xobjects)
+        for name in source_xobjects:
+            assert staged_xobjects[name].get_object().get_data() == (
+                source_xobjects[name].get_object().get_data()
+            )
+        source_annotations = [
+            annotation.get_object() for annotation in source_page.get("/Annots", ())
+        ]
+        staged_annotations = [
+            annotation.get_object() for annotation in staged_page.get("/Annots", ())
+        ]
+        assert [list(annotation["/Rect"]) for annotation in staged_annotations] == [
+            list(annotation["/Rect"]) for annotation in source_annotations
+        ]
+        assert [
+            tuple(str(value) for value in annotation.get("/Dest", ())[1:])
+            for annotation in staged_annotations
+        ] == [
+            tuple(str(value) for value in annotation.get("/Dest", ())[1:])
+            for annotation in source_annotations
+        ]
+        assert set(staged_reader.named_destinations) == set(
+            source_reader.named_destinations
+        )
+
+    assert not staging_root.exists()
+    assert not staging_parent.exists()
+    assert source.read_bytes() == original_bytes
+
+    with pytest.raises(KeyboardInterrupt):
+        with normalize(source, staging_parent) as staged:
+            interrupted_root = staged.parent
+            raise KeyboardInterrupt
+    assert not interrupted_root.exists()
+    assert not staging_parent.exists()
+    assert source.read_bytes() == original_bytes
 
 
 def test_detect_tables_preserves_merged_spans_and_empty_structural_cells(
@@ -1676,36 +1760,90 @@ def test_extract_pdf_keeps_one_semantic_coordinate_system_for_nonzero_rich_page(
 
 
 @pytest.mark.parametrize("rotation", [90, 180, 270])
-def test_extract_pdf_preserves_nonzero_rich_evidence_after_rotation(
+def test_extract_pdf_normalizes_rotated_nonzero_rich_page_end_to_end(
     tmp_path: Path,
     rotation: int,
 ) -> None:
-    from web_translator.pdf_layout import detect_tables
-    from web_translator.pdf_media import crop_figure_regions, detect_figure_regions
+    from web_translator.pdf_extract import extract_pdf
 
     source = _nonzero_rich_coordinates_pdf(
         tmp_path / f"nonzero-rich-{rotation}.pdf",
         rotation=rotation,
     )
-    with pdfplumber.open(source) as document:
-        page = document.pages[0]
-        tables = detect_tables(page, page_number=1)
-        regions = detect_figure_regions(
-            page,
-            page_number=1,
-            excluded_bboxes=tables.bboxes,
-        )
-
-    assert len(tables.cells) == 4
-    assert len(regions) == 1
-    crops = crop_figure_regions(
+    document = extract_pdf(
         source,
-        regions,
+        tmp_path / f"nonzero-rich-{rotation}-document.json",
+        tmp_path / f"nonzero-rich-{rotation}-segments.jsonl",
         tmp_path / f"nonzero-rich-{rotation}-media",
     )
-    with Image.open(crops[0]) as image:
-        assert image.width > 0
-        assert image.height > 0
+    segments = read_segments(
+        tmp_path / f"nonzero-rich-{rotation}-segments.jsonl"
+    )
+    table_blocks = sorted(
+        (block for block in document.blocks if block.kind == "table-cell"),
+        key=lambda block: (block.row or 0, block.column or 0),
+    )
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    captions = [block for block in document.blocks if block.kind == "caption"]
+
+    assert [
+        (block.row, block.column, block.source_text) for block in table_blocks
+    ] == [
+        (0, 0, "A1"),
+        (0, 1, "B1"),
+        (1, 0, "A2"),
+        (1, 1, "B2"),
+    ]
+    assert [(cell.row, cell.column) for cell in document.table_cells] == [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    ]
+    assert len(figures) == 1
+    assert len(captions) == 1
+    assert captions[0].source_text == "Figure 1. Nonzero source figure"
+    assert figures[0].caption_id == captions[0].id
+    assert captions[0].caption_id == figures[0].id
+    assert all("Embedded figure label" not in segment.source_text for segment in segments)
+    assert document.pages[0].width == 400.0
+    assert document.pages[0].height == 500.0
+    assert document.pages[0].rotation == rotation
+
+    expected_text = (
+        "Introductory prose before the rich regions remains ordered.",
+        "Following prose after the rich regions remains ordered.",
+    )
+    prose = [
+        block for block in document.blocks if block.source_text in expected_text
+    ]
+    assert [block.source_text for block in prose] == list(expected_text)
+    assert prose[0].uri == "https://example.com/rich"
+    assert prose[1].destination == prose[0].id
+    rich_orders = [
+        *(block.order for block in table_blocks),
+        figures[0].order,
+        captions[0].order,
+    ]
+    assert prose[0].order < min(rich_orders)
+    assert max(rich_orders) < prose[1].order
+
+    assigned_characters = sum(
+        sum(1 for character in block.source_text if not character.isspace())
+        for block in document.blocks
+    ) + len("Embeddedfigurelabel")
+    assert assigned_characters / document.selectable_characters >= 0.99
+
+    expected_crop_size = {
+        90: (160, 280),
+        180: (280, 160),
+        270: (160, 280),
+    }
+    with Image.open(
+        tmp_path / f"nonzero-rich-{rotation}-media" / "figure-0001.png"
+    ) as image:
+        assert image.size == expected_crop_size[rotation]
+        assert image.convert("RGB").getpixel((10, 10)) == (30, 120, 210)
 
 
 @pytest.mark.parametrize("rotation", [90, 180, 270])
