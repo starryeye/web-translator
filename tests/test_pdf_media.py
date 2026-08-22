@@ -158,7 +158,7 @@ def test_detected_raster_crop_normalizes_nonzero_page_box_origin(
     with pdfplumber.open(source) as document:
         regions = detect_figure_regions(document.pages[0], page_number=1)
 
-    assert [region.bbox for region in regions] == [(0.0, 50.0, 100.0, 100.0)]
+    assert [region.bbox for region in regions] == [(-50.0, 75.0, 50.0, 125.0)]
     crops = crop_figure_regions(source, regions, tmp_path / "nonzero-media")
     with Image.open(crops[0]) as image:
         assert image.size == (200, 100)
@@ -191,7 +191,7 @@ def test_detected_vector_crop_normalizes_nonzero_page_box_origin(
     with pdfplumber.open(source) as document:
         regions = detect_figure_regions(document.pages[0], page_number=1)
 
-    assert [region.bbox for region in regions] == [(10.0, 45.0, 90.0, 75.0)]
+    assert [region.bbox for region in regions] == [(-40.0, 70.0, 40.0, 100.0)]
     crops = crop_figure_regions(source, regions, tmp_path / "nonzero-vector-media")
     with Image.open(crops[0]) as image:
         assert image.size == (160, 60)

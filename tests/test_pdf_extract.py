@@ -1223,7 +1223,7 @@ def _orphan_visible_link_pdf(path: Path) -> Path:
     return path
 
 
-def _nonzero_origin_link_pdf(path: Path) -> Path:
+def _nonzero_origin_link_pdf(path: Path, *, rotation: int = 0) -> Path:
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import ArrayObject, NameObject, NumberObject
 
@@ -1234,11 +1234,57 @@ def _nonzero_origin_link_pdf(path: Path) -> Path:
     reader = PdfReader(path)
     writer = PdfWriter()
     writer.clone_document_from_reader(reader)
+    if rotation:
+        writer.pages[0].rotate(rotation)
     bounds = ArrayObject(
         [NumberObject(-50), NumberObject(-25), NumberObject(150), NumberObject(75)]
     )
     writer.pages[0][NameObject("/MediaBox")] = bounds
     writer.pages[0][NameObject("/CropBox")] = ArrayObject(bounds)
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
+def _nonzero_rich_coordinates_pdf(path: Path, *, rotation: int = 0) -> Path:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, NameObject, NumberObject
+
+    image_path = path.with_suffix(".png")
+    Image.new("RGB", (140, 80), (30, 120, 210)).save(image_path)
+    canvas = Canvas(str(path), pagesize=(400, 500))
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(-60, 370, "Introductory prose before the rich regions remains ordered.")
+
+    canvas.rect(-60, 220, 140, 80, stroke=1, fill=0)
+    canvas.line(10, 220, 10, 300)
+    canvas.line(-60, 260, 80, 260)
+    canvas.drawString(-50, 275, "A1")
+    canvas.drawString(20, 275, "B1")
+    canvas.drawString(-50, 235, "A2")
+    canvas.drawString(20, 235, "B2")
+
+    canvas.drawImage(str(image_path), 120, 220, width=140, height=80)
+    canvas.setFillColorRGB(1, 1, 1)
+    canvas.drawString(140, 255, "Embedded figure label")
+    canvas.setFillColorRGB(0, 0, 0)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(120, 205, "Figure 1. Nonzero source figure")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(-60, 160, "Following prose after the rich regions remains ordered.")
+    canvas.save()
+
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    page = writer.pages[0]
+    if rotation:
+        page.rotate(rotation)
+    bounds = ArrayObject(
+        [NumberObject(-100), NumberObject(-100), NumberObject(300), NumberObject(400)]
+    )
+    page[NameObject("/MediaBox")] = bounds
+    page[NameObject("/CropBox")] = ArrayObject(bounds)
     with path.open("wb") as destination:
         writer.write(destination)
     return path
@@ -1595,6 +1641,220 @@ def test_link_coordinates_match_emitted_blocks_with_nonzero_page_origin(
 
     assert evidence.blocks[0].uri == "https://example.com/nonzero"
     assert _map_internal_destination(reader, destination, {1: [target]}) == target
+
+
+def test_extract_pdf_keeps_one_semantic_coordinate_system_for_nonzero_rich_page(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    document = extract_pdf(
+        _nonzero_rich_coordinates_pdf(tmp_path / "nonzero-rich.pdf"),
+        tmp_path / "nonzero-rich-document.json",
+        tmp_path / "nonzero-rich-segments.jsonl",
+        tmp_path / "nonzero-rich-media",
+    )
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    captions = [block for block in document.blocks if block.kind == "caption"]
+    segments = read_segments(tmp_path / "nonzero-rich-segments.jsonl")
+
+    assert len(document.table_cells) == 4
+    assert len(figures) == 1
+    assert len(captions) == 1
+    assert figures[0].caption_id == captions[0].id
+    assert captions[0].caption_id == figures[0].id
+    assert all("Embedded figure label" not in segment.source_text for segment in segments)
+    positions = {
+        label: next(
+            block.order for block in document.blocks if label in block.source_text
+        )
+        for label in ("Introductory prose", "A1", "Figure 1.", "Following prose")
+    }
+    assert positions["Introductory prose"] < positions["A1"]
+    assert positions["A1"] < positions["Following prose"]
+    assert positions["Figure 1."] < positions["Following prose"]
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_extract_pdf_preserves_nonzero_rich_evidence_after_rotation(
+    tmp_path: Path,
+    rotation: int,
+) -> None:
+    from web_translator.pdf_layout import detect_tables
+    from web_translator.pdf_media import crop_figure_regions, detect_figure_regions
+
+    source = _nonzero_rich_coordinates_pdf(
+        tmp_path / f"nonzero-rich-{rotation}.pdf",
+        rotation=rotation,
+    )
+    with pdfplumber.open(source) as document:
+        page = document.pages[0]
+        tables = detect_tables(page, page_number=1)
+        regions = detect_figure_regions(
+            page,
+            page_number=1,
+            excluded_bboxes=tables.bboxes,
+        )
+
+    assert len(tables.cells) == 4
+    assert len(regions) == 1
+    crops = crop_figure_regions(
+        source,
+        regions,
+        tmp_path / f"nonzero-rich-{rotation}-media",
+    )
+    with Image.open(crops[0]) as image:
+        assert image.width > 0
+        assert image.height > 0
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_external_link_maps_rotated_nonzero_annotation_bbox(
+    tmp_path: Path,
+    rotation: int,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    source = _nonzero_origin_link_pdf(
+        tmp_path / f"rotated-uri-{rotation}.pdf",
+        rotation=rotation,
+    )
+    with pdfplumber.open(source) as document:
+        words = document.pages[0].extract_words()
+    block = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(
+            min(float(word["x0"]) for word in words),
+            min(float(word["top"]) for word in words),
+            max(float(word["x1"]) for word in words),
+            max(float(word["bottom"]) for word in words),
+        ),
+        style=PdfBlockStyle(12.0, False, "left", 0.0, 0.0),
+        source_text="Target link",
+    )
+
+    evidence = extract_link_evidence(source, [block])
+
+    assert evidence.blocks[0].uri == "https://example.com/nonzero"
+    assert evidence.warnings == ()
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_visible_orphan_link_is_fatal_after_rotation_and_nonzero_origin(
+    tmp_path: Path,
+    rotation: int,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    source = _nonzero_origin_link_pdf(
+        tmp_path / f"rotated-orphan-{rotation}.pdf",
+        rotation=rotation,
+    )
+
+    with pytest.raises(PdfExtractionError, match="visible link text has no emitted owner"):
+        extract_link_evidence(source, [])
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+@pytest.mark.parametrize(
+    "destination_kind",
+    ["XYZ", "FitH", "FitV", "FitR", "Destination"],
+)
+def test_internal_destination_maps_rotated_nonzero_coordinates(
+    tmp_path: Path,
+    rotation: int,
+    destination_kind: str,
+) -> None:
+    from pypdf import PdfReader
+    from pypdf.generic import (
+        ArrayObject,
+        Destination,
+        Fit,
+        FloatObject,
+        NameObject,
+    )
+
+    from web_translator.pdf_layout import _map_internal_destination
+
+    source = _nonzero_origin_link_pdf(
+        tmp_path / f"rotated-destination-{rotation}-{destination_kind}.pdf",
+        rotation=rotation,
+    )
+    reader = PdfReader(source)
+    page_reference = reader.pages[0].indirect_reference
+    if destination_kind == "XYZ":
+        destination = ArrayObject(
+            [
+                page_reference,
+                NameObject("/XYZ"),
+                FloatObject(35),
+                FloatObject(65),
+                FloatObject(0),
+            ]
+        )
+    elif destination_kind == "FitH":
+        destination = ArrayObject(
+            [page_reference, NameObject("/FitH"), FloatObject(65)]
+        )
+    elif destination_kind == "FitV":
+        destination = ArrayObject(
+            [page_reference, NameObject("/FitV"), FloatObject(35)]
+        )
+    elif destination_kind == "FitR":
+        destination = ArrayObject(
+            [
+                page_reference,
+                NameObject("/FitR"),
+                FloatObject(20),
+                FloatObject(55),
+                FloatObject(50),
+                FloatObject(75),
+            ]
+        )
+    else:
+        destination = Destination(
+            "rotated-coordinate-target",
+            page_reference,
+            Fit.xyz(left=35, top=65),
+        )
+    target_bboxes = {
+        90: (55.0, 120.0, 75.0, 150.0),
+        180: (50.0, 105.0, 80.0, 125.0),
+        270: (-25.0, 150.0, -5.0, 180.0),
+    }
+    decoy_bboxes = {
+        90: (0.0, 20.0, 20.0, 50.0),
+        180: (120.0, 40.0, 150.0, 60.0),
+        270: (40.0, 50.0, 60.0, 80.0),
+    }
+    style = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    target = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=target_bboxes[rotation],
+        style=style,
+        source_text="Coordinate target",
+    )
+    decoy = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="paragraph",
+        bbox=decoy_bboxes[rotation],
+        style=style,
+        source_text="Decoy",
+    )
+
+    assert _map_internal_destination(
+        reader,
+        destination,
+        {1: [target, decoy]},
+    ) == target
 
 
 def test_extract_link_evidence_warns_and_fails_closed_for_ambiguous_source(

@@ -30,12 +30,13 @@ class PopplerTools:
 
 @dataclass(frozen=True, slots=True)
 class FigureRegion:
-    """One page-local graphical region in pdfplumber top-origin coordinates."""
+    """One graphical region in shared pdfplumber top-origin coordinates."""
 
     page_number: int
     bbox: tuple[float, float, float, float]
     page_width: float
     page_height: float
+    crop_bbox: tuple[float, float, float, float] | None = None
 
 
 def find_poppler() -> PopplerTools:
@@ -158,15 +159,7 @@ def detect_figure_regions(
     raster = [
         bbox
         for item in getattr(page, "images", ())
-        if (
-            bbox := _object_bbox(
-                item,
-                page_x0=page_x0,
-                page_top=page_top,
-                page_width=page_width,
-                page_height=page_height,
-            )
-        )
+        if (bbox := _object_bbox(item))
         is not None
         and not _excluded(bbox, excluded_bboxes)
     ]
@@ -174,15 +167,7 @@ def detect_figure_regions(
         bbox
         for collection in ("lines", "rects", "curves")
         for item in getattr(page, collection, ())
-        if (
-            bbox := _object_bbox(
-                item,
-                page_x0=page_x0,
-                page_top=page_top,
-                page_width=page_width,
-                page_height=page_height,
-            )
-        )
+        if (bbox := _object_bbox(item))
         is not None
         and not _excluded(bbox, excluded_bboxes)
     ]
@@ -200,17 +185,42 @@ def detect_figure_regions(
     ]
     candidates = [*raster, *(_union_bbox(group) for group in vector_groups)]
     merged = [_union_bbox(group) for group in _connected_groups(candidates)]
-    normalized = sorted(
+    semantic = sorted(
         {
-            tuple(round(value, 6) for value in bbox)
+            tuple(round(value, 6) for value in clipped)
             for bbox in merged
-            if _valid_bbox(bbox)
+            if (
+                clipped := _clip_bbox(
+                    bbox,
+                    (
+                        page_x0,
+                        page_top,
+                        page_x0 + page_width,
+                        page_top + page_height,
+                    ),
+                )
+            )
+            is not None
         },
         key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]),
     )
     return [
-        FigureRegion(page_number, bbox, page_width, page_height)
-        for bbox in normalized
+        FigureRegion(
+            page_number,
+            bbox,
+            page_width,
+            page_height,
+            tuple(
+                round(value, 6)
+                for value in (
+                    bbox[0] - page_x0,
+                    bbox[1] - page_top,
+                    bbox[2] - page_x0,
+                    bbox[3] - page_top,
+                )
+            ),
+        )
+        for bbox in semantic
     ]
 
 
@@ -239,10 +249,11 @@ def _crop_rendered_region(
     destination: Path,
     index: int,
 ) -> None:
-    x0, top, x1, bottom = region.bbox
+    crop_bbox = region.crop_bbox or region.bbox
+    x0, top, x1, bottom = crop_bbox
     if (
         region.page_number <= 0
-        or not _valid_bbox(region.bbox)
+        or not _valid_bbox(crop_bbox)
         or not math.isfinite(region.page_width)
         or not math.isfinite(region.page_height)
         or region.page_width <= 0
@@ -284,11 +295,6 @@ def _crop_rendered_region(
 
 def _object_bbox(
     item: object,
-    *,
-    page_x0: float,
-    page_top: float,
-    page_width: float,
-    page_height: float,
 ) -> tuple[float, float, float, float] | None:
     if not isinstance(item, Mapping):
         return None
@@ -300,14 +306,27 @@ def _object_bbox(
     except (KeyError, TypeError, ValueError):
         return None
     bbox = (
-        max(0.0, min(page_width, min(x0, x1) - page_x0)),
-        max(0.0, min(page_height, min(top, bottom) - page_top)),
-        max(0.0, min(page_width, max(x0, x1) - page_x0)),
-        max(0.0, min(page_height, max(top, bottom) - page_top)),
+        min(x0, x1),
+        min(top, bottom),
+        max(x0, x1),
+        max(top, bottom),
     )
     if not all(math.isfinite(value) for value in bbox):
         return None
     return bbox
+
+
+def _clip_bbox(
+    bbox: tuple[float, float, float, float],
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    clipped = (
+        max(bbox[0], bounds[0]),
+        max(bbox[1], bounds[1]),
+        min(bbox[2], bounds[2]),
+        min(bbox[3], bounds[3]),
+    )
+    return clipped if _valid_bbox(clipped) else None
 
 
 def _page_origin(page: object) -> tuple[float, float]:

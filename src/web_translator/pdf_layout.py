@@ -959,19 +959,13 @@ def extract_link_evidence(
 
     for page_index, page in enumerate(reader.pages):
         page_number = page_index + 1
-        try:
-            page_height = float(page.mediabox.height)
-        except (TypeError, ValueError) as error:
-            raise PdfExtractionError(
-                f"cannot map PDF links on page {page_number}: invalid page bounds"
-            ) from error
         annotations = page.get("/Annots", ())
         for annotation_index, reference in enumerate(annotations, start=1):
             try:
                 annotation = reference.get_object()
                 if str(annotation.get("/Subtype", "")) != "/Link":
                     continue
-                source_bbox = _annotation_bbox(annotation.get("/Rect"), page_height)
+                source_bbox = _annotation_bbox(annotation.get("/Rect"), page)
                 owners = _blocks_intersecting_bbox(by_page.get(page_number, ()), source_bbox)
             except Exception:
                 warnings.append(
@@ -1347,7 +1341,7 @@ def _horizontal_bbox_gap(
 
 
 def _annotation_bbox(
-    value: object, page_height: float
+    value: object, page: object
 ) -> tuple[float, float, float, float]:
     if (
         not isinstance(value, Sequence)
@@ -1356,12 +1350,11 @@ def _annotation_bbox(
     ):
         raise ValueError("invalid link rectangle")
     x0, y0, x1, y1 = (float(item) for item in value)
-    return (
-        min(x0, x1),
-        page_height - max(y0, y1),
-        max(x0, x1),
-        page_height - min(y0, y1),
-    )
+    points = [
+        _pdf_point_to_plumber(page, x, y)
+        for x, y in ((x0, y0), (x0, y1), (x1, y0), (x1, y1))
+    ]
+    return _points_bbox(points)
 
 
 def _blocks_intersecting_bbox(
@@ -1431,9 +1424,15 @@ def _map_internal_destination(
     candidates = sorted(by_page.get(page_index + 1, ()), key=lambda block: block.order)
     if not candidates:
         return None
+    page = reader.pages[page_index]
     try:
-        media_box = reader.pages[page_index].mediabox
-        page_height = float(media_box.height)
+        media_box = page.mediabox
+        page_left, page_right = sorted(
+            (float(media_box.left), float(media_box.right))
+        )
+        page_bottom, page_top = sorted(
+            (float(media_box.bottom), float(media_box.top))
+        )
     except (AttributeError, TypeError, ValueError):
         return None
 
@@ -1446,43 +1445,133 @@ def _map_internal_destination(
     elif mode in {"/FitH", "/FitBH"}:
         if top is None:
             return candidates[0] if len(candidates) == 1 else None
-        y = page_height - top
-        matches = [
-            block
-            for block in candidates
-            if block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6
-        ]
+        matches = _blocks_intersecting_segment(
+            candidates,
+            _pdf_point_to_plumber(page, page_left, top),
+            _pdf_point_to_plumber(page, page_right, top),
+        )
     elif mode in {"/FitV", "/FitBV"}:
         if left is None:
             return candidates[0] if len(candidates) == 1 else None
-        x = left
-        matches = [
-            block
-            for block in candidates
-            if block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6
-        ]
+        matches = _blocks_intersecting_segment(
+            candidates,
+            _pdf_point_to_plumber(page, left, page_bottom),
+            _pdf_point_to_plumber(page, left, page_top),
+        )
     elif mode == "/FitR":
         if None in {left, bottom, right, top}:
             return None
-        target_bbox = (
-            min(left, right),
-            page_height - max(bottom, top),
-            max(left, right),
-            page_height - min(bottom, top),
+        target_bbox = _points_bbox(
+            [
+                _pdf_point_to_plumber(page, x, y)
+                for x, y in (
+                    (left, bottom),
+                    (left, top),
+                    (right, bottom),
+                    (right, top),
+                )
+            ]
         )
         matches = _blocks_intersecting_bbox(candidates, target_bbox)
     elif mode == "/XYZ":
-        x = left
-        y = None if top is None else page_height - top
-        matches = [
-            block
-            for block in candidates
-            if (x is None or block.bbox[0] - 1e-6 <= x <= block.bbox[2] + 1e-6)
-            and (y is None or block.bbox[1] - 1e-6 <= y <= block.bbox[3] + 1e-6)
-        ]
+        if left is not None and top is not None:
+            point = _pdf_point_to_plumber(page, left, top)
+            matches = [
+                block
+                for block in candidates
+                if block.bbox[0] - 1e-6 <= point[0] <= block.bbox[2] + 1e-6
+                and block.bbox[1] - 1e-6 <= point[1] <= block.bbox[3] + 1e-6
+            ]
+        elif left is not None:
+            matches = _blocks_intersecting_segment(
+                candidates,
+                _pdf_point_to_plumber(page, left, page_bottom),
+                _pdf_point_to_plumber(page, left, page_top),
+            )
+        elif top is not None:
+            matches = _blocks_intersecting_segment(
+                candidates,
+                _pdf_point_to_plumber(page, page_left, top),
+                _pdf_point_to_plumber(page, page_right, top),
+            )
+        else:
+            matches = candidates if len(candidates) == 1 else []
     else:
         return None
     return matches[0] if len(matches) == 1 else None
+
+
+def _pdf_point_to_plumber(
+    page: object,
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    """Map a raw PDF point to pdfplumber's rotated, top-origin coordinates."""
+    try:
+        media_box = page.mediabox  # type: ignore[attr-defined]
+        x0, x1 = sorted((float(media_box.left), float(media_box.right)))
+        y0, y1 = sorted((float(media_box.bottom), float(media_box.top)))
+        rotation = int(page.get("/Rotate", 0)) % 360  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("invalid PDF page geometry") from error
+    if rotation == 0:
+        a, b, c, d, e, f = (1.0, 0.0, 0.0, 1.0, -x0, -y0)
+        normalized = (x0, y0, x1, y1)
+    elif rotation == 90:
+        a, b, c, d, e, f = (0.0, -1.0, 1.0, 0.0, -y0, x1)
+        normalized = (y0, x0, y1, x1)
+    elif rotation == 180:
+        a, b, c, d, e, f = (-1.0, 0.0, 0.0, -1.0, x1, y1)
+        normalized = (x0, y0, x1, y1)
+    elif rotation == 270:
+        a, b, c, d, e, f = (0.0, 1.0, -1.0, 0.0, y1, -x0)
+        normalized = (y0, x0, y1, x1)
+    else:
+        raise ValueError("PDF page rotation must be a multiple of 90 degrees")
+    media_height = normalized[3] - normalized[1]
+    media_x0 = normalized[0]
+    media_top = media_height - normalized[3]
+    transformed_x = a * x + c * y + e
+    transformed_y = b * x + d * y + f
+    return (
+        transformed_x + media_x0,
+        media_height - transformed_y + media_top,
+    )
+
+
+def _points_bbox(
+    points: Sequence[tuple[float, float]],
+) -> tuple[float, float, float, float]:
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+
+
+def _blocks_intersecting_segment(
+    blocks: Sequence[PdfBlock],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> list[PdfBlock]:
+    x0, x1 = sorted((start[0], end[0]))
+    top, bottom = sorted((start[1], end[1]))
+    if abs(x1 - x0) <= 1e-6:
+        return [
+            block
+            for block in blocks
+            if block.bbox[0] - 1e-6 <= x0 <= block.bbox[2] + 1e-6
+            and min(block.bbox[3], bottom) >= max(block.bbox[1], top) - 1e-6
+        ]
+    if abs(bottom - top) <= 1e-6:
+        return [
+            block
+            for block in blocks
+            if block.bbox[1] - 1e-6 <= top <= block.bbox[3] + 1e-6
+            and min(block.bbox[2], x1) >= max(block.bbox[0], x0) - 1e-6
+        ]
+    return []
 
 
 def _destination_array_values(
