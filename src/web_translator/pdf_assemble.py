@@ -18,14 +18,30 @@ import stat
 import struct
 import sys
 from typing import Any, BinaryIO
-from xml.sax.saxutils import escape
+from urllib.parse import urlsplit
+from xml.sax.saxutils import escape, quoteattr
 
+from PIL import Image as PillowImage
+from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4, LETTER
+from reportlab.lib.pagesizes import A4, LETTER, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    Image,
+    KeepTogether,
+    NextPageTemplate,
+    PageBreak,
+    PageTemplate,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 import web_translator.pdf_acquire as pdf_acquire_module
 from web_translator.models import (
@@ -58,7 +74,14 @@ _DIRFD_PUBLICATION_SUPPORTED = all(
     operation in os.supports_dir_fd
     for operation in (os.link, os.mkdir, os.open, os.rmdir, os.stat, os.unlink)
 )
-_BASIC_KINDS = {"heading", "paragraph", "list-item"}
+_TEXT_KINDS = {
+    "heading",
+    "paragraph",
+    "list-item",
+    "table-cell",
+    "caption",
+    "footnote",
+}
 _IGNORED_KINDS = {"header", "footer", "page-number"}
 _ALIGNMENTS = {
     "left": TA_LEFT,
@@ -68,6 +91,11 @@ _ALIGNMENTS = {
 }
 _LIST_INDENT_TOLERANCE = 3.0
 _CANONICAL_BULLET_MARKERS = {"•", "‣", "◦", "⁃", "∙"}
+_RICH_KINDS = {"table-cell", "figure", "caption", "footnote"}
+_TABLE_COLUMN_MINIMUM = 54.0
+_TABLE_CELL_PADDING = 5.0
+_FIGURE_RENDER_DPI = 144.0
+_PAGE_LOCAL_FOOTNOTE_HEIGHT = 60.0
 
 
 @dataclass(slots=True)
@@ -147,6 +175,8 @@ def assemble_pdf(
     temporary_name: str | None = None
     run_anchor: _DirectoryAnchor | None = None
     evidence_files: dict[str, _OpenedFile] = {}
+    media_anchor: _DirectoryAnchor | None = None
+    media_files: dict[str, _OpenedFile] = {}
     temporary_anchor: _DirectoryAnchor | None = None
     temporary_staging_anchor: _DirectoryAnchor | None = None
     staging_anchor: _DirectoryAnchor | None = None
@@ -190,6 +220,30 @@ def assemble_pdf(
             translations,
             glossary,
         )
+        _validate_rich_relationships(document)
+        media_payloads: dict[str, bytes] = {}
+        figure_blocks = [block for block in document.blocks if block.kind == "figure"]
+        if figure_blocks:
+            media_anchor = _open_existing_child_directory(
+                run_anchor,
+                "media",
+                "PDF media",
+            )
+            for block in figure_blocks:
+                assert block.media_path is not None
+                media_name = _media_name(block)
+                opened = _open_anchored_input_file(
+                    media_anchor,
+                    media_name,
+                    f"figure media for {block.id}",
+                )
+                media_files[media_name] = opened
+                media_payloads[block.id] = _read_opened_bytes(
+                    opened,
+                    run_dir / block.media_path,
+                    f"figure media for {block.id}",
+                )
+            _verify_anchored_evidence(media_anchor, media_files)
         page_size = _select_page_size(document)
         _verify_anchored_evidence(run_anchor, evidence_files)
         temporary_name, temporary_anchor = _create_unique_child_directory(
@@ -206,12 +260,29 @@ def assemble_pdf(
             temporary_staging_anchor,
             "translated.pdf",
         )
-        records = _build_basic_document(
-            ordered,
-            source,
-            temporary_pdf.stream,
-            page_size,
+        uses_rich_layout = any(
+            block.kind in _RICH_KINDS or block.kind in _IGNORED_KINDS
+            for block in document.blocks
         )
+        if uses_rich_layout:
+            records = _build_rich_document(
+                document,
+                ordered,
+                source,
+                temporary_pdf.stream,
+                page_size,
+                media_payloads,
+            )
+        else:
+            records = _build_basic_document(
+                ordered,
+                source,
+                temporary_pdf.stream,
+                page_size,
+            )
+        if media_anchor is not None:
+            _verify_anchored_evidence(media_anchor, media_files)
+        records.sort(key=lambda item: (item.source_order, item.split_part))
         digest = _finalize_opened_file(temporary_pdf, "staged PDF")
         temporary_pdf.stream.close()
         temporary_staging_anchor.verify_visible()
@@ -327,6 +398,10 @@ def assemble_pdf(
             staging_anchor.close()
         for opened in evidence_files.values():
             _close_opened_file(opened)
+        for opened in media_files.values():
+            _close_opened_file(opened)
+        if media_anchor is not None:
+            media_anchor.close()
         if run_anchor is not None:
             run_anchor.close()
 
@@ -375,12 +450,28 @@ def _read_opened_utf8(
     context: str,
 ) -> str:
     try:
+        payload = _read_opened_bytes(opened, path, context)
+        return payload.decode("utf-8")
+    except (OSError, UnicodeError, TypeError) as error:
+        raise PdfAssemblyError(f"cannot read {context} {path}: {error}") from error
+
+
+def _read_opened_bytes(
+    opened: _OpenedFile,
+    path: Path,
+    context: str,
+) -> bytes:
+    try:
         opened.stream.seek(0)
         payload = opened.stream.read()
         if not isinstance(payload, bytes):
             raise TypeError("anchored evidence stream did not return bytes")
-        return payload.decode("utf-8")
-    except (OSError, UnicodeError, TypeError) as error:
+        if not payload:
+            raise PdfAssemblyError(f"{context} is empty: {path}")
+        return payload
+    except PdfAssemblyError:
+        raise
+    except (OSError, TypeError) as error:
         raise PdfAssemblyError(f"cannot read {context} {path}: {error}") from error
 
 
@@ -409,9 +500,21 @@ def _normalize_pdf_translations(
                     f"ignored PDF block cannot have a translation segment: {block.id}"
                 )
             continue
-        if block.kind not in _BASIC_KINDS:
+        if block.kind == "figure":
+            if block.segment_id is not None:
+                raise PdfAssemblyError(
+                    f"figure blocks cannot have translation segments: {block.id}"
+                )
+            continue
+        if block.kind == "table-cell" and not block.source_text.strip():
+            if block.segment_id is not None:
+                raise PdfAssemblyError(
+                    f"empty table cells cannot have translation segments: {block.id}"
+                )
+            continue
+        if block.kind not in _TEXT_KINDS:
             raise PdfAssemblyError(
-                f"unsupported PDF block kind before Task 8: {block.kind} ({block.id})"
+                f"unsupported PDF block kind: {block.kind} ({block.id})"
             )
         if block.segment_id is None:
             raise PdfAssemblyError(f"visible PDF block is missing a segment: {block.id}")
@@ -482,6 +585,139 @@ def _normalize_pdf_translations(
     return restored
 
 
+def _validate_rich_relationships(document: PdfDocument) -> None:
+    by_id = {block.id: block for block in document.blocks}
+    table_blocks = {
+        block.id: block for block in document.blocks if block.kind == "table-cell"
+    }
+    cells_by_block = {cell.block_id: cell for cell in document.table_cells}
+    if set(table_blocks) != set(cells_by_block):
+        raise PdfAssemblyError(
+            "table cells and table-cell blocks must match exactly"
+        )
+    occupied_by_table: dict[str, set[tuple[int, int]]] = {}
+    for block_id, block in table_blocks.items():
+        cell = cells_by_block[block_id]
+        if (
+            block.table_id,
+            block.row,
+            block.column,
+            block.row_span,
+            block.column_span,
+        ) != (
+            cell.table_id,
+            cell.row,
+            cell.column,
+            cell.row_span,
+            cell.column_span,
+        ):
+            raise PdfAssemblyError(f"table metadata mismatch for {block_id}")
+        occupied = occupied_by_table.setdefault(cell.table_id, set())
+        for row in range(cell.row, cell.row + cell.row_span):
+            for column in range(cell.column, cell.column + cell.column_span):
+                coordinate = (row, column)
+                if coordinate in occupied:
+                    raise PdfAssemblyError(
+                        f"overlapping table spans in {cell.table_id}"
+                    )
+                occupied.add(coordinate)
+
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    captions = [block for block in document.blocks if block.kind == "caption"]
+    media_names = [_media_name(figure) for figure in figures]
+    if len(media_names) != len(set(media_names)):
+        raise PdfAssemblyError("figure media paths must be unique")
+    claimed_captions: set[str] = set()
+    for figure in figures:
+        if figure.caption_id is None:
+            raise PdfAssemblyError(f"figure is missing its caption: {figure.id}")
+        caption = by_id.get(figure.caption_id)
+        if (
+            caption is None
+            or caption.kind != "caption"
+            or caption.caption_id != figure.id
+            or caption.id in claimed_captions
+        ):
+            raise PdfAssemblyError(
+                f"ambiguous figure-caption relationship for {figure.id}"
+            )
+        claimed_captions.add(caption.id)
+        page = document.pages[figure.page_number - 1]
+        x0, top, x1, bottom = figure.bbox
+        if (
+            x0 < 0
+            or top < 0
+            or x1 > page.width
+            or bottom > page.height
+            or x1 <= x0
+            or bottom <= top
+        ):
+            raise PdfAssemblyError(
+                f"figure bounds fall outside source page: {figure.id}"
+            )
+    if claimed_captions != {caption.id for caption in captions}:
+        raise PdfAssemblyError("every caption must have one reciprocal figure")
+
+    emitted_ids = {
+        block.id
+        for block in document.blocks
+        if block.kind not in _IGNORED_KINDS
+    }
+    footnote_ids = {
+        block.id for block in document.blocks if block.kind == "footnote"
+    }
+    footnote_owners = {identifier: [] for identifier in footnote_ids}
+    for block in document.blocks:
+        if block.uri is not None and block.destination is not None:
+            raise PdfAssemblyError(
+                f"PDF block cannot have both URI and internal destination: {block.id}"
+            )
+        if block.uri is not None:
+            _safe_uri(block.uri, block.id)
+        if block.destination is not None:
+            if block.destination not in emitted_ids:
+                raise PdfAssemblyError(
+                    f"unresolved internal destination for {block.id}: "
+                    f"{block.destination}"
+                )
+            if block.destination in footnote_owners:
+                footnote_owners[block.destination].append(block.id)
+    for footnote_id, owners in footnote_owners.items():
+        if len(owners) != 1:
+            raise PdfAssemblyError(
+                f"footnote must have exactly one marker owner: {footnote_id}"
+            )
+
+
+def _media_name(block: PdfBlock) -> str:
+    if block.kind != "figure" or block.media_path is None:
+        raise PdfAssemblyError(f"figure is missing media: {block.id}")
+    media_path = Path(block.media_path)
+    if (
+        media_path.parts[:1] != ("media",)
+        or len(media_path.parts) != 2
+        or media_path.name != media_path.parts[1]
+        or media_path.suffix.lower() != ".png"
+    ):
+        raise PdfAssemblyError(f"unsafe figure media path: {block.media_path}")
+    return media_path.name
+
+
+def _safe_uri(uri: str, block_id: str) -> str:
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in uri):
+        raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+    parsed = urlsplit(uri)
+    if parsed.scheme.lower() not in {"http", "https", "mailto"}:
+        raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+    if parsed.scheme.lower() in {"http", "https"} and not parsed.netloc:
+        raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+    return uri
+
+
+def _anchor_name(block_id: str) -> str:
+    return "wt-" + re.sub(r"[^A-Za-z0-9_.-]", "-", block_id)
+
+
 def _build_basic_document(
     ordered: Sequence[tuple[PdfBlock, Segment, str]],
     source: PdfSourceRecord,
@@ -538,28 +774,7 @@ def _build_basic_document(
                     )
                 )
             story.append(Spacer(1.0, 16.0))
-            attribution_style = ParagraphStyle(
-                "WT-SourceAttribution",
-                fontName=REGULAR_FONT_NAME,
-                fontSize=MINIMUM_FONT_SIZE,
-                leading=11.0,
-                textColor="#444444",
-                spaceBefore=6.0,
-                spaceAfter=0.0,
-            )
-            source_label = source.final_source
-            generated = datetime.now(UTC).isoformat(timespec="seconds").replace(
-                "+00:00", "Z"
-            )
-            story.append(
-                Paragraph(
-                    f'<font name="{BOLD_FONT_NAME}">Source:</font> '
-                    f"{escape(source_label)}<br/>"
-                    f'<font name="{BOLD_FONT_NAME}">Generated:</font> '
-                    f"{escape(generated)}",
-                    attribution_style,
-                )
-            )
+            story.append(_source_attribution(source))
             pdf = SimpleDocTemplate(
                 destination,
                 pagesize=(page_size.width, page_size.height),
@@ -581,6 +796,702 @@ def _build_basic_document(
     ):
         raise PdfAssemblyError("tracked flowables were emitted out of document order")
     return records
+
+
+def _build_rich_document(
+    document: PdfDocument,
+    ordered: Sequence[tuple[PdfBlock, Segment, str]],
+    source: PdfSourceRecord,
+    destination: BinaryIO,
+    page_size: PdfPageSize,
+    media_payloads: Mapping[str, bytes],
+) -> list[PdfFlowableLayout]:
+    records: list[PdfFlowableLayout] = []
+    part_counters: dict[str, int] = {}
+    translated = {block.id: text for block, _segment, text in ordered}
+    block_by_id = {block.id: block for block in document.blocks}
+    left_margin = right_margin = 54.0
+    top_margin = 54.0
+    bottom_margin = 42.0
+    portrait_size = (page_size.width, page_size.height)
+    landscape_size = landscape(portrait_size)
+
+    def frames_for(size: tuple[float, float]) -> tuple[
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+    ]:
+        width, height = size
+        footnote_frame = (
+            left_margin,
+            bottom_margin,
+            width - left_margin - right_margin,
+            _PAGE_LOCAL_FOOTNOTE_HEIGHT,
+        )
+        body_y = bottom_margin + _PAGE_LOCAL_FOOTNOTE_HEIGHT + 8.0
+        body_frame = (
+            left_margin,
+            body_y,
+            width - left_margin - right_margin,
+            height - top_margin - body_y,
+        )
+        return body_frame, footnote_frame
+
+    portrait_frame, portrait_footnote_frame = frames_for(portrait_size)
+    landscape_frame, landscape_footnote_frame = frames_for(landscape_size)
+    page_local_notes, section_notes, owner_to_note = _classify_footnotes(document)
+    scheduled_page_notes: dict[int, list[str]] = {}
+    scheduled_note_pages: dict[str, int] = {}
+    drawn_page_notes: set[tuple[int, str]] = set()
+    running_header = _running_block(document, "header")
+    running_footer = _running_block(document, "footer")
+    running_page_number = _running_block(document, "page-number")
+    running_style = ParagraphStyle(
+        "WT-Running",
+        fontName=REGULAR_FONT_NAME,
+        fontSize=MINIMUM_FONT_SIZE,
+        leading=11.0,
+        textColor="#555555",
+    )
+    footnote_style = ParagraphStyle(
+        "WT-PageFootnote",
+        fontName=REGULAR_FONT_NAME,
+        fontSize=MINIMUM_FONT_SIZE,
+        leading=11.0,
+        textColor="#333333",
+        spaceAfter=2.0,
+    )
+
+    def schedule_page_note(note_id: str) -> Any:
+        def schedule(_canvas: Any, page_number: int) -> None:
+            if note_id in scheduled_note_pages:
+                return
+            scheduled_note_pages[note_id] = page_number
+            notes = scheduled_page_notes.setdefault(page_number, [])
+            notes.append(note_id)
+
+        return schedule
+
+    def draw_running(canvas: Any, _doc: BaseDocTemplate, *, orientation: str) -> None:
+        width, height = (
+            portrait_size if orientation == "portrait" else landscape_size
+        )
+        page_number = int(canvas.getPageNumber())
+        if running_header is not None:
+            frame = (left_margin, height - 37.0, width - 108.0, 13.0)
+            flowable = TrackedFlowable(
+                Paragraph(escape(running_header.source_text), running_style),
+                block_id=running_header.id,
+                kind="header",
+                source_order=running_header.order,
+                split_part=0,
+                font_size=MINIMUM_FONT_SIZE,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+            )
+            flowable.wrapOn(canvas, frame[2], frame[3])
+            flowable.drawOn(canvas, frame[0], frame[1])
+        if running_footer is not None:
+            frame = (left_margin, 20.0, width - 180.0, 13.0)
+            flowable = TrackedFlowable(
+                Paragraph(escape(running_footer.source_text), running_style),
+                block_id=running_footer.id,
+                kind="footer",
+                source_order=running_footer.order,
+                split_part=0,
+                font_size=MINIMUM_FONT_SIZE,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+            )
+            flowable.wrapOn(canvas, frame[2], frame[3])
+            flowable.drawOn(canvas, frame[0], frame[1])
+        if running_page_number is not None:
+            frame = (width - right_margin - 54.0, 20.0, 54.0, 13.0)
+            page_style = ParagraphStyle(
+                "WT-PageNumber",
+                parent=running_style,
+                alignment=TA_RIGHT,
+            )
+            flowable = TrackedFlowable(
+                Paragraph(str(page_number), page_style),
+                block_id=running_page_number.id,
+                kind="page-number",
+                source_order=running_page_number.order,
+                split_part=0,
+                font_size=MINIMUM_FONT_SIZE,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+            )
+            flowable.wrapOn(canvas, frame[2], frame[3])
+            flowable.drawOn(canvas, frame[0], frame[1])
+
+    def draw_page_notes(
+        canvas: Any,
+        _doc: BaseDocTemplate,
+        *,
+        orientation: str,
+    ) -> None:
+        page_number = int(canvas.getPageNumber())
+        note_ids = scheduled_page_notes.get(page_number, [])
+        if not note_ids:
+            return
+        frame = (
+            portrait_footnote_frame
+            if orientation == "portrait"
+            else landscape_footnote_frame
+        )
+        cursor = frame[1] + frame[3]
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#888888"))
+        canvas.setLineWidth(0.5)
+        canvas.line(frame[0], cursor, frame[0] + frame[2], cursor)
+        canvas.restoreState()
+        cursor -= 4.0
+        for note_id in note_ids:
+            if (page_number, note_id) in drawn_page_notes:
+                continue
+            block = block_by_id[note_id]
+            paragraph = Paragraph(
+                _linked_markup(block, translated[note_id]),
+                footnote_style,
+            )
+            flowable = TrackedFlowable(
+                paragraph,
+                block_id=block.id,
+                kind="footnote",
+                source_order=block.order,
+                split_part=0,
+                font_size=MINIMUM_FONT_SIZE,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+                anchor_name=_anchor_name(block.id),
+            )
+            _width, height = flowable.wrapOn(canvas, frame[2], cursor - frame[1])
+            cursor -= height
+            if cursor < frame[1] - 1e-6:
+                raise PdfAssemblyError(
+                    f"page-local footnotes exceed their frame on page {page_number}"
+                )
+            flowable.drawOn(canvas, frame[0], cursor)
+            drawn_page_notes.add((page_number, note_id))
+
+    portrait_template = PageTemplate(
+        id="portrait",
+        pagesize=portrait_size,
+        frames=[Frame(*portrait_frame, id="portrait-body", showBoundary=0)],
+        onPage=lambda canvas, doc: draw_running(
+            canvas, doc, orientation="portrait"
+        ),
+        onPageEnd=lambda canvas, doc: draw_page_notes(
+            canvas, doc, orientation="portrait"
+        ),
+    )
+    landscape_template = PageTemplate(
+        id="landscape",
+        pagesize=landscape_size,
+        frames=[Frame(*landscape_frame, id="landscape-body", showBoundary=0)],
+        onPage=lambda canvas, doc: draw_running(
+            canvas, doc, orientation="landscape"
+        ),
+        onPageEnd=lambda canvas, doc: draw_page_notes(
+            canvas, doc, orientation="landscape"
+        ),
+    )
+
+    heading_sizes = sorted(
+        {
+            round(block.style.font_size)
+            for block, _segment, _text in ordered
+            if block.kind == "heading"
+        },
+        reverse=True,
+    )
+    list_levels = _relative_list_levels(ordered)
+    tables = _table_blocks(document)
+    table_header_rows = _table_header_rows(document)
+    table_orientation = {
+        table_id: _table_widths(
+            table_id,
+            table_blocks,
+            translated,
+            portrait_frame[2],
+            landscape_frame[2],
+        )
+        for table_id, table_blocks in tables.items()
+    }
+    first_emitted = next(
+        (
+            block
+            for block in document.blocks
+            if block.kind not in _IGNORED_KINDS
+            and block.id not in page_local_notes
+        ),
+        None,
+    )
+    initial_landscape = bool(
+        first_emitted is not None
+        and first_emitted.table_id is not None
+        and table_orientation[first_emitted.table_id][1] == "landscape"
+    )
+    story: list[Any] = []
+    emitted_tables: set[str] = set()
+    emitted_captions: set[str] = set()
+    emitted_section_notes: set[str] = set()
+
+    def append_text(block: PdfBlock, frame: tuple[float, float, float, float]) -> None:
+        if block.id not in translated:
+            raise PdfAssemblyError(f"translated text is missing for {block.id}")
+        text = translated[block.id]
+        bullet_text: str | None = None
+        rendered_text = text
+        if block.kind == "list-item":
+            bullet_text, rendered_text = _normalized_list_parts(block, text)
+        if block.kind in {"caption", "footnote"}:
+            font_size = MINIMUM_FONT_SIZE
+            style = ParagraphStyle(
+                f"WT-{block.kind}-{block.order}",
+                fontName=REGULAR_FONT_NAME,
+                fontSize=font_size,
+                leading=11.0,
+                textColor="#333333",
+                spaceBefore=2.0,
+                spaceAfter=5.0,
+            )
+        else:
+            font_size, style = _style_for_block(
+                block,
+                heading_sizes=heading_sizes,
+                list_level=list_levels.get(block.id, 0),
+            )
+        note_id = owner_to_note.get(block.id)
+        on_draw = (
+            schedule_page_note(note_id)
+            if note_id is not None and note_id in page_local_notes
+            else None
+        )
+        story.append(
+            TrackedFlowable(
+                Paragraph(
+                    _linked_markup(block, rendered_text),
+                    style,
+                    bulletText=(
+                        escape(bullet_text) if bullet_text is not None else None
+                    ),
+                ),
+                block_id=block.id,
+                kind=block.kind,
+                source_order=block.order,
+                split_part=0,
+                font_size=font_size,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+                anchor_name=_anchor_name(block.id),
+                on_draw=on_draw,
+            )
+        )
+
+    def append_pending_section_notes(before_order: int | None) -> None:
+        pending = sorted(
+            (
+                (block_by_id[owner_id].order, note_id)
+                for owner_id, note_id in owner_to_note.items()
+                if note_id in section_notes and note_id not in emitted_section_notes
+            ),
+            key=lambda item: (item[0], block_by_id[item[1]].order),
+        )
+        for owner_order, note_id in pending:
+            if before_order is not None and owner_order >= before_order:
+                continue
+            append_text(block_by_id[note_id], portrait_frame)
+            emitted_section_notes.add(note_id)
+
+    try:
+        with ExitStack() as stack:
+            _register_fonts(stack)
+            for block in document.blocks:
+                if block.kind in _IGNORED_KINDS or block.id in page_local_notes:
+                    continue
+                if block.kind == "heading":
+                    append_pending_section_notes(block.order)
+                if block.kind == "table-cell":
+                    assert block.table_id is not None
+                    if block.table_id in emitted_tables:
+                        continue
+                    widths, orientation = table_orientation[block.table_id]
+                    table_frame = (
+                        portrait_frame
+                        if orientation == "portrait"
+                        else landscape_frame
+                    )
+                    if orientation == "landscape" and not (
+                        initial_landscape and not story
+                    ):
+                        story.extend([NextPageTemplate("landscape"), PageBreak()])
+                    story.append(
+                        _native_table(
+                            block.table_id,
+                            tables[block.table_id],
+                            translated,
+                            widths,
+                            table_frame,
+                            records,
+                            part_counters,
+                            table_header_rows[block.table_id],
+                        )
+                    )
+                    emitted_tables.add(block.table_id)
+                    if orientation == "landscape":
+                        story.extend([NextPageTemplate("portrait"), PageBreak()])
+                    continue
+                if block.kind == "figure":
+                    assert block.caption_id is not None
+                    caption = block_by_id[block.caption_id]
+                    image = _figure_flowable(
+                        block,
+                        media_payloads[block.id],
+                        portrait_frame,
+                        records,
+                        part_counters,
+                    )
+                    caption_style = ParagraphStyle(
+                        f"WT-caption-{caption.order}",
+                        fontName=REGULAR_FONT_NAME,
+                        fontSize=MINIMUM_FONT_SIZE,
+                        leading=11.0,
+                        textColor="#333333",
+                        spaceBefore=2.0,
+                        spaceAfter=6.0,
+                    )
+                    caption_flowable = TrackedFlowable(
+                        Paragraph(
+                            _linked_markup(caption, translated[caption.id]),
+                            caption_style,
+                        ),
+                        block_id=caption.id,
+                        kind="caption",
+                        source_order=caption.order,
+                        split_part=0,
+                        font_size=MINIMUM_FONT_SIZE,
+                        frame=portrait_frame,
+                        records=records,
+                        part_counters=part_counters,
+                        anchor_name=_anchor_name(caption.id),
+                    )
+                    story.append(KeepTogether([image, caption_flowable]))
+                    emitted_captions.add(caption.id)
+                    continue
+                if block.kind == "caption" and block.id in emitted_captions:
+                    continue
+                if block.kind == "footnote" and block.id in section_notes:
+                    continue
+                append_text(block, portrait_frame)
+            append_pending_section_notes(None)
+            story.append(Spacer(1.0, 16.0))
+            story.append(_source_attribution(source))
+            pdf = BaseDocTemplate(
+                destination,
+                pagesize=(
+                    landscape_size if initial_landscape else portrait_size
+                ),
+                leftMargin=left_margin,
+                rightMargin=right_margin,
+                topMargin=top_margin,
+                bottomMargin=bottom_margin,
+                title="Reviewed Korean translation",
+                author="web-translator",
+                subject="Selectable Korean PDF translation",
+            )
+            templates = (
+                [landscape_template, portrait_template]
+                if initial_landscape
+                else [portrait_template, landscape_template]
+            )
+            pdf.addPageTemplates(templates)
+            pdf.build(story)
+    except PdfAssemblyError:
+        raise
+    except Exception as error:
+        raise PdfAssemblyError(f"ReportLab PDF assembly failed: {error}") from error
+    if set(page_local_notes) != {
+        note_id for _page, note_id in drawn_page_notes
+    }:
+        raise PdfAssemblyError("not every page-local footnote was emitted")
+    return records
+
+
+def _linked_markup(block: PdfBlock, text: str) -> str:
+    rendered = escape(text)
+    if block.uri is not None:
+        return f"<link href={quoteattr(_safe_uri(block.uri, block.id))}>{rendered}</link>"
+    if block.destination is not None:
+        return (
+            f"<link href={quoteattr('#' + _anchor_name(block.destination))}>"
+            f"{rendered}</link>"
+        )
+    return rendered
+
+
+def _classify_footnotes(
+    document: PdfDocument,
+) -> tuple[set[str], set[str], dict[str, str]]:
+    footnotes = [block for block in document.blocks if block.kind == "footnote"]
+    owners = {
+        block.destination: block
+        for block in document.blocks
+        if block.destination in {footnote.id for footnote in footnotes}
+    }
+    page_local = {
+        footnote.id
+        for footnote in footnotes
+        if owners[footnote.id].page_number == footnote.page_number
+    }
+    section = {footnote.id for footnote in footnotes} - page_local
+    return page_local, section, {
+        owner.id: note_id for note_id, owner in owners.items()
+    }
+
+
+def _running_block(document: PdfDocument, kind: str) -> PdfBlock | None:
+    blocks = [block for block in document.blocks if block.kind == kind]
+    if not blocks:
+        return None
+    if kind != "page-number" and len({block.source_text for block in blocks}) != 1:
+        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    return blocks[0]
+
+
+def _table_blocks(document: PdfDocument) -> dict[str, list[PdfBlock]]:
+    tables: dict[str, list[PdfBlock]] = {}
+    for block in document.blocks:
+        if block.kind == "table-cell":
+            assert block.table_id is not None
+            tables.setdefault(block.table_id, []).append(block)
+    return tables
+
+
+def _table_header_rows(document: PdfDocument) -> dict[str, set[int]]:
+    rows_by_table: dict[str, dict[int, list[bool]]] = {}
+    for cell in document.table_cells:
+        rows_by_table.setdefault(cell.table_id, {}).setdefault(cell.row, []).append(
+            cell.is_header
+        )
+    result: dict[str, set[int]] = {}
+    for table_id, rows in rows_by_table.items():
+        mixed = [row for row, values in rows.items() if any(values) and not all(values)]
+        if mixed:
+            raise PdfAssemblyError(
+                f"table {table_id} has mixed header status in row {mixed[0]}"
+            )
+        header_rows = {row for row, values in rows.items() if values and all(values)}
+        if header_rows and header_rows != set(range(max(header_rows) + 1)):
+            raise PdfAssemblyError(f"table {table_id} has non-prefix header rows")
+        result[table_id] = header_rows
+    return result
+
+
+def _table_widths(
+    table_id: str,
+    blocks: Sequence[PdfBlock],
+    translated: Mapping[str, str],
+    portrait_width: float,
+    landscape_width: float,
+) -> tuple[list[float], str]:
+    column_count = max(
+        (block.column or 0) + block.column_span for block in blocks
+    )
+    widths = [_TABLE_COLUMN_MINIMUM] * column_count
+    for block in blocks:
+        if not block.source_text.strip():
+            continue
+        text = translated[block.id]
+        tokens = text.split() or [text]
+        # The exact face is registered only inside the build ExitStack.  A
+        # conservative normalized-glyph estimate keeps sizing independent of
+        # prior global ReportLab registrations.
+        longest = max(len(token) * MINIMUM_FONT_SIZE * 0.62 for token in tokens)
+        required = min(108.0, max(_TABLE_COLUMN_MINIMUM, longest + 10.0))
+        assert block.column is not None
+        current = sum(widths[block.column : block.column + block.column_span])
+        if required > current:
+            addition = (required - current) / block.column_span
+            for column in range(block.column, block.column + block.column_span):
+                widths[column] += addition
+    total = sum(widths)
+    if total <= portrait_width + 1e-6:
+        return widths, "portrait"
+    if total <= landscape_width + 1e-6:
+        return widths, "landscape"
+    raise PdfAssemblyError(f"table {table_id} unreadable at 9-point")
+
+
+def _native_table(
+    table_id: str,
+    blocks: Sequence[PdfBlock],
+    translated: Mapping[str, str],
+    widths: Sequence[float],
+    frame: tuple[float, float, float, float],
+    records: list[PdfFlowableLayout],
+    part_counters: dict[str, int],
+    header_rows: set[int],
+) -> TrackedFlowable:
+    row_count = max((block.row or 0) + block.row_span for block in blocks)
+    column_count = len(widths)
+    data: list[list[Any]] = [["" for _ in range(column_count)] for _ in range(row_count)]
+    commands: list[tuple[Any, ...]] = []
+    first_block = min(blocks, key=lambda block: (block.row or 0, block.column or 0))
+    repeat_rows = len(header_rows)
+    cell_style = ParagraphStyle(
+        f"WT-table-{table_id}",
+        fontName=REGULAR_FONT_NAME,
+        fontSize=MINIMUM_FONT_SIZE,
+        leading=11.0,
+        spaceAfter=0.0,
+    )
+    header_style = ParagraphStyle(
+        f"WT-table-header-{table_id}",
+        parent=cell_style,
+        fontName=BOLD_FONT_NAME,
+    )
+    for block in blocks:
+        assert block.row is not None and block.column is not None
+        style = header_style if block.row in header_rows else cell_style
+        content: Any
+        if block.source_text.strip():
+            paragraph = Paragraph(_linked_markup(block, translated[block.id]), style)
+        else:
+            paragraph = Spacer(1.0, MINIMUM_FONT_SIZE)
+        if block.id == first_block.id:
+            content = paragraph
+        else:
+            content = TrackedFlowable(
+                paragraph,
+                block_id=block.id,
+                kind="table-cell",
+                source_order=block.order,
+                split_part=0,
+                font_size=MINIMUM_FONT_SIZE,
+                frame=frame,
+                records=records,
+                part_counters=part_counters,
+                anchor_name=_anchor_name(block.id),
+            )
+        data[block.row][block.column] = content
+        if block.row_span > 1 or block.column_span > 1:
+            commands.append(
+                (
+                    "SPAN",
+                    (block.column, block.row),
+                    (
+                        block.column + block.column_span - 1,
+                        block.row + block.row_span - 1,
+                    ),
+                )
+            )
+    commands.extend(
+        [
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#777777")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), _TABLE_CELL_PADDING),
+            ("RIGHTPADDING", (0, 0), (-1, -1), _TABLE_CELL_PADDING),
+            ("TOPPADDING", (0, 0), (-1, -1), 4.0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4.0),
+        ]
+    )
+    if repeat_rows:
+        commands.append(
+            ("BACKGROUND", (0, 0), (-1, repeat_rows - 1), colors.HexColor("#E8EEF5"))
+        )
+    table = Table(
+        data,
+        colWidths=list(widths),
+        repeatRows=repeat_rows,
+        splitByRow=1,
+        hAlign="LEFT",
+    )
+    table.setStyle(TableStyle(commands))
+    return TrackedFlowable(
+        table,
+        block_id=first_block.id,
+        kind="table-cell",
+        source_order=first_block.order,
+        split_part=0,
+        font_size=MINIMUM_FONT_SIZE,
+        frame=frame,
+        records=records,
+        part_counters=part_counters,
+        anchor_name=_anchor_name(first_block.id),
+    )
+
+
+def _figure_flowable(
+    block: PdfBlock,
+    payload: bytes,
+    frame: tuple[float, float, float, float],
+    records: list[PdfFlowableLayout],
+    part_counters: dict[str, int],
+) -> TrackedFlowable:
+    try:
+        with PillowImage.open(io.BytesIO(payload)) as image:
+            if image.format != "PNG":
+                raise PdfAssemblyError(f"figure media is not PNG: {block.id}")
+            pixel_width, pixel_height = image.size
+            image.verify()
+    except PdfAssemblyError:
+        raise
+    except Exception as error:
+        raise PdfAssemblyError(f"invalid figure media for {block.id}: {error}") from error
+    expected_width = (block.bbox[2] - block.bbox[0]) * _FIGURE_RENDER_DPI / 72.0
+    expected_height = (block.bbox[3] - block.bbox[1]) * _FIGURE_RENDER_DPI / 72.0
+    if (
+        abs(pixel_width - expected_width) > 2.0
+        or abs(pixel_height - expected_height) > 2.0
+    ):
+        raise PdfAssemblyError(f"figure media dimensions do not match source bounds: {block.id}")
+    natural_width = pixel_width * 72.0 / _FIGURE_RENDER_DPI
+    natural_height = pixel_height * 72.0 / _FIGURE_RENDER_DPI
+    scale = min(1.0, frame[2] / natural_width, frame[3] / natural_height)
+    width = natural_width * scale
+    height = natural_height * scale
+    image = Image(io.BytesIO(payload), width=width, height=height)
+    image.hAlign = "LEFT"
+    return TrackedFlowable(
+        image,
+        block_id=block.id,
+        kind="figure",
+        source_order=block.order,
+        split_part=0,
+        font_size=MINIMUM_FONT_SIZE,
+        frame=frame,
+        records=records,
+        part_counters=part_counters,
+        anchor_name=_anchor_name(block.id),
+    )
+
+
+def _source_attribution(source: PdfSourceRecord) -> Paragraph:
+    attribution_style = ParagraphStyle(
+        "WT-SourceAttribution",
+        fontName=REGULAR_FONT_NAME,
+        fontSize=MINIMUM_FONT_SIZE,
+        leading=11.0,
+        textColor="#444444",
+        spaceBefore=6.0,
+        spaceAfter=0.0,
+    )
+    generated = datetime.now(UTC).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+    return Paragraph(
+        f'<font name="{BOLD_FONT_NAME}">Source:</font> '
+        f"{escape(source.final_source)}<br/>"
+        f'<font name="{BOLD_FONT_NAME}">Generated:</font> '
+        f"{escape(generated)}",
+        attribution_style,
+    )
 
 
 def _style_for_block(
@@ -1036,6 +1947,85 @@ def _create_unique_child_directory(
     raise PdfAssemblyError(
         f"cannot reserve unique {label} directory in {parent.path}"
     )
+
+
+def _open_existing_child_directory(
+    parent: _DirectoryAnchor,
+    name: str,
+    label: str,
+) -> _DirectoryAnchor:
+    if Path(name).name != name:
+        raise PdfAssemblyError(f"unsafe anchored evidence directory name: {name}")
+    parent.verify_visible()
+    descriptor: int | None = None
+    path_anchor: object | None = None
+    windows_handle: int | None = None
+    try:
+        if parent.descriptor is not None:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent.descriptor,
+            )
+            result = os.fstat(descriptor)
+            if not stat.S_ISDIR(result.st_mode) or _is_reparse_stat(result):
+                raise PdfAssemblyError(
+                    f"anchored {label} is not a safe directory: {parent.path / name}"
+                )
+            identity = (result.st_dev, result.st_ino)
+        elif _IS_WINDOWS:
+            windows_handle = _windows_open_relative_directory(
+                _windows_anchor_handle(parent),
+                name,
+            )
+            path_anchor = pdf_acquire_module._WindowsDirectoryPathAnchor(
+                windows_handle
+            )
+            windows_handle = None
+            current = path_anchor.current_path()  # type: ignore[attr-defined]
+            result = current.lstat()
+            if not stat.S_ISDIR(result.st_mode) or _is_reparse_stat(result):
+                raise PdfAssemblyError(
+                    f"anchored {label} is not a safe directory: {parent.path / name}"
+                )
+            identity = (result.st_dev, result.st_ino)
+        else:
+            raise PdfAssemblyError(
+                f"safe anchored evidence directory open unavailable: "
+                f"{parent.path / name}"
+            )
+        child = _DirectoryAnchor(
+            parent.path / name,
+            label,
+            identity,
+            descriptor,
+            path_anchor,
+        )
+        parent.verify_visible()
+        child.verify_visible()
+        return child
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError) as error:
+        raise PdfAssemblyError(
+            f"cannot open anchored {label} directory {parent.path / name}: {error}"
+        ) from error
+    finally:
+        if sys.exc_info()[0] is not None:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if path_anchor is not None:
+                try:
+                    path_anchor.close()  # type: ignore[attr-defined]
+                except (AttributeError, OSError):
+                    pass
+            if windows_handle is not None:
+                pdf_acquire_module._close_windows_handle(windows_handle)
 
 
 def _create_child_directory(
@@ -1528,6 +2518,17 @@ def _windows_create_relative_directory(root_handle: int, name: str) -> int:
         create_disposition=2,
         create_options=0x00000001 | 0x00000020 | 0x00200000,
         file_attributes=0x00000010,
+    )
+
+
+def _windows_open_relative_directory(root_handle: int, name: str) -> int:
+    return _windows_nt_create_relative(
+        root_handle,
+        name,
+        desired_access=0x00000001 | 0x00000080 | 0x00100000,
+        create_disposition=1,
+        create_options=0x00000001 | 0x00000020 | 0x00200000,
+        file_attributes=0,
     )
 
 

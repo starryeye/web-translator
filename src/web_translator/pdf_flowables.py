@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from reportlab.platypus import Flowable
 
@@ -18,7 +18,18 @@ from reportlab.platypus import Flowable
 _BLOCK_ID = re.compile(
     r"pdf:page-\d{4}:(?:block-\d{4}|table-\d{4}:row-\d{4}:cell-\d{4})\Z"
 )
-_KINDS = {"heading", "paragraph", "list-item"}
+_KINDS = {
+    "heading",
+    "paragraph",
+    "list-item",
+    "table-cell",
+    "figure",
+    "caption",
+    "footnote",
+    "header",
+    "footer",
+    "page-number",
+}
 _PAGE_NAMES = {"A4", "LETTER"}
 _IS_WINDOWS = os.name == "nt"
 
@@ -52,7 +63,18 @@ class PdfPageSize:
 @dataclass(frozen=True, slots=True)
 class PdfFlowableLayout:
     block_id: str
-    kind: Literal["heading", "paragraph", "list-item"]
+    kind: Literal[
+        "heading",
+        "paragraph",
+        "list-item",
+        "table-cell",
+        "figure",
+        "caption",
+        "footnote",
+        "header",
+        "footer",
+        "page-number",
+    ]
     source_order: int
     split_part: int
     page_number: int
@@ -94,7 +116,7 @@ class PdfFlowableLayout:
             raise PdfAssemblyError(f"{context}.block_id is not a stable PDF block ID")
         kind = _string(data, "kind", context)
         if kind not in _KINDS:
-            raise PdfAssemblyError(f"{context}.kind is not a basic flowable kind")
+            raise PdfAssemblyError(f"{context}.kind is not a supported flowable kind")
         bounds = _box(data, "bounds", context)
         frame = _box(data, "frame", context)
         _validate_inside_frame(bounds, frame, context)
@@ -167,6 +189,26 @@ class PdfAssemblyLayout:
             key=lambda item: (item.source_order, item.split_part),
         ):
             raise PdfAssemblyError("layout.flowables must be in source and split-part order")
+        for index, left in enumerate(flowables):
+            for right in flowables[index + 1 :]:
+                if left.page_number != right.page_number or left.frame != right.frame:
+                    continue
+                if _intersection_area(left.bounds, right.bounds) <= 1e-6:
+                    continue
+                if (
+                    left.kind == right.kind == "table-cell"
+                    and (
+                        _contains(left.bounds, right.bounds)
+                        or _contains(right.bounds, left.bounds)
+                    )
+                ):
+                    # A tracked native Table part contains its tracked cell
+                    # content; peer cell content may not overlap.
+                    continue
+                raise PdfAssemblyError(
+                    "layout contains overlapping peer flowables: "
+                    f"{left.block_id} and {right.block_id}"
+                )
         minimum_font_size = _positive_number(
             data, "minimum_font_size", "layout"
         )
@@ -203,6 +245,9 @@ class TrackedFlowable(Flowable):
         font_size: float,
         frame: tuple[float, float, float, float],
         records: list[PdfFlowableLayout],
+        part_counters: dict[str, int] | None = None,
+        anchor_name: str | None = None,
+        on_draw: Callable[[Any, int], None] | None = None,
     ) -> None:
         super().__init__()
         self._content = content
@@ -213,6 +258,9 @@ class TrackedFlowable(Flowable):
         self._font_size = font_size
         self._frame_bounds = frame
         self._records = records
+        self._part_counters = part_counters
+        self._anchor_name = anchor_name
+        self._on_draw = on_draw
         self.width = 0.0
         self.height = 0.0
 
@@ -234,6 +282,9 @@ class TrackedFlowable(Flowable):
                 font_size=self._font_size,
                 frame=self._frame_bounds,
                 records=self._records,
+                part_counters=self._part_counters,
+                anchor_name=self._anchor_name,
+                on_draw=self._on_draw,
             )
             for index, part in enumerate(parts)
         ]
@@ -245,16 +296,48 @@ class TrackedFlowable(Flowable):
         return float(self._content.getSpaceAfter())
 
     def drawOn(self, canvas: Any, x: float, y: float, _sW: float = 0) -> None:
-        bounds = (float(x), float(y), float(self.width), float(self.height))
+        corners = [
+            canvas.absolutePosition(point_x, point_y)
+            for point_x, point_y in (
+                (x, y),
+                (x + self.width, y),
+                (x, y + self.height),
+                (x + self.width, y + self.height),
+            )
+        ]
+        x_values = [float(point[0]) for point in corners]
+        y_values = [float(point[1]) for point in corners]
+        bounds = (
+            min(x_values),
+            min(y_values),
+            max(x_values) - min(x_values),
+            max(y_values) - min(y_values),
+        )
         _validate_inside_frame(bounds, self._frame_bounds, self._block_id)
+        page_number = int(canvas.getPageNumber())
+        if self._anchor_name is not None and not any(
+            record.block_id == self._block_id for record in self._records
+        ):
+            canvas.bookmarkHorizontalAbsolute(
+                self._anchor_name,
+                bounds[1] + bounds[3],
+                left=bounds[0],
+            )
+        if self._on_draw is not None:
+            self._on_draw(canvas, page_number)
         self._content.drawOn(canvas, x, y, _sW)
+        if self._part_counters is None:
+            split_part = self._split_part
+        else:
+            split_part = self._part_counters.get(self._block_id, 0)
+            self._part_counters[self._block_id] = split_part + 1
         self._records.append(
             PdfFlowableLayout(
                 block_id=self._block_id,
                 kind=self._kind,  # type: ignore[arg-type]
                 source_order=self._source_order,
-                split_part=self._split_part,
-                page_number=int(canvas.getPageNumber()),
+                split_part=split_part,
+                page_number=page_number,
                 bounds=bounds,
                 frame=self._frame_bounds,
                 font_size=self._font_size,
@@ -423,3 +506,29 @@ def _validate_inside_frame(
         or y + height > frame_y + frame_height + tolerance
     ):
         raise PdfAssemblyError(f"{context} bounds fall outside the document frame")
+
+
+def _intersection_area(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    left_x, left_y, left_width, left_height = left
+    right_x, right_y, right_width, right_height = right
+    width = min(left_x + left_width, right_x + right_width) - max(left_x, right_x)
+    height = min(left_y + left_height, right_y + right_height) - max(left_y, right_y)
+    return max(0.0, width) * max(0.0, height)
+
+
+def _contains(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+) -> bool:
+    outer_x, outer_y, outer_width, outer_height = outer
+    inner_x, inner_y, inner_width, inner_height = inner
+    tolerance = 1e-6
+    return (
+        inner_x >= outer_x - tolerance
+        and inner_y >= outer_y - tolerance
+        and inner_x + inner_width <= outer_x + outer_width + tolerance
+        and inner_y + inner_height <= outer_y + outer_height + tolerance
+    )

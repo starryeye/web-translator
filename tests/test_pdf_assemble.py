@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 from importlib.resources import as_file, files
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ import sys
 
 from fontTools.ttLib import TTFont
 import pdfplumber
+from PIL import Image
 from pypdf import PdfReader
 import pytest
 
@@ -33,6 +35,7 @@ from web_translator.pdf_models import (
     PdfDocument,
     PdfPage,
     PdfSourceRecord,
+    PdfTableCell,
 )
 
 
@@ -187,6 +190,290 @@ def _assembly_run(
         "seg-000003": Translation("seg-000003", "첫째 ⟦WT:000002⟧"),
     }
     return run_dir, translations, {"OAuth": "권한 위임"}
+
+
+def _rich_assembly_run(
+    root: Path,
+    *,
+    table_columns: int = 10,
+    table_rows: int = 36,
+) -> tuple[Path, dict[str, Translation], dict[str, str], dict[str, str]]:
+    run_dir = root / f"rich-{table_columns}-columns" / "run"
+    media_dir = run_dir / "media"
+    media_dir.mkdir(parents=True)
+    Image.new("RGB", (240, 120), (42, 120, 196)).save(
+        media_dir / "figure-0001.png"
+    )
+    style = PdfBlockStyle(11.0, False, "left", 0.0, 6.0)
+    blocks: list[PdfBlock] = []
+    table_cells: list[PdfTableCell] = []
+    segments: list[Segment] = []
+    translations: dict[str, Translation] = {}
+    page_block_numbers = {1: 0, 2: 0}
+
+    def add_block(
+        *,
+        page: int,
+        kind: str,
+        source: str,
+        translated: str | None,
+        bbox: tuple[float, float, float, float],
+        block_style: PdfBlockStyle = style,
+        **relationships: object,
+    ) -> PdfBlock:
+        page_block_numbers[page] += 1
+        identifier = (
+            f"pdf:page-{page:04d}:block-{page_block_numbers[page]:04d}"
+        )
+        segment_id = f"seg-{len(segments) + 1:06d}" if translated is not None else None
+        block = PdfBlock(
+            id=identifier,
+            page_number=page,
+            order=len(blocks),
+            kind=kind,  # type: ignore[arg-type]
+            bbox=bbox,
+            style=block_style,
+            source_text=source,
+            segment_id=segment_id,
+            **relationships,  # type: ignore[arg-type]
+        )
+        blocks.append(block)
+        if segment_id is not None:
+            segments.append(
+                Segment(
+                    id=segment_id,
+                    locator=identifier,
+                    semantic_type=kind,
+                    heading_path=[],
+                    source_text=source,
+                    protected=[],
+                    context_ids=[],
+                    target=True,
+                )
+            )
+            translations[segment_id] = Translation(segment_id, translated)
+        return block
+
+    add_block(
+        page=1,
+        kind="header",
+        source="반복 머리글",
+        translated=None,
+        bbox=(54.0, 18.0, 558.0, 34.0),
+    )
+    add_block(
+        page=1,
+        kind="heading",
+        source="Rich content",
+        translated="풍부한 콘텐츠",
+        bbox=(54.0, 52.0, 558.0, 78.0),
+        block_style=PdfBlockStyle(18.0, True, "left", 0.0, 10.0),
+    )
+    table_id = "pdf:page-0001:table-0001"
+    table_start_order = len(blocks)
+    for row in range(table_rows):
+        for column in range(table_columns):
+            if row == 0 and column == 1:
+                continue
+            column_span = 2 if row == 0 and column == 0 else 1
+            identifier = (
+                f"pdf:page-0001:table-0001:row-{row:04d}:cell-{column:04d}"
+            )
+            empty = row == 2 and column == 1
+            source = "" if empty else (
+                "Merged heading" if row == 0 and column == 0 else f"R{row} C{column}"
+            )
+            translated = None if empty else (
+                "병합 머리글" if row == 0 and column == 0 else f"행{row} 열{column}"
+            )
+            segment_id = f"seg-{len(segments) + 1:06d}" if translated is not None else None
+            block = PdfBlock(
+                id=identifier,
+                page_number=1,
+                order=len(blocks),
+                kind="table-cell",
+                bbox=(
+                    36.0 + column * 54.0,
+                    100.0 + row * 18.0,
+                    36.0 + (column + column_span) * 54.0,
+                    118.0 + row * 18.0,
+                ),
+                style=PdfBlockStyle(9.0, False, "left", 0.0, 0.0),
+                source_text=source,
+                segment_id=segment_id,
+                table_id=table_id,
+                row=row,
+                column=column,
+                row_span=1,
+                column_span=column_span,
+            )
+            blocks.append(block)
+            table_cells.append(
+                PdfTableCell(
+                    id=identifier,
+                    table_id=table_id,
+                    page_number=1,
+                    row=row,
+                    column=column,
+                    row_span=1,
+                    column_span=column_span,
+                    is_header=row == 0,
+                    block_id=identifier,
+                )
+            )
+            if segment_id is not None:
+                segments.append(
+                    Segment(
+                        id=segment_id,
+                        locator=identifier,
+                        semantic_type="table-cell",
+                        heading_path=["Rich content"],
+                        source_text=source,
+                        protected=[],
+                        context_ids=[],
+                        target=True,
+                    )
+                )
+                translations[segment_id] = Translation(segment_id, translated)
+
+    figure = add_block(
+        page=1,
+        kind="figure",
+        source="",
+        translated=None,
+        bbox=(72.0, 390.0, 192.0, 450.0),
+        media_path="media/figure-0001.png",
+    )
+    caption = add_block(
+        page=1,
+        kind="caption",
+        source="Figure 1. source rendered pixels",
+        translated="그림 1. 원본 렌더링 픽셀",
+        bbox=(72.0, 454.0, 240.0, 470.0),
+        caption_id=figure.id,
+    )
+    blocks[blocks.index(figure)] = replace(figure, caption_id=caption.id)
+    external = add_block(
+        page=1,
+        kind="paragraph",
+        source="External link",
+        translated="외부 링크",
+        bbox=(72.0, 480.0, 220.0, 500.0),
+        uri="https://example.com/search?q=a&lang=ko",
+    )
+    owner = add_block(
+        page=1,
+        kind="paragraph",
+        source="Page local marker 1",
+        translated="페이지 지역 표지 1",
+        bbox=(72.0, 510.0, 260.0, 530.0),
+    )
+    page_note = add_block(
+        page=1,
+        kind="footnote",
+        source="1 page local note",
+        translated="1 페이지 지역 각주",
+        bbox=(72.0, 748.0, 260.0, 766.0),
+        block_style=PdfBlockStyle(9.0, False, "left", 0.0, 0.0),
+    )
+    section_owner = add_block(
+        page=1,
+        kind="paragraph",
+        source="Section marker 2",
+        translated="절 표지 2",
+        bbox=(72.0, 540.0, 260.0, 560.0),
+    )
+    target = add_block(
+        page=2,
+        kind="heading",
+        source="Internal destination",
+        translated="내부 목적지",
+        bbox=(72.0, 100.0, 300.0, 126.0),
+        block_style=PdfBlockStyle(16.0, True, "left", 0.0, 10.0),
+    )
+    section_note = add_block(
+        page=2,
+        kind="footnote",
+        source="2 section note",
+        translated="2 절 끝 각주",
+        bbox=(72.0, 650.0, 260.0, 668.0),
+        block_style=PdfBlockStyle(9.0, False, "left", 0.0, 0.0),
+    )
+    blocks[blocks.index(owner)] = replace(owner, destination=page_note.id)
+    blocks[blocks.index(section_owner)] = replace(
+        section_owner,
+        destination=section_note.id,
+    )
+    internal = add_block(
+        page=2,
+        kind="paragraph",
+        source="Internal link",
+        translated="내부 링크",
+        bbox=(72.0, 140.0, 220.0, 160.0),
+        destination=blocks[table_start_order + 1].id,
+    )
+    for page in (1, 2):
+        add_block(
+            page=page,
+            kind="footer",
+            source="반복 바닥글",
+            translated=None,
+            bbox=(54.0, 770.0, 558.0, 784.0),
+        )
+        add_block(
+            page=page,
+            kind="page-number",
+            source=str(page),
+            translated=None,
+            bbox=(540.0, 770.0, 558.0, 784.0),
+        )
+    document = PdfDocument(
+        schema_version="1.0",
+        source_sha256="a" * 64,
+        page_count=2,
+        selectable_characters=5000,
+        scan_candidate_pages=[],
+        pages=[
+            PdfPage(number=1, width=612.0, height=792.0, rotation=0),
+            PdfPage(number=2, width=612.0, height=792.0, rotation=0),
+        ],
+        blocks=blocks,
+        table_cells=table_cells,
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    source = PdfSourceRecord(
+        schema_version="1.0",
+        input_kind="local",
+        requested_source="rich.pdf",
+        final_source="rich.pdf",
+        content_type="application/pdf",
+        byte_length=123,
+        sha256="a" * 64,
+        acquired_at="2026-08-21T01:02:03Z",
+        redirects=[],
+        warnings=[],
+    )
+    (run_dir / "source.json").write_text(
+        json.dumps(source.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    write_segments(run_dir / "segments.jsonl", segments)
+    return run_dir, translations, {}, {
+        "caption": caption.id,
+        "external": external.id,
+        "figure": figure.id,
+        "internal": internal.id,
+        "owner": owner.id,
+        "page_note": page_note.id,
+        "section_note": section_note.id,
+        "section_owner": section_owner.id,
+        "table_header": blocks[table_start_order].id,
+        "table_link_target": blocks[table_start_order + 1].id,
+        "target": target.id,
+    }
 
 
 def _embedded_font_programs(path: Path) -> dict[str, bytes]:
@@ -1116,6 +1403,24 @@ def test_pdf_layout_reader_rejects_cross_field_contract_violations(
         read_pdf_layout(path)
 
 
+def test_pdf_layout_reader_rejects_overlapping_peer_flowables(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    path = run_dir / "layout.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["flowables"][1].update(
+        bounds=list(payload["flowables"][0]["bounds"]),
+        frame=list(payload["flowables"][0]["frame"]),
+        page_number=payload["flowables"][0]["page_number"],
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PdfAssemblyError, match="overlapping peer flowables"):
+        read_pdf_layout(path)
+
+
 def test_assemble_pdf_cleans_owned_partial_staging_on_base_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1310,6 +1615,14 @@ def test_windows_file_rename_info_uses_relative_no_replace_contract(
                 "create_disposition": 2,
                 "create_options": 0x00000001 | 0x00000020 | 0x00200000,
                 "file_attributes": 0x00000010,
+            },
+        ),
+        (
+            "_windows_open_relative_directory",
+            {
+                "create_disposition": 1,
+                "create_options": 0x00000001 | 0x00000020 | 0x00200000,
+                "file_attributes": 0,
             },
         ),
         (
@@ -1780,6 +2093,57 @@ def test_windows_child_creation_closes_handle_if_anchor_construction_interrupts(
     assert closed == [919]
 
 
+def test_windows_existing_media_anchor_closes_handle_if_construction_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "run"
+    directory.mkdir()
+    result = directory.lstat()
+    closed: list[int] = []
+
+    class FakeAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return directory
+
+        def close(self) -> None:
+            return None
+
+    parent = pdf_assemble_module._DirectoryAnchor(
+        directory,
+        "run",
+        (result.st_dev, result.st_ino),
+        None,
+        FakeAnchor(),
+    )
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_windows_open_relative_directory",
+        lambda _root, _name: 929,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_WindowsDirectoryPathAnchor",
+        lambda _handle: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pdf_assemble_module._open_existing_child_directory(
+            parent,
+            "media",
+            "PDF media",
+        )
+
+    assert closed == [929]
+
+
 def test_windows_publication_closes_source_handle_on_rename_base_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1973,13 +2337,251 @@ def test_assemble_pdf_rejects_preexisting_destinations_without_overwrite(
         assert path.read_text(encoding="utf-8") == "keep"
 
 
-def test_assemble_pdf_fails_closed_on_task_8_rich_blocks(tmp_path: Path) -> None:
-    run_dir, translations, glossary = _assembly_run(tmp_path)
-    payload = json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
-    payload["blocks"][2]["kind"] = "caption"
-    (run_dir / "document.json").write_text(json.dumps(payload), encoding="utf-8")
+def test_assemble_pdf_reflows_rich_content_with_complete_layout_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(tmp_path)
 
-    with pytest.raises(PdfAssemblyError, match="unsupported PDF block kind.*caption"):
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    reader = PdfReader(staged)
+    assert len(reader.pages) >= 4
+    dimensions = [
+        (float(page.mediabox.width), float(page.mediabox.height))
+        for page in reader.pages
+    ]
+    assert any(width < height for width, height in dimensions)
+    assert any(width > height for width, height in dimensions)
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    landscape_pages = sum(width > height for width, height in dimensions)
+    assert extracted.count("병합 머리글") == landscape_pages
+    assert extracted.count("반복 머리글") == len(reader.pages)
+    assert extracted.count("반복 바닥글") == len(reader.pages)
+    assert "그림 1. 원본 렌더링 픽셀" in extracted
+    assert "1 페이지 지역 각주" in extracted
+    assert "2 절 끝 각주" in extracted
+
+    external_uris: list[str] = []
+    internal_destinations: list[object] = []
+    for page in reader.pages:
+        for annotation_ref in page.get("/Annots", []):
+            annotation = annotation_ref.get_object()
+            action = annotation.get("/A")
+            if action is not None and str(action.get_object().get("/S")) == "/URI":
+                external_uris.append(str(action.get_object()["/URI"]))
+            if annotation.get("/Dest") is not None:
+                internal_destinations.append(annotation["/Dest"])
+    assert external_uris == ["https://example.com/search?q=a&lang=ko"]
+    assert len(internal_destinations) >= 3
+
+    layout = read_pdf_layout(run_dir / "layout.json")
+    by_block: dict[str, list[object]] = {}
+    for item in layout.flowables:
+        by_block.setdefault(item.block_id, []).append(item)
+        assert all(math.isfinite(value) for value in (*item.bounds, *item.frame))
+        x, y, width, height = item.bounds
+        frame_x, frame_y, frame_width, frame_height = item.frame
+        assert frame_x <= x <= x + width <= frame_x + frame_width
+        assert frame_y <= y <= y + height <= frame_y + frame_height
+    for parts in by_block.values():
+        assert [item.split_part for item in parts] == list(range(len(parts)))
+    rich_document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    assert {
+        block.id for block in rich_document.blocks if block.kind == "table-cell"
+    } <= set(by_block)
+    header_parts = by_block[identifiers["table_header"]]
+    assert len(header_parts) == landscape_pages
+    assert [item.split_part for item in header_parts] == list(range(len(header_parts)))
+    assert header_parts[0].bounds[2] > 2 * 45.0
+    table_target = by_block[identifiers["table_link_target"]][0]
+    table_target_top = table_target.bounds[1] + table_target.bounds[3]
+    assert any(
+        float(destination[3]) == pytest.approx(table_target_top, abs=0.5)
+        for destination in internal_destinations
+        if isinstance(destination, list) and len(destination) >= 4
+    )
+
+    figure_layout = by_block[identifiers["figure"]][0]
+    caption_layout = by_block[identifiers["caption"]][0]
+    assert figure_layout.page_number == caption_layout.page_number
+    assert figure_layout.bounds[2] / figure_layout.bounds[3] == pytest.approx(2.0)
+    assert figure_layout.bounds[2] <= 120.0
+    assert figure_layout.bounds[3] <= 60.0
+    assert figure_layout.bounds[1] - sum(caption_layout.bounds[1::2]) <= 12.0
+
+    owner_layout = by_block[identifiers["owner"]][0]
+    page_note_layout = by_block[identifiers["page_note"]][0]
+    assert owner_layout.page_number == page_note_layout.page_number
+    assert page_note_layout.frame[1] < owner_layout.frame[1]
+    section_owner_layout = by_block[identifiers["section_owner"]][0]
+    section_note_layout = by_block[identifiers["section_note"]][0]
+    target_layout = by_block[identifiers["target"]][0]
+    assert section_note_layout.frame == section_owner_layout.frame
+    assert extracted.index("2 절 끝 각주") < extracted.index("내부 목적지")
+    assert section_note_layout.page_number <= target_layout.page_number
+
+
+def test_assemble_pdf_keeps_readable_native_table_on_portrait_pages(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, _identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert all(
+        float(page.mediabox.width) < float(page.mediabox.height)
+        for page in PdfReader(staged).pages
+    )
+
+
+def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    owner = next(block for block in document.blocks if block.id == identifiers["owner"])
+    assert owner.segment_id is not None
+    translations[owner.segment_id] = Translation(
+        owner.segment_id,
+        "페이지 지역 표지 1 " * 250,
+    )
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    reader = PdfReader(staged)
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert extracted.count("1 페이지 지역 각주") == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    owner_parts = [
+        item for item in layout.flowables if item.block_id == identifiers["owner"]
+    ]
+    page_note = next(
+        item for item in layout.flowables if item.block_id == identifiers["page_note"]
+    )
+    assert len(owner_parts) > 1
+    assert page_note.page_number == owner_parts[0].page_number
+
+
+def test_rich_assembly_closes_anchored_media_on_build_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, translations, glossary, _identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    original_media_anchor = pdf_assemble_module._open_existing_child_directory
+    original_input = pdf_assemble_module._open_anchored_input_file
+    media_directory_descriptor: int | None = None
+    media_file_descriptor: int | None = None
+
+    def capture_media_anchor(*args: object, **kwargs: object) -> object:
+        nonlocal media_directory_descriptor
+        anchor = original_media_anchor(*args, **kwargs)
+        media_directory_descriptor = anchor.descriptor
+        return anchor
+
+    def capture_media_file(*args: object, **kwargs: object) -> object:
+        nonlocal media_file_descriptor
+        opened = original_input(*args, **kwargs)
+        if "figure media" in str(args[2]):
+            media_file_descriptor = opened.stream.fileno()
+        return opened
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_open_existing_child_directory",
+        capture_media_anchor,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_open_anchored_input_file",
+        capture_media_file,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_build_rich_document",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert media_directory_descriptor is not None
+    assert media_file_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(media_directory_descriptor)
+    with pytest.raises(OSError):
+        os.fstat(media_file_descriptor)
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+    assert not any(
+        path.name.startswith(".pdf-assembling-") for path in run_dir.iterdir()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "figure media"),
+        ("dimensions", "dimensions do not match source bounds"),
+        ("bounds", "figure bounds fall outside source page"),
+    ],
+)
+def test_rich_assembly_fails_closed_on_invalid_media_evidence(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    run_dir, translations, glossary, _identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    media = run_dir / "media" / "figure-0001.png"
+    if mutation == "missing":
+        media.unlink()
+    elif mutation == "dimensions":
+        Image.new("RGB", (120, 120), (42, 120, 196)).save(media)
+    else:
+        payload = json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+        figure = next(block for block in payload["blocks"] if block["kind"] == "figure")
+        figure["bbox"] = [72.0, 390.0, 700.0, 450.0]
+        (run_dir / "document.json").write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(PdfAssemblyError, match=message):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_assemble_pdf_fails_when_table_is_unreadable_at_nine_points(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, _identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=14,
+        table_rows=4,
+    )
+
+    with pytest.raises(PdfAssemblyError, match="table .* unreadable at 9-point"):
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert not (run_dir / "staged-output").exists()
