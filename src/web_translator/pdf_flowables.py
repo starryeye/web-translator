@@ -195,16 +195,6 @@ class PdfAssemblyLayout:
                     continue
                 if _intersection_area(left.bounds, right.bounds) <= 1e-6:
                     continue
-                if (
-                    left.kind == right.kind == "table-cell"
-                    and (
-                        _contains(left.bounds, right.bounds)
-                        or _contains(right.bounds, left.bounds)
-                    )
-                ):
-                    # A tracked native Table part contains its tracked cell
-                    # content; peer cell content may not overlap.
-                    continue
                 raise PdfAssemblyError(
                     "layout contains overlapping peer flowables: "
                     f"{left.block_id} and {right.block_id}"
@@ -517,18 +507,3 @@ def _intersection_area(
     width = min(left_x + left_width, right_x + right_width) - max(left_x, right_x)
     height = min(left_y + left_height, right_y + right_height) - max(left_y, right_y)
     return max(0.0, width) * max(0.0, height)
-
-
-def _contains(
-    outer: tuple[float, float, float, float],
-    inner: tuple[float, float, float, float],
-) -> bool:
-    outer_x, outer_y, outer_width, outer_height = outer
-    inner_x, inner_y, inner_width, inner_height = inner
-    tolerance = 1e-6
-    return (
-        inner_x >= outer_x - tolerance
-        and inner_y >= outer_y - tolerance
-        and inner_x + inner_width <= outer_x + outer_width + tolerance
-        and inner_y + inner_height <= outer_y + outer_height + tolerance
-    )

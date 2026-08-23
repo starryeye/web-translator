@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -96,6 +96,8 @@ _TABLE_COLUMN_MINIMUM = 54.0
 _TABLE_CELL_PADDING = 5.0
 _FIGURE_RENDER_DPI = 144.0
 _PAGE_LOCAL_FOOTNOTE_HEIGHT = 60.0
+_URI_CHARACTERS = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*\Z")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 @dataclass(slots=True)
@@ -704,12 +706,25 @@ def _media_name(block: PdfBlock) -> str:
 
 
 def _safe_uri(uri: str, block_id: str) -> str:
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in uri):
+    if (
+        _URI_CHARACTERS.fullmatch(uri) is None
+        or _INVALID_PERCENT_ESCAPE.search(uri) is not None
+    ):
         raise PdfAssemblyError(f"unsafe external URI for {block_id}")
-    parsed = urlsplit(uri)
+    try:
+        parsed = urlsplit(uri)
+        hostname = parsed.hostname
+    except ValueError as error:
+        raise PdfAssemblyError(f"unsafe external URI for {block_id}") from error
     if parsed.scheme.lower() not in {"http", "https", "mailto"}:
         raise PdfAssemblyError(f"unsafe external URI for {block_id}")
-    if parsed.scheme.lower() in {"http", "https"} and not parsed.netloc:
+    if parsed.scheme.lower() in {"http", "https"} and (
+        not parsed.netloc or not hostname
+    ):
+        raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+    if parsed.scheme.lower() == "mailto" and (
+        parsed.netloc or not parsed.path
+    ):
         raise PdfAssemblyError(f"unsafe external URI for {block_id}")
     return uri
 
@@ -870,6 +885,12 @@ def _build_rich_document(
             notes.append(note_id)
 
         return schedule
+
+    page_note_callbacks: dict[str, Callable[[Any, int], None]] = {
+        owner_id: schedule_page_note(note_id)
+        for owner_id, note_id in owner_to_note.items()
+        if note_id in page_local_notes
+    }
 
     def draw_running(canvas: Any, _doc: BaseDocTemplate, *, orientation: str) -> None:
         width, height = (
@@ -1038,7 +1059,7 @@ def _build_rich_document(
     )
     story: list[Any] = []
     emitted_tables: set[str] = set()
-    emitted_captions: set[str] = set()
+    emitted_figures: set[str] = set()
     emitted_section_notes: set[str] = set()
 
     def append_text(block: PdfBlock, frame: tuple[float, float, float, float]) -> None:
@@ -1066,12 +1087,6 @@ def _build_rich_document(
                 heading_sizes=heading_sizes,
                 list_level=list_levels.get(block.id, 0),
             )
-        note_id = owner_to_note.get(block.id)
-        on_draw = (
-            schedule_page_note(note_id)
-            if note_id is not None and note_id in page_local_notes
-            else None
-        )
         story.append(
             TrackedFlowable(
                 Paragraph(
@@ -1090,7 +1105,7 @@ def _build_rich_document(
                 records=records,
                 part_counters=part_counters,
                 anchor_name=_anchor_name(block.id),
-                on_draw=on_draw,
+                on_draw=page_note_callbacks.get(block.id),
             )
         )
 
@@ -1108,6 +1123,46 @@ def _build_rich_document(
                 continue
             append_text(block_by_id[note_id], portrait_frame)
             emitted_section_notes.add(note_id)
+
+    def append_figure_pair(figure: PdfBlock, caption: PdfBlock) -> None:
+        image = _figure_flowable(
+            figure,
+            media_payloads[figure.id],
+            portrait_frame,
+            records,
+            part_counters,
+        )
+        caption_style = ParagraphStyle(
+            f"WT-caption-{caption.order}",
+            fontName=REGULAR_FONT_NAME,
+            fontSize=MINIMUM_FONT_SIZE,
+            leading=11.0,
+            textColor="#333333",
+            spaceBefore=2.0,
+            spaceAfter=6.0,
+        )
+        caption_flowable = TrackedFlowable(
+            Paragraph(
+                _linked_markup(caption, translated[caption.id]),
+                caption_style,
+            ),
+            block_id=caption.id,
+            kind="caption",
+            source_order=caption.order,
+            split_part=0,
+            font_size=MINIMUM_FONT_SIZE,
+            frame=portrait_frame,
+            records=records,
+            part_counters=part_counters,
+            anchor_name=_anchor_name(caption.id),
+        )
+        contents = (
+            [caption_flowable, image]
+            if caption.order < figure.order
+            else [image, caption_flowable]
+        )
+        story.append(KeepTogether(contents))
+        emitted_figures.add(figure.id)
 
     try:
         with ExitStack() as stack:
@@ -1141,50 +1196,24 @@ def _build_rich_document(
                             records,
                             part_counters,
                             table_header_rows[block.table_id],
+                            page_note_callbacks,
                         )
                     )
                     emitted_tables.add(block.table_id)
                     if orientation == "landscape":
                         story.extend([NextPageTemplate("portrait"), PageBreak()])
                     continue
-                if block.kind == "figure":
-                    assert block.caption_id is not None
-                    caption = block_by_id[block.caption_id]
-                    image = _figure_flowable(
-                        block,
-                        media_payloads[block.id],
-                        portrait_frame,
-                        records,
-                        part_counters,
-                    )
-                    caption_style = ParagraphStyle(
-                        f"WT-caption-{caption.order}",
-                        fontName=REGULAR_FONT_NAME,
-                        fontSize=MINIMUM_FONT_SIZE,
-                        leading=11.0,
-                        textColor="#333333",
-                        spaceBefore=2.0,
-                        spaceAfter=6.0,
-                    )
-                    caption_flowable = TrackedFlowable(
-                        Paragraph(
-                            _linked_markup(caption, translated[caption.id]),
-                            caption_style,
-                        ),
-                        block_id=caption.id,
-                        kind="caption",
-                        source_order=caption.order,
-                        split_part=0,
-                        font_size=MINIMUM_FONT_SIZE,
-                        frame=portrait_frame,
-                        records=records,
-                        part_counters=part_counters,
-                        anchor_name=_anchor_name(caption.id),
-                    )
-                    story.append(KeepTogether([image, caption_flowable]))
-                    emitted_captions.add(caption.id)
-                    continue
-                if block.kind == "caption" and block.id in emitted_captions:
+                if block.kind in {"figure", "caption"}:
+                    if block.kind == "figure":
+                        figure = block
+                        assert block.caption_id is not None
+                        caption = block_by_id[block.caption_id]
+                    else:
+                        assert block.caption_id is not None
+                        figure = block_by_id[block.caption_id]
+                        caption = block
+                    if figure.id not in emitted_figures:
+                        append_figure_pair(figure, caption)
                     continue
                 if block.kind == "footnote" and block.id in section_notes:
                     continue
@@ -1337,12 +1366,12 @@ def _native_table(
     records: list[PdfFlowableLayout],
     part_counters: dict[str, int],
     header_rows: set[int],
-) -> TrackedFlowable:
+    on_draw_by_block: Mapping[str, Callable[[Any, int], None]],
+) -> Table:
     row_count = max((block.row or 0) + block.row_span for block in blocks)
     column_count = len(widths)
     data: list[list[Any]] = [["" for _ in range(column_count)] for _ in range(row_count)]
     commands: list[tuple[Any, ...]] = []
-    first_block = min(blocks, key=lambda block: (block.row or 0, block.column or 0))
     repeat_rows = len(header_rows)
     cell_style = ParagraphStyle(
         f"WT-table-{table_id}",
@@ -1359,27 +1388,23 @@ def _native_table(
     for block in blocks:
         assert block.row is not None and block.column is not None
         style = header_style if block.row in header_rows else cell_style
-        content: Any
         if block.source_text.strip():
             paragraph = Paragraph(_linked_markup(block, translated[block.id]), style)
         else:
             paragraph = Spacer(1.0, MINIMUM_FONT_SIZE)
-        if block.id == first_block.id:
-            content = paragraph
-        else:
-            content = TrackedFlowable(
-                paragraph,
-                block_id=block.id,
-                kind="table-cell",
-                source_order=block.order,
-                split_part=0,
-                font_size=MINIMUM_FONT_SIZE,
-                frame=frame,
-                records=records,
-                part_counters=part_counters,
-                anchor_name=_anchor_name(block.id),
-            )
-        data[block.row][block.column] = content
+        data[block.row][block.column] = TrackedFlowable(
+            paragraph,
+            block_id=block.id,
+            kind="table-cell",
+            source_order=block.order,
+            split_part=0,
+            font_size=MINIMUM_FONT_SIZE,
+            frame=frame,
+            records=records,
+            part_counters=part_counters,
+            anchor_name=_anchor_name(block.id),
+            on_draw=on_draw_by_block.get(block.id),
+        )
         if block.row_span > 1 or block.column_span > 1:
             commands.append(
                 (
@@ -1413,18 +1438,7 @@ def _native_table(
         hAlign="LEFT",
     )
     table.setStyle(TableStyle(commands))
-    return TrackedFlowable(
-        table,
-        block_id=first_block.id,
-        kind="table-cell",
-        source_order=first_block.order,
-        split_part=0,
-        font_size=MINIMUM_FONT_SIZE,
-        frame=frame,
-        records=records,
-        part_counters=part_counters,
-        anchor_name=_anchor_name(first_block.id),
-    )
+    return table
 
 
 def _figure_flowable(

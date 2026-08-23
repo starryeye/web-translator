@@ -2394,7 +2394,15 @@ def test_assemble_pdf_reflows_rich_content_with_complete_layout_evidence(
     header_parts = by_block[identifiers["table_header"]]
     assert len(header_parts) == landscape_pages
     assert [item.split_part for item in header_parts] == list(range(len(header_parts)))
-    assert header_parts[0].bounds[2] > 2 * 45.0
+    assert all(item.bounds[2] == pytest.approx(98.0, abs=0.5) for item in header_parts)
+    table_blocks = [
+        block for block in rich_document.blocks if block.kind == "table-cell"
+    ]
+    for block in table_blocks:
+        assert len(by_block[block.id]) == (
+            landscape_pages if block.row == 0 else 1
+        )
+        assert all(item.frame == header_parts[0].frame for item in by_block[block.id])
     table_target = by_block[identifiers["table_link_target"]][0]
     table_target_top = table_target.bounds[1] + table_target.bounds[3]
     assert any(
@@ -2421,6 +2429,36 @@ def test_assemble_pdf_reflows_rich_content_with_complete_layout_evidence(
     assert section_note_layout.frame == section_owner_layout.frame
     assert extracted.index("2 절 끝 각주") < extracted.index("내부 목적지")
     assert section_note_layout.page_number <= target_layout.page_number
+
+
+def test_pdf_layout_reader_rejects_contained_table_cell_peer_overlap(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, _identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    path = run_dir / "layout.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cells = [item for item in payload["flowables"] if item["kind"] == "table-cell"]
+    outer, inner = cells[-2:]
+    outer_x, outer_y, outer_width, outer_height = outer["bounds"]
+    inner.update(
+        bounds=[
+            outer_x + 1.0,
+            outer_y + 1.0,
+            outer_width / 2.0,
+            outer_height / 2.0,
+        ],
+        frame=list(outer["frame"]),
+        page_number=outer["page_number"],
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PdfAssemblyError, match="overlapping peer flowables"):
+        read_pdf_layout(path)
 
 
 def test_assemble_pdf_keeps_readable_native_table_on_portrait_pages(
@@ -2472,6 +2510,136 @@ def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
     )
     assert len(owner_parts) > 1
     assert page_note.page_number == owner_parts[0].page_number
+
+
+def test_page_local_footnote_owned_by_repeated_table_cell_is_emitted_once(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(tmp_path)
+    path = run_dir / "document.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for block in payload["blocks"]:
+        if block["id"] == identifiers["owner"]:
+            block["destination"] = None
+        elif block["id"] == identifiers["table_link_target"]:
+            block["destination"] = identifiers["page_note"]
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert extracted.count("1 페이지 지역 각주") == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    owner_parts = [
+        item
+        for item in layout.flowables
+        if item.block_id == identifiers["table_link_target"]
+    ]
+    note = next(
+        item for item in layout.flowables if item.block_id == identifiers["page_note"]
+    )
+    assert len(owner_parts) > 1
+    assert note.page_number == owner_parts[0].page_number
+
+
+def test_caption_above_figure_is_emitted_once_in_source_order(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    path = run_dir / "document.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    blocks = payload["blocks"]
+    figure_index = next(
+        index for index, block in enumerate(blocks) if block["id"] == identifiers["figure"]
+    )
+    caption_index = next(
+        index for index, block in enumerate(blocks) if block["id"] == identifiers["caption"]
+    )
+    blocks[figure_index], blocks[caption_index] = blocks[caption_index], blocks[figure_index]
+    for order, block in enumerate(blocks):
+        block["order"] = order
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert extracted.count("그림 1. 원본 렌더링 픽셀") == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    captions = [
+        item for item in layout.flowables if item.block_id == identifiers["caption"]
+    ]
+    figure = next(
+        item for item in layout.flowables if item.block_id == identifiers["figure"]
+    )
+    assert len(captions) == 1
+    caption = captions[0]
+    assert caption.page_number == figure.page_number
+    figure_top = figure.bounds[1] + figure.bounds[3]
+    assert 0.0 <= caption.bounds[1] - figure_top <= 12.0
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://example.com/a b",
+        "https://example.com/a<bad>",
+        "https://example.com/a%2",
+        "https:///missing-authority",
+        "mailto:",
+    ],
+)
+def test_rich_assembly_rejects_raw_or_structurally_invalid_uri(
+    tmp_path: Path,
+    uri: str,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    path = run_dir / "document.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    external = next(
+        block for block in payload["blocks"] if block["id"] == identifiers["external"]
+    )
+    external["uri"] = uri
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    with pytest.raises(PdfAssemblyError, match="unsafe external URI"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+
+def test_rich_assembly_preserves_percent_encoded_uri_exactly(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    expected = "https://example.com/a%20b?q=x%2Fy&lang=ko"
+    path = run_dir / "document.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    external = next(
+        block for block in payload["blocks"] if block["id"] == identifiers["external"]
+    )
+    external["uri"] = expected
+    path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    uris = [
+        str(annotation.get_object()["/A"].get_object()["/URI"])
+        for page in PdfReader(staged).pages
+        for annotation in page.get("/Annots", [])
+        if annotation.get_object().get("/A") is not None
+        and str(annotation.get_object()["/A"].get_object().get("/S")) == "/URI"
+    ]
+    assert uris == [expected]
 
 
 def test_rich_assembly_closes_anchored_media_on_build_base_exception(
