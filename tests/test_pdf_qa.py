@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -715,6 +716,32 @@ def test_prepare_pdf_qa_rejects_render_failure_without_publishing(
     assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
 
 
+@pytest.mark.parametrize("failure", ["media-error", "interrupt"])
+def test_prepare_pdf_qa_removes_empty_owned_render_destination_after_immediate_failure(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from web_translator.pdf_media import PdfMediaError
+
+    def fail_immediately(*args: object, **kwargs: object) -> list[Path]:
+        del args, kwargs
+        if failure == "media-error":
+            raise PdfMediaError("injected immediate render failure")
+        raise KeyboardInterrupt("injected immediate render interruption")
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", fail_immediately)
+
+    expected = PdfQAFailure if failure == "media-error" else KeyboardInterrupt
+    with pytest.raises(expected, match="immediate render"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-raced-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+
+
 @pytest.mark.parametrize("partial_page", [False, True])
 @pytest.mark.parametrize("failure", ["media-error", "interrupt"])
 def test_prepare_pdf_qa_cleans_owned_destination_after_render_failure(
@@ -841,6 +868,174 @@ def test_prepare_pdf_qa_quarantines_failed_render_filename_racers(
     assert (quarantines[0] / racer_name).read_bytes() == racer_bytes
 
 
+def test_remove_qa_pages_quarantines_exact_directory_when_posix_rmdir_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_path = tmp_path / "run"
+    staging_path = run_path / ".pdf-qa-preparing-test"
+    pages_path = staging_path / "qa-pages"
+    pages_path.mkdir(parents=True)
+    racer_bytes = b"raced-between-empty-check-and-rmdir"
+    real_rmdir = os.rmdir
+    run_anchor = pdf_qa_module.assembly._open_directory_anchor(run_path, "run")
+    staging_anchor = pdf_qa_module.assembly._open_existing_child_directory(
+        run_anchor, staging_path.name, "staging"
+    )
+    pages_anchor = pdf_qa_module.assembly._open_existing_child_directory(
+        staging_anchor, "qa-pages", "pages"
+    )
+
+    def racing_rmdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == "qa-pages" and dir_fd == staging_anchor.descriptor:
+            (pages_path / "page-999.png").write_bytes(racer_bytes)
+        real_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pdf_qa_module.os, "rmdir", racing_rmdir)
+    try:
+        pdf_qa_module._remove_qa_pages(
+            staging_anchor,
+            "qa-pages",
+            pages_anchor,
+            quarantine_parent=run_anchor,
+        )
+    finally:
+        pages_anchor.close()
+        staging_anchor.close()
+        run_anchor.close()
+
+    assert not pages_path.exists()
+    quarantines = list(run_path.glob(".pdf-qa-raced-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "page-999.png").read_bytes() == racer_bytes
+
+
+def test_remove_qa_pages_quarantines_exact_directory_on_unexpected_posix_delete_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_path = tmp_path / "run"
+    staging_path = run_path / ".pdf-qa-preparing-test"
+    pages_path = staging_path / "qa-pages"
+    pages_path.mkdir(parents=True)
+    run_anchor = pdf_qa_module.assembly._open_directory_anchor(run_path, "run")
+    staging_anchor = pdf_qa_module.assembly._open_existing_child_directory(
+        run_anchor, staging_path.name, "staging"
+    )
+    pages_anchor = pdf_qa_module.assembly._open_existing_child_directory(
+        staging_anchor, "qa-pages", "pages"
+    )
+    staging_descriptor = staging_anchor.descriptor
+    attempts: list[tuple[object, int | None]] = []
+
+    def denied_rmdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        attempts.append((path, dir_fd))
+        raise OSError(errno.EACCES, "injected delete denial")
+
+    monkeypatch.setattr(pdf_qa_module.os, "rmdir", denied_rmdir)
+    try:
+        pdf_qa_module._remove_qa_pages(
+            staging_anchor,
+            "qa-pages",
+            pages_anchor,
+            quarantine_parent=run_anchor,
+        )
+    finally:
+        pages_anchor.close()
+        staging_anchor.close()
+        run_anchor.close()
+
+    assert attempts == [("qa-pages", staging_descriptor)]
+    assert not pages_path.exists()
+    quarantines = list(run_path.glob(".pdf-qa-raced-*"))
+    assert len(quarantines) == 1
+    assert list(quarantines[0].iterdir()) == []
+
+
+def test_remove_qa_pages_uses_windows_held_handle_to_remove_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class WindowsOSProxy:
+        name = "nt"
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    class WindowsPathAnchor:
+        def __init__(self, path: Path, handle: int) -> None:
+            self.path = path
+            self.handle = handle
+            self.close_count = 0
+
+        def current_path(self) -> Path:
+            return self.path
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    run_path = tmp_path / "run"
+    staging_path = run_path / ".pdf-qa-preparing-test"
+    pages_path = staging_path / "qa-pages"
+    pages_path.mkdir(parents=True)
+    run_path_anchor = WindowsPathAnchor(run_path, 101)
+    staging_path_anchor = WindowsPathAnchor(staging_path, 202)
+    pages_path_anchor = WindowsPathAnchor(pages_path, 303)
+    anchor_type = pdf_qa_module.assembly._DirectoryAnchor
+
+    def identity(path: Path) -> tuple[int, int]:
+        metadata = path.lstat()
+        return metadata.st_dev, metadata.st_ino
+
+    run_anchor = anchor_type(run_path, "run", identity(run_path), None, run_path_anchor)
+    staging_anchor = anchor_type(
+        staging_path, "staging", identity(staging_path), None, staging_path_anchor
+    )
+    pages_anchor = anchor_type(
+        pages_path, "pages", identity(pages_path), None, pages_path_anchor
+    )
+    deleted: list[int] = []
+    moved: list[tuple[int, int, str]] = []
+
+    def windows_delete(handle: int) -> None:
+        deleted.append(handle)
+        pages_path.rmdir()
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly, "_windows_delete_open_file", windows_delete
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_rename_open_file",
+        lambda source, destination, name: moved.append((source, destination, name)),
+    )
+    monkeypatch.setattr(pdf_qa_module, "os", WindowsOSProxy())
+
+    try:
+        pdf_qa_module._remove_qa_pages(
+            staging_anchor,
+            "qa-pages",
+            pages_anchor,
+            quarantine_parent=run_anchor,
+        )
+    finally:
+        pages_anchor.close()
+        staging_anchor.close()
+        run_anchor.close()
+
+    assert deleted == [303]
+    assert moved == []
+    assert not pages_path.exists()
+    assert pages_path_anchor.close_count == 1
+    assert staging_path_anchor.close_count == 1
+    assert run_path_anchor.close_count == 1
+
+
 def test_remove_qa_pages_uses_windows_held_handle_move_and_closes_anchors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -894,6 +1089,7 @@ def test_remove_qa_pages_uses_windows_held_handle_move_and_closes_anchors(
         pages_path_anchor,
     )
 
+    deleted: list[int] = []
     moved: list[tuple[int, int, str]] = []
 
     def windows_rename(
@@ -904,6 +1100,11 @@ def test_remove_qa_pages_uses_windows_held_handle_move_and_closes_anchors(
         moved.append((source_handle, destination_handle, destination_name))
         pages_path.rename(run_path / destination_name)
 
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_delete_open_file",
+        deleted.append,
+    )
     monkeypatch.setattr(
         pdf_qa_module.assembly,
         "_windows_rename_open_file",
@@ -923,6 +1124,7 @@ def test_remove_qa_pages_uses_windows_held_handle_move_and_closes_anchors(
         staging_anchor.close()
         run_anchor.close()
 
+    assert deleted == [303]
     assert len(moved) == 1
     assert moved[0][:2] == (303, 101)
     assert moved[0][2].startswith(".pdf-qa-raced-")
