@@ -1572,24 +1572,7 @@ def _remove_qa_pages(
     if pages_anchor is None:
         return
     try:
-        current = pages_anchor.current_path()
-        has_racer = False
-        for path in current.iterdir():
-            if (
-                _RAW_PAGE_NAME.fullmatch(path.name)
-                or _CONTACT_NAME.fullmatch(path.name)
-            ):
-                metadata = path.lstat()
-                if stat.S_ISREG(metadata.st_mode) and not assembly._is_reparse_stat(metadata):
-                    if pages_anchor.descriptor is not None:
-                        os.unlink(path.name, dir_fd=pages_anchor.descriptor)
-                    else:
-                        path.unlink()
-                    continue
-            has_racer = True
-        if has_racer:
-            if quarantine_parent is None:
-                return
+        if quarantine_parent is not None:
             _require_anchored_directory_identity(
                 run_anchor,
                 name,
@@ -1603,6 +1586,8 @@ def _remove_qa_pages(
                 quarantine_parent,
                 f".pdf-qa-raced-{os.urandom(16).hex()}",
             )
+            return
+        if any(pages_anchor.current_path().iterdir()):
             return
         assembly._remove_owned_directory(
             run_anchor, name, pages_anchor.identity, child=pages_anchor

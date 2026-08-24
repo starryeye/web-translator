@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 
@@ -786,6 +787,150 @@ def test_prepare_pdf_qa_preserves_renderer_racer_without_preparation_leak(
     markers = list(assembled_pdf_run.run_dir.rglob("unrelated.txt"))
     assert len(markers) == 1
     assert markers[0].read_text(encoding="utf-8") == "preserve me"
+
+
+@pytest.mark.parametrize(
+    "racer_name",
+    ["page-1.png", "page-999.png", "contact-sheet-001.png"],
+)
+@pytest.mark.parametrize("failure", ["media-error", "interrupt"])
+def test_prepare_pdf_qa_quarantines_failed_render_filename_racers(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    racer_name: str,
+    failure: str,
+) -> None:
+    from web_translator.pdf_media import PdfMediaError
+
+    racer_bytes = f"racer:{racer_name}:{failure}".encode()
+
+    def fail_after_filename_race(
+        source_pdf: Path,
+        destination: Path,
+        **kwargs: object,
+    ) -> list[Path]:
+        del source_pdf, kwargs
+        partial = destination / "page-1.png"
+        image = Image.new("RGB", (32, 32), "white")
+        try:
+            image.save(partial)
+        finally:
+            image.close()
+        if racer_name == partial.name:
+            partial.unlink()
+        (destination / racer_name).write_bytes(racer_bytes)
+        if failure == "media-error":
+            raise PdfMediaError("injected render failure with filename racer")
+        raise KeyboardInterrupt("injected render interruption with filename racer")
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "render_pdf_pages",
+        fail_after_filename_race,
+    )
+
+    expected = PdfQAFailure if failure == "media-error" else KeyboardInterrupt
+    with pytest.raises(expected, match="filename racer"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+    quarantines = list(assembled_pdf_run.run_dir.glob(".pdf-qa-raced-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / racer_name).read_bytes() == racer_bytes
+
+
+def test_remove_qa_pages_uses_windows_held_handle_move_and_closes_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class WindowsOSProxy:
+        name = "nt"
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    class WindowsPathAnchor:
+        def __init__(self, path: Path, handle: int) -> None:
+            self.path = path
+            self.handle = handle
+            self.close_count = 0
+
+        def current_path(self) -> Path:
+            return self.path
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    run_path = tmp_path / "run"
+    staging_path = run_path / ".pdf-qa-preparing-test"
+    pages_path = staging_path / "qa-pages"
+    pages_path.mkdir(parents=True)
+    racer_bytes = b"windows-page-racer"
+    (pages_path / "page-999.png").write_bytes(racer_bytes)
+
+    run_path_anchor = WindowsPathAnchor(run_path, 101)
+    staging_path_anchor = WindowsPathAnchor(staging_path, 202)
+    pages_path_anchor = WindowsPathAnchor(pages_path, 303)
+    anchor_type = pdf_qa_module.assembly._DirectoryAnchor
+
+    def identity(path: Path) -> tuple[int, int]:
+        metadata = path.lstat()
+        return metadata.st_dev, metadata.st_ino
+
+    run_anchor = anchor_type(run_path, "run", identity(run_path), None, run_path_anchor)
+    staging_anchor = anchor_type(
+        staging_path,
+        "staging",
+        identity(staging_path),
+        None,
+        staging_path_anchor,
+    )
+    pages_anchor = anchor_type(
+        pages_path,
+        "pages",
+        identity(pages_path),
+        None,
+        pages_path_anchor,
+    )
+
+    moved: list[tuple[int, int, str]] = []
+
+    def windows_rename(
+        source_handle: int,
+        destination_handle: int,
+        destination_name: str,
+    ) -> None:
+        moved.append((source_handle, destination_handle, destination_name))
+        pages_path.rename(run_path / destination_name)
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_rename_open_file",
+        windows_rename,
+    )
+    monkeypatch.setattr(pdf_qa_module, "os", WindowsOSProxy())
+
+    try:
+        pdf_qa_module._remove_qa_pages(
+            staging_anchor,
+            "qa-pages",
+            pages_anchor,
+            quarantine_parent=run_anchor,
+        )
+    finally:
+        pages_anchor.close()
+        staging_anchor.close()
+        run_anchor.close()
+
+    assert len(moved) == 1
+    assert moved[0][:2] == (303, 101)
+    assert moved[0][2].startswith(".pdf-qa-raced-")
+    quarantine = run_path / moved[0][2]
+    assert (quarantine / "page-999.png").read_bytes() == racer_bytes
+    assert pages_path_anchor.close_count == 1
+    assert staging_path_anchor.close_count == 1
+    assert run_path_anchor.close_count == 1
 
 
 def test_prepare_pdf_qa_regenerates_safe_prior_evidence_and_preserves_unrelated_files(
