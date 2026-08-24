@@ -1171,6 +1171,122 @@ def test_prepare_pdf_qa_rejects_staged_pdf_swap_before_poppler_render(
     _assert_no_public_qa_evidence(assembled_pdf_run)
 
 
+@pytest.mark.parametrize("mutation", ["overwrite", "truncate"])
+def test_prepare_pdf_qa_rejects_same_inode_staged_pdf_mutation_after_render(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    staged = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    real_render = pdf_qa_module.render_pdf_pages
+
+    def render_then_mutate(*args: object, **kwargs: object) -> list[Path]:
+        paths = real_render(*args, **kwargs)  # type: ignore[arg-type]
+        identity = (staged.stat().st_dev, staged.stat().st_ino)
+        with staged.open("r+b") as stream:
+            if mutation == "overwrite":
+                first = stream.read(1)
+                assert first
+                stream.seek(0)
+                stream.write(bytes([first[0] ^ 0xFF]))
+            else:
+                stream.truncate(staged.stat().st_size // 2)
+        assert (staged.stat().st_dev, staged.stat().st_ino) == identity
+        return paths
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", render_then_mutate)
+
+    with pytest.raises(PdfQAFailure, match="staged translated PDF.*content"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+
+
+def test_prepare_pdf_qa_checks_staged_pdf_content_immediately_after_render(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staged = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    original = staged.read_bytes()
+    identity = (staged.stat().st_dev, staged.stat().st_ino)
+    real_render = pdf_qa_module.render_pdf_pages
+    real_validate = pdf_qa_module._validate_rendered_pages
+
+    def render_then_mutate(*args: object, **kwargs: object) -> list[Path]:
+        paths = real_render(*args, **kwargs)  # type: ignore[arg-type]
+        with staged.open("r+b") as stream:
+            stream.write(bytes([original[0] ^ 0xFF]))
+        assert (staged.stat().st_dev, staged.stat().st_ino) == identity
+        return paths
+
+    def restore_then_validate(*args: object, **kwargs: object) -> None:
+        with staged.open("r+b") as stream:
+            stream.write(original)
+            stream.truncate()
+        real_validate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", render_then_mutate)
+    monkeypatch.setattr(pdf_qa_module, "_validate_rendered_pages", restore_then_validate)
+
+    with pytest.raises(PdfQAFailure, match="staged translated PDF.*content"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+
+
+@pytest.mark.parametrize("fault", ["premature-eof", "oserror", "interrupt"])
+def test_prepare_pdf_qa_fails_closed_when_staged_pdf_reread_fails(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    class RereadFaultStream:
+        def __init__(self, wrapped: object) -> None:
+            self.wrapped = wrapped
+            self.read_count = 0
+
+        def read(self, *args: object, **kwargs: object) -> bytes:
+            self.read_count += 1
+            if self.read_count == 2:
+                if fault == "premature-eof":
+                    return b""
+                if fault == "oserror":
+                    raise OSError("injected staged translated PDF reread failure")
+                raise KeyboardInterrupt(
+                    "injected staged translated PDF reread interruption"
+                )
+            return self.wrapped.read(*args, **kwargs)  # type: ignore[union-attr,no-any-return]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.wrapped, name)
+
+    real_open = pdf_qa_module.assembly._open_anchored_input_file
+
+    def open_with_reread_fault(*args: object, **kwargs: object) -> object:
+        opened = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        if args[1] == "translated.pdf":
+            opened.stream = RereadFaultStream(opened.stream)  # type: ignore[assignment]
+        return opened
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_open_anchored_input_file",
+        open_with_reread_fault,
+    )
+
+    expected = KeyboardInterrupt if fault == "interrupt" else PdfQAFailure
+    with pytest.raises(expected, match="staged translated PDF"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+
+
 @pytest.mark.parametrize("interrupt_after", ["record", "page"])
 def test_prepare_pdf_qa_keeps_new_public_pair_after_prior_cleanup_interruption(
     assembled_pdf_run: PdfQARun,

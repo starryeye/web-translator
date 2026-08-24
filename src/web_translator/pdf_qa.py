@@ -269,6 +269,14 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         temporary_name, staging_anchor = assembly._create_unique_child_directory(
             run_anchor, ".pdf-qa-preparing-", "PDF QA preparation"
         )
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
         render_input = assembly._create_anchored_binary_file(
             staging_anchor, "render-input.pdf"
         )
@@ -288,8 +296,17 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             dpi=144,
             name_width=3,
         )
+        qa_pages_anchor = assembly._open_existing_child_directory(
+            staging_anchor, "qa-pages", "rendered PDF QA pages"
+        )
+        raw_pages = [qa_pages_anchor.current_path() / path.name for path in raw_pages]
         assembly._verify_anchored_evidence(
             staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
         )
         assembly._verify_anchored_evidence(
             staging_anchor, {"render-input.pdf": render_input}
@@ -297,10 +314,6 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         assembly._remove_owned_file(
             staging_anchor, "render-input.pdf", render_input_candidate
         )
-        qa_pages_anchor = assembly._open_existing_child_directory(
-            staging_anchor, "qa-pages", "rendered PDF QA pages"
-        )
-        raw_pages = [qa_pages_anchor.current_path() / path.name for path in raw_pages]
         for path in raw_pages:
             qa_artifacts[path.name] = assembly._open_anchored_input_file(
                 qa_pages_anchor,
@@ -393,6 +406,14 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         assembly._verify_anchored_evidence(qa_pages_anchor, qa_artifacts)
         if prior is not None:
             _move_prior_evidence_to_staging(run_anchor, staging_anchor, prior)
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
         qa_pages_publication_attempted = True
         _publish_new_directory(
             staging_anchor,
@@ -466,6 +487,47 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             staging_anchor.close()
         if run_anchor is not None:
             run_anchor.close()
+
+
+def _verify_staged_pdf_content(
+    opened: assembly._OpenedFile,
+    expected_sha256: str,
+    path: Path,
+) -> None:
+    stream = opened.stream
+    try:
+        original_position = stream.tell()
+    except (OSError, ValueError, TypeError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect staged translated PDF content {path}: {error}"
+        ) from error
+    try:
+        stream.seek(0)
+        digest = hashlib.sha256()
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not isinstance(chunk, bytes):
+                raise TypeError("held staged PDF stream did not return bytes")
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise PdfQAFailure(
+                f"staged translated PDF content changed: {path}"
+            )
+    except PdfQAFailure:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise PdfQAFailure(
+            f"cannot read staged translated PDF content {path}: {error}"
+        ) from error
+    finally:
+        try:
+            stream.seek(original_position)
+        except (OSError, ValueError, TypeError) as error:
+            raise PdfQAFailure(
+                f"cannot restore staged translated PDF stream {path}: {error}"
+            ) from error
 
 
 def _validate_locations(run_anchor: assembly._DirectoryAnchor, output_dir: Path) -> None:
