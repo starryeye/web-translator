@@ -98,6 +98,7 @@ _FIGURE_RENDER_DPI = 144.0
 _PAGE_LOCAL_FOOTNOTE_HEIGHT = 60.0
 _URI_CHARACTERS = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*\Z")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_HTTP_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 
 @dataclass(slots=True)
@@ -714,17 +715,52 @@ def _safe_uri(uri: str, block_id: str) -> str:
     try:
         parsed = urlsplit(uri)
         hostname = parsed.hostname
+        port = parsed.port
     except ValueError as error:
         raise PdfAssemblyError(f"unsafe external URI for {block_id}") from error
-    if parsed.scheme.lower() not in {"http", "https", "mailto"}:
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "mailto"}:
         raise PdfAssemblyError(f"unsafe external URI for {block_id}")
-    if parsed.scheme.lower() in {"http", "https"} and (
-        not parsed.netloc or not hostname
-    ):
-        raise PdfAssemblyError(f"unsafe external URI for {block_id}")
-    if parsed.scheme.lower() == "mailto" and (
-        parsed.netloc or not parsed.path
-    ):
+    if scheme in {"http", "https"}:
+        at_count = parsed.netloc.count("@")
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        if (
+            not parsed.netloc
+            or not hostname
+            or at_count > 1
+            or (at_count == 1 and not parsed.username)
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+
+        if authority.startswith("["):
+            closing_bracket = authority.find("]")
+            port_suffix = authority[closing_bracket + 1 :]
+            if closing_bracket < 0 or (port_suffix and not port_suffix.startswith(":")):
+                raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+            explicit_port = port_suffix[1:] if port_suffix else None
+        else:
+            if authority.count(":") > 1:
+                raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+            _host, separator, port_text = authority.rpartition(":")
+            explicit_port = port_text if separator else None
+        if explicit_port is not None and (
+            not explicit_port or not explicit_port.isdecimal()
+        ):
+            raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+
+        if ":" not in hostname:
+            dns_hostname = hostname[:-1] if hostname.endswith(".") else hostname
+            if (
+                not dns_hostname
+                or len(dns_hostname) > 253
+                or any(
+                    _HTTP_HOST_LABEL.fullmatch(label) is None
+                    for label in dns_hostname.split(".")
+                )
+            ):
+                raise PdfAssemblyError(f"unsafe external URI for {block_id}")
+    if scheme == "mailto" and (parsed.netloc or not parsed.path):
         raise PdfAssemblyError(f"unsafe external URI for {block_id}")
     return uri
 

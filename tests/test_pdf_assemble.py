@@ -2589,6 +2589,19 @@ def test_caption_above_figure_is_emitted_once_in_source_order(
         "https://example.com/a<bad>",
         "https://example.com/a%2",
         "https:///missing-authority",
+        "https://example.com:bad/path",
+        "https://example.com:-1/path",
+        "https://example.com:/path",
+        "https://example.com:0/path",
+        "https://example.com:65536/path",
+        "https://example.com:99999/path",
+        "https://a@b@c/path",
+        "https://@example.com/path",
+        "https://:pass@example.com/path",
+        "https://example..com/path",
+        "https://[2001:db8::1/path",
+        "https://[not-ip]/path",
+        "https://2001:db8::1/path",
         "mailto:",
     ],
 )
@@ -2613,15 +2626,26 @@ def test_rich_assembly_rejects_raw_or_structurally_invalid_uri(
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
-def test_rich_assembly_preserves_percent_encoded_uri_exactly(
+@pytest.mark.parametrize(
+    "expected",
+    [
+        "https://example.com/a%20b?q=x%2Fy&lang=ko",
+        "https://example.com:1/path",
+        "https://example.com:65535/path",
+        "https://user:pass@example.com:443/path",
+        "https://user:@example.com/path",
+        "https://[2001:db8::1]:443/a%20b?q=x%2Fy",
+    ],
+)
+def test_rich_assembly_preserves_valid_external_uri_exactly(
     tmp_path: Path,
+    expected: str,
 ) -> None:
     run_dir, translations, glossary, identifiers = _rich_assembly_run(
         tmp_path,
         table_columns=4,
         table_rows=4,
     )
-    expected = "https://example.com/a%20b?q=x%2Fy&lang=ko"
     path = run_dir / "document.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     external = next(
