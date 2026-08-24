@@ -7,7 +7,9 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -22,6 +24,7 @@ _CONTACT_COLUMNS = 4
 _CONTACT_THUMBNAIL = (360, 480)
 _CONTACT_LABEL_HEIGHT = 28
 _CONTACT_GAP = 16
+_RENDERED_PAGE_NAME = re.compile(r"page-(\d+)\.png\Z")
 
 
 class PdfMediaError(RuntimeError):
@@ -76,18 +79,17 @@ def render_pdf_pages(
     *,
     dpi: int = 144,
     name_width: int | None = None,
+    existing_destination_identity: tuple[int, int] | None = None,
 ) -> list[Path]:
     """Render every source page to a deterministic PNG prefix."""
     if type(dpi) is not int or dpi <= 0:
         raise PdfMediaError("PDF render DPI must be a positive integer")
     tools = find_poppler()
     destination = Path(destination)
-    try:
-        destination.mkdir(parents=True, exist_ok=False)
-    except OSError as error:
-        raise PdfMediaError(
-            f"cannot create PDF render destination {destination}: {error}"
-        ) from error
+    destination_identity = _prepare_render_destination(
+        destination,
+        existing_destination_identity,
+    )
     prefix = destination / "page"
     command = [
         str(tools.pdftoppm),
@@ -98,7 +100,8 @@ def render_pdf_pages(
         str(prefix),
     ]
     _run_poppler(command, "render PDF pages")
-    pages = sorted(destination.glob("page-*.png"))
+    _verify_render_destination(destination, destination_identity)
+    pages = _rendered_page_files(destination)
     if not pages:
         raise PdfMediaError("render PDF pages produced no PNG output")
     if name_width is not None:
@@ -116,7 +119,103 @@ def render_pdf_pages(
                     ) from error
             renamed.append(destination_name)
         pages = renamed
-    return pages
+    _verify_render_destination(destination, destination_identity)
+    final_pages = _rendered_page_files(destination)
+    if final_pages != pages:
+        raise PdfMediaError(
+            "rendered PDF page set changed during name normalization"
+        )
+    return final_pages
+
+
+def _prepare_render_destination(
+    destination: Path,
+    expected_identity: tuple[int, int] | None,
+) -> tuple[int, int]:
+    if expected_identity is None:
+        try:
+            destination.mkdir(parents=True, exist_ok=False)
+        except OSError as error:
+            raise PdfMediaError(
+                f"cannot create PDF render destination {destination}: {error}"
+            ) from error
+    elif (
+        not isinstance(expected_identity, tuple)
+        or len(expected_identity) != 2
+        or any(type(value) is not int or value < 0 for value in expected_identity)
+    ):
+        raise PdfMediaError("existing PDF render destination identity is invalid")
+    identity = _verify_render_destination(destination, expected_identity)
+    if expected_identity is not None:
+        try:
+            if next(destination.iterdir(), None) is not None:
+                raise PdfMediaError(
+                    f"existing PDF render destination is not empty: {destination}"
+                )
+        except PdfMediaError:
+            raise
+        except OSError as error:
+            raise PdfMediaError(
+                f"cannot inspect existing PDF render destination {destination}: {error}"
+            ) from error
+        _verify_render_destination(destination, identity)
+    return identity
+
+
+def _verify_render_destination(
+    destination: Path,
+    expected_identity: tuple[int, int] | None,
+) -> tuple[int, int]:
+    try:
+        metadata = destination.lstat()
+    except OSError as error:
+        raise PdfMediaError(
+            f"cannot inspect safe existing PDF render destination {destination}: {error}"
+        ) from error
+    identity = (metadata.st_dev, metadata.st_ino)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or _is_reparse_metadata(metadata)
+        or (expected_identity is not None and identity != expected_identity)
+    ):
+        raise PdfMediaError(
+            f"safe existing PDF render destination changed identity: {destination}"
+        )
+    return identity
+
+
+def _rendered_page_files(destination: Path) -> list[Path]:
+    try:
+        entries = list(destination.iterdir())
+        pages: list[tuple[int, Path]] = []
+        page_numbers: set[int] = set()
+        for path in entries:
+            match = _RENDERED_PAGE_NAME.fullmatch(path.name)
+            metadata = path.lstat()
+            if (
+                match is None
+                or not stat.S_ISREG(metadata.st_mode)
+                or _is_reparse_metadata(metadata)
+            ):
+                raise PdfMediaError(
+                    "render PDF pages must output only page PNG files"
+                )
+            page_number = int(match.group(1))
+            if page_number <= 0 or page_number in page_numbers:
+                raise PdfMediaError("render PDF pages produced duplicate page numbers")
+            page_numbers.add(page_number)
+            pages.append((page_number, path))
+        return [path for _number, path in sorted(pages)]
+    except PdfMediaError:
+        raise
+    except OSError as error:
+        raise PdfMediaError(f"cannot inspect rendered PDF pages: {error}") from error
+
+
+def _is_reparse_metadata(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse)
 
 
 def build_contact_sheets(

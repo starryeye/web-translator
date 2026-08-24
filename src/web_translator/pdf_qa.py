@@ -36,6 +36,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HANGUL = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
 _TOKEN = re.compile(r"⟦WT:\d{6}⟧")
 _PAGE_NAME = re.compile(r"page-(\d{3})\.png\Z")
+_RAW_PAGE_NAME = re.compile(r"page-\d+\.png\Z")
 _CONTACT_NAME = re.compile(r"contact-sheet-(\d{3})\.png\Z")
 _REVIEW_DIMENSIONS = {
     "semantic_fidelity",
@@ -290,15 +291,17 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         assembly._verify_anchored_evidence(
             staging_anchor, {"render-input.pdf": render_input}
         )
-        raw_pages = render_pdf_pages(
-            staging_anchor.current_path() / "render-input.pdf",
-            staging_anchor.current_path() / "qa-pages",
-            dpi=144,
-            name_width=3,
-        )
-        qa_pages_anchor = assembly._open_existing_child_directory(
+        qa_pages_anchor = assembly._create_child_directory(
             staging_anchor, "qa-pages", "rendered PDF QA pages"
         )
+        raw_pages = render_pdf_pages(
+            staging_anchor.current_path() / "render-input.pdf",
+            qa_pages_anchor.current_path(),
+            dpi=144,
+            name_width=3,
+            existing_destination_identity=qa_pages_anchor.identity,
+        )
+        qa_pages_anchor.verify_visible()
         raw_pages = [qa_pages_anchor.current_path() / path.name for path in raw_pages]
         assembly._verify_anchored_evidence(
             staged_output_anchor, {"translated.pdf": staged_pdf}
@@ -443,7 +446,12 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                 published_json or json_publication_candidate,
             )
             if qa_pages_publication_attempted:
-                _remove_qa_pages(run_anchor, "qa-pages", qa_pages_anchor)
+                _remove_qa_pages(
+                    run_anchor,
+                    "qa-pages",
+                    qa_pages_anchor,
+                    quarantine_parent=run_anchor,
+                )
             if prior is not None and staging_anchor is not None:
                 _restore_prior_evidence(run_anchor, staging_anchor, prior)
         for file in [
@@ -461,7 +469,12 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             assembly._close_opened_file(prior.record)
             prior.pages.close()
         if staging_anchor is not None and not completed:
-            _remove_qa_pages(staging_anchor, "qa-pages", qa_pages_anchor)
+            _remove_qa_pages(
+                staging_anchor,
+                "qa-pages",
+                qa_pages_anchor,
+                quarantine_parent=run_anchor,
+            )
         if qa_pages_anchor is not None:
             qa_pages_anchor.close()
         if staged_output_anchor is not None:
@@ -1553,23 +1566,48 @@ def _remove_qa_pages(
     run_anchor: assembly._DirectoryAnchor,
     name: str,
     pages_anchor: assembly._DirectoryAnchor | None,
+    *,
+    quarantine_parent: assembly._DirectoryAnchor | None,
 ) -> None:
     if pages_anchor is None:
         return
     try:
         current = pages_anchor.current_path()
+        has_racer = False
         for path in current.iterdir():
-            if _PAGE_NAME.fullmatch(path.name) or _CONTACT_NAME.fullmatch(path.name):
+            if (
+                _RAW_PAGE_NAME.fullmatch(path.name)
+                or _CONTACT_NAME.fullmatch(path.name)
+            ):
                 metadata = path.lstat()
                 if stat.S_ISREG(metadata.st_mode) and not assembly._is_reparse_stat(metadata):
                     if pages_anchor.descriptor is not None:
                         os.unlink(path.name, dir_fd=pages_anchor.descriptor)
                     else:
                         path.unlink()
+                    continue
+            has_racer = True
+        if has_racer:
+            if quarantine_parent is None:
+                return
+            _require_anchored_directory_identity(
+                run_anchor,
+                name,
+                pages_anchor.identity,
+                "failed PDF QA render directory",
+            )
+            _move_directory(
+                run_anchor,
+                name,
+                pages_anchor,
+                quarantine_parent,
+                f".pdf-qa-raced-{os.urandom(16).hex()}",
+            )
+            return
         assembly._remove_owned_directory(
             run_anchor, name, pages_anchor.identity, child=pages_anchor
         )
-    except (OSError, PdfAssemblyError):
+    except (OSError, PdfAssemblyError, PdfQAFailure):
         return
 
 

@@ -714,6 +714,80 @@ def test_prepare_pdf_qa_rejects_render_failure_without_publishing(
     assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
 
 
+@pytest.mark.parametrize("partial_page", [False, True])
+@pytest.mark.parametrize("failure", ["media-error", "interrupt"])
+def test_prepare_pdf_qa_cleans_owned_destination_after_render_failure(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    partial_page: bool,
+    failure: str,
+) -> None:
+    from web_translator.pdf_media import PdfMediaError
+
+    racer = assembled_pdf_run.run_dir / "unrelated-render-racer"
+    racer.mkdir()
+    marker = racer / "keep.txt"
+    marker.write_text("preserve me", encoding="utf-8")
+
+    def fail_after_destination(
+        source_pdf: Path,
+        destination: Path,
+        **kwargs: object,
+    ) -> list[Path]:
+        destination.mkdir(parents=True, exist_ok=True)
+        if partial_page:
+            image = Image.new("RGB", (32, 32), "white")
+            try:
+                image.save(destination / "page-1.png")
+            finally:
+                image.close()
+        if failure == "media-error":
+            raise PdfMediaError("injected render failure after destination")
+        raise KeyboardInterrupt("injected render interruption after destination")
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", fail_after_destination)
+
+    expected = PdfQAFailure if failure == "media-error" else KeyboardInterrupt
+    with pytest.raises(expected, match="after destination"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+    assert marker.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_prepare_pdf_qa_preserves_renderer_racer_without_preparation_leak(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt_with_racer(
+        source_pdf: Path,
+        destination: Path,
+        **kwargs: object,
+    ) -> list[Path]:
+        destination.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (32, 32), "white")
+        try:
+            image.save(destination / "page-1.png")
+        finally:
+            image.close()
+        (destination / "unrelated.txt").write_text("preserve me", encoding="utf-8")
+        raise KeyboardInterrupt("injected render interruption with racer")
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", interrupt_with_racer)
+
+    with pytest.raises(KeyboardInterrupt, match="with racer"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+    markers = list(assembled_pdf_run.run_dir.rglob("unrelated.txt"))
+    assert len(markers) == 1
+    assert markers[0].read_text(encoding="utf-8") == "preserve me"
+
+
 def test_prepare_pdf_qa_regenerates_safe_prior_evidence_and_preserves_unrelated_files(
     assembled_pdf_run: PdfQARun,
 ) -> None:
@@ -868,6 +942,110 @@ def test_render_pdf_pages_orders_double_digit_poppler_names_numerically(
         with Image.open(path) as image:
             shades.append(image.convert("RGB").getpixel((50, 50))[0])
     assert shades == sorted(shades)
+
+
+def test_render_pdf_pages_uses_empty_existing_owned_destination(
+    tmp_path: Path,
+) -> None:
+    source = make_text_pdf(tmp_path / "source.pdf")
+    destination = tmp_path / "rendered"
+    destination.mkdir()
+    metadata = destination.stat()
+
+    pages = render_pdf_pages(
+        source,
+        destination,
+        dpi=72,
+        name_width=3,
+        existing_destination_identity=(metadata.st_dev, metadata.st_ino),
+    )
+
+    assert [path.name for path in pages] == ["page-001.png"]
+
+
+def test_render_pdf_pages_never_follows_existing_destination_symlink(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_media import PdfMediaError
+
+    source = make_text_pdf(tmp_path / "source.pdf")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = tmp_path / "rendered"
+    destination.symlink_to(outside, target_is_directory=True)
+    metadata = outside.stat()
+
+    with pytest.raises(PdfMediaError, match="safe existing PDF render destination"):
+        render_pdf_pages(
+            source,
+            destination,
+            existing_destination_identity=(metadata.st_dev, metadata.st_ino),
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_render_pdf_pages_rejects_non_page_output_in_owned_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_media as media_module
+    from web_translator.pdf_media import PdfMediaError
+
+    source = make_text_pdf(tmp_path / "source.pdf")
+    destination = tmp_path / "rendered"
+    destination.mkdir()
+    metadata = destination.stat()
+
+    def write_mixed_output(command: list[str], action: str) -> None:
+        prefix = Path(command[-1])
+        image = Image.new("RGB", (20, 20), "white")
+        try:
+            image.save(prefix.parent / "page-1.png")
+        finally:
+            image.close()
+        (prefix.parent / "unexpected.txt").write_text("racer", encoding="utf-8")
+
+    monkeypatch.setattr(media_module, "_run_poppler", write_mixed_output)
+
+    with pytest.raises(PdfMediaError, match="only page PNG files"):
+        render_pdf_pages(
+            source,
+            destination,
+            existing_destination_identity=(metadata.st_dev, metadata.st_ino),
+        )
+
+    assert (destination / "unexpected.txt").read_text(encoding="utf-8") == "racer"
+
+
+def test_render_pdf_pages_rechecks_output_after_name_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_media as media_module
+    from web_translator.pdf_media import PdfMediaError
+
+    source = make_text_pdf(tmp_path / "source.pdf")
+    destination = tmp_path / "rendered"
+    destination.mkdir()
+    metadata = destination.stat()
+    real_replace = media_module.os.replace
+
+    def replace_then_race(source_path: object, destination_path: object) -> None:
+        real_replace(source_path, destination_path)
+        (destination / "late-racer.txt").write_text("preserve me", encoding="utf-8")
+
+    monkeypatch.setattr(media_module.os, "replace", replace_then_race)
+
+    with pytest.raises(PdfMediaError, match="only page PNG files"):
+        render_pdf_pages(
+            source,
+            destination,
+            name_width=3,
+            existing_destination_identity=(metadata.st_dev, metadata.st_ino),
+        )
+
+    assert (destination / "late-racer.txt").read_text(encoding="utf-8") == "preserve me"
 
 
 def test_prepare_pdf_qa_rejects_layout_block_text_mapping_swap(
@@ -1078,13 +1256,15 @@ def test_prepare_pdf_qa_rejects_known_tofu_boxes_in_korean_block_renders(
         *,
         dpi: int,
         name_width: int,
+        existing_destination_identity: tuple[int, int],
     ) -> list[Path]:
         assert dpi == 144
         assert name_width == 3
         page_count = len(PdfReader(source_pdf).pages)
         width = round(layout["page_size"]["width"] * 2)
         height = round(layout["page_size"]["height"] * 2)
-        destination.mkdir(parents=True, exist_ok=False)
+        metadata = destination.stat()
+        assert existing_destination_identity == (metadata.st_dev, metadata.st_ino)
         paths: list[Path] = []
         for page_number in range(1, page_count + 1):
             image = Image.new("RGB", (width, height), "white")
@@ -1133,8 +1313,10 @@ def test_prepare_pdf_qa_rejects_pure_white_page_even_with_flowable_evidence(
         *,
         dpi: int,
         name_width: int,
+        existing_destination_identity: tuple[int, int],
     ) -> list[Path]:
-        destination.mkdir(parents=True, exist_ok=False)
+        metadata = destination.stat()
+        assert existing_destination_identity == (metadata.st_dev, metadata.st_ino)
         paths: list[Path] = []
         for page_number, _page in enumerate(PdfReader(source_pdf).pages, start=1):
             path = destination / f"page-{page_number:03d}.png"
