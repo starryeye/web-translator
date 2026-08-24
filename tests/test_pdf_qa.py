@@ -4,8 +4,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import struct
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytest
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, NameObject, TextStringObject
@@ -393,6 +394,56 @@ def _rewrite_pdf(run: PdfQARun, mutate: object) -> None:
     with pdf.open("wb") as stream:
         writer.write(stream)
     _rewrite_layout_hash(run)
+
+
+def _replace_embedded_font_program(
+    writer: PdfWriter,
+    face: str,
+    payload: bytes,
+) -> None:
+    for page in writer.pages:
+        fonts = page["/Resources"].get_object()["/Font"].get_object()
+        for reference in fonts.values():
+            font = reference.get_object()
+            if f"NotoSansCJKKR-{face}" not in str(font.get("/BaseFont", "")):
+                continue
+            descendants = font.get("/DescendantFonts", [])
+            candidate = descendants[0].get_object() if descendants else font
+            descriptor = candidate["/FontDescriptor"].get_object()
+            stream = DecodedStreamObject()
+            stream.set_data(payload)
+            descriptor[NameObject("/FontFile2")] = writer._add_object(stream)
+            return
+    raise AssertionError(f"fixture {face} font was not found")
+
+
+def _corrupt_embedded_font_glyph_table(writer: PdfWriter, face: str) -> None:
+    for page in writer.pages:
+        fonts = page["/Resources"].get_object()["/Font"].get_object()
+        for reference in fonts.values():
+            font = reference.get_object()
+            if f"NotoSansCJKKR-{face}" not in str(font.get("/BaseFont", "")):
+                continue
+            candidate = font.get("/DescendantFonts", [font])[0].get_object()
+            descriptor = candidate["/FontDescriptor"].get_object()
+            payload = bytearray(descriptor["/FontFile2"].get_object().get_data())
+            table_count = struct.unpack_from(">H", payload, 4)[0]
+            for index in range(table_count):
+                tag, _checksum, offset, length = struct.unpack_from(
+                    ">4sIII", payload, 12 + index * 16
+                )
+                if tag == b"glyf":
+                    payload[offset + length // 2] ^= 1
+                    _replace_embedded_font_program(writer, face, bytes(payload))
+                    return
+            raise AssertionError(f"fixture {face} glyph table was not found")
+    raise AssertionError(f"fixture {face} font was not found")
+
+
+def _assert_no_public_qa_evidence(run: PdfQARun) -> None:
+    assert not (run.run_dir / "qa-pages").exists()
+    assert not (run.run_dir / "pdf-qa.json").exists()
+    assert not run.output_dir.exists()
 
 
 def test_build_contact_sheets_limits_each_sheet_to_twelve_numbered_pages(
@@ -977,3 +1028,291 @@ def test_prepare_pdf_qa_requires_external_link_for_each_source_block(
 
     with pytest.raises(PdfQAFailure, match="external URI annotation.*block"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+@pytest.mark.parametrize("face", ["Regular", "Bold"])
+@pytest.mark.parametrize("payload", [b"", b"not-a-true-type-font"])
+def test_prepare_pdf_qa_rejects_empty_or_corrupt_embedded_font_program(
+    assembled_pdf_run: PdfQARun,
+    face: str,
+    payload: bytes,
+) -> None:
+    _rewrite_pdf(
+        assembled_pdf_run,
+        lambda writer: _replace_embedded_font_program(writer, face, payload),
+    )
+
+    with pytest.raises(PdfQAFailure, match=f"{face}.*font|font.*{face}"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+
+
+@pytest.mark.parametrize("face", ["Regular", "Bold"])
+def test_prepare_pdf_qa_rejects_checksum_corrupt_embedded_font_program(
+    assembled_pdf_run: PdfQARun,
+    face: str,
+) -> None:
+    _rewrite_pdf(
+        assembled_pdf_run,
+        lambda writer: _corrupt_embedded_font_glyph_table(writer, face),
+    )
+
+    with pytest.raises(PdfQAFailure, match=f"{face}.*font|font.*{face}"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+
+
+def test_prepare_pdf_qa_rejects_known_tofu_boxes_in_korean_block_renders(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = json.loads(
+        (assembled_pdf_run.run_dir / "layout.json").read_text(encoding="utf-8")
+    )
+
+    def render_tofu(
+        source_pdf: Path,
+        destination: Path,
+        *,
+        dpi: int,
+        name_width: int,
+    ) -> list[Path]:
+        assert dpi == 144
+        assert name_width == 3
+        page_count = len(PdfReader(source_pdf).pages)
+        width = round(layout["page_size"]["width"] * 2)
+        height = round(layout["page_size"]["height"] * 2)
+        destination.mkdir(parents=True, exist_ok=False)
+        paths: list[Path] = []
+        for page_number in range(1, page_count + 1):
+            image = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(image)
+            for item in layout["flowables"]:
+                if item["page_number"] != page_number or item["kind"] == "figure":
+                    continue
+                x, y, box_width, box_height = item["bounds"]
+                left = round(x * 2) + 2
+                top = round(height - (y + box_height) * 2) + 2
+                glyph_height = max(6, min(16, round(box_height * 2) - 4))
+                glyph_width = max(5, min(11, round(box_width * 2 / 6)))
+                for index in range(4):
+                    glyph_left = left + index * (glyph_width + 3)
+                    draw.rectangle(
+                        (
+                            glyph_left,
+                            top,
+                            glyph_left + glyph_width,
+                            top + glyph_height,
+                        ),
+                        outline="black",
+                        width=1,
+                    )
+            path = destination / f"page-{page_number:03d}.png"
+            image.save(path)
+            image.close()
+            paths.append(path)
+        return paths
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", render_tofu)
+
+    with pytest.raises(PdfQAFailure, match="replacement boxes|tofu"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+
+
+def test_prepare_pdf_qa_rejects_pure_white_page_even_with_flowable_evidence(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def render_white(
+        source_pdf: Path,
+        destination: Path,
+        *,
+        dpi: int,
+        name_width: int,
+    ) -> list[Path]:
+        destination.mkdir(parents=True, exist_ok=False)
+        paths: list[Path] = []
+        for page_number, _page in enumerate(PdfReader(source_pdf).pages, start=1):
+            path = destination / f"page-{page_number:03d}.png"
+            Image.new("RGB", (1224, 1584), "white").save(path)
+            paths.append(path)
+        return paths
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", render_white)
+
+    with pytest.raises(PdfQAFailure, match="blank output page"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+
+
+def test_prepare_pdf_qa_rejects_staged_pdf_swap_before_poppler_render(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement = make_text_pdf(tmp_path / "replacement.pdf")
+    staged = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    real_render = pdf_qa_module.render_pdf_pages
+
+    def swap_then_render(*args: object, **kwargs: object) -> list[Path]:
+        replacement.replace(staged)
+        return real_render(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", swap_then_render)
+
+    with pytest.raises(PdfQAFailure, match="staged translated PDF.*identity|changed identity"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+
+
+@pytest.mark.parametrize("interrupt_after", ["record", "page"])
+def test_prepare_pdf_qa_keeps_new_public_pair_after_prior_cleanup_interruption(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_after: str,
+) -> None:
+    first = prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    real_remove = pdf_qa_module.assembly._remove_owned_file
+    prior_record_removed = False
+
+    def remove_then_interrupt(
+        directory: object,
+        name: str,
+        published: object,
+    ) -> None:
+        nonlocal prior_record_removed
+        real_remove(directory, name, published)  # type: ignore[arg-type]
+        if name == "prior-pdf-qa.json":
+            prior_record_removed = True
+            if interrupt_after == "record":
+                raise KeyboardInterrupt
+        elif interrupt_after == "page" and prior_record_removed and name.startswith("page-"):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_remove_owned_file",
+        remove_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    record_path = assembled_pdf_run.run_dir / "pdf-qa.json"
+    pages_path = assembled_pdf_run.run_dir / "qa-pages"
+    assert record_path.is_file()
+    assert pages_path.is_dir()
+    record = PdfQAResult.from_dict(
+        json.loads(record_path.read_text(encoding="utf-8")),
+        pages_path,
+    )
+    assert record.staged_pdf_sha256 == first.staged_pdf_sha256
+    assert all((pages_path / name).is_file() for name in record.rendered_page_hashes)
+    assert all((pages_path / name).is_file() for name in record.contact_sheet_hashes)
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_publish_new_directory_rejects_and_preserves_source_name_swap(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_publish = pdf_qa_module._publish_new_directory
+    racer_marker = "unrelated-racer"
+
+    def swap_source_then_publish(
+        source_parent: object,
+        source_name: str,
+        source: object,
+        destination_parent: object,
+        destination_name: str,
+    ) -> None:
+        parent_path = source_parent.current_path()  # type: ignore[attr-defined]
+        (parent_path / source_name).rename(parent_path / "held-original-qa-pages")
+        racer = parent_path / source_name
+        racer.mkdir()
+        (racer / "keep.txt").write_text(racer_marker, encoding="utf-8")
+        real_publish(
+            source_parent,  # type: ignore[arg-type]
+            source_name,
+            source,  # type: ignore[arg-type]
+            destination_parent,  # type: ignore[arg-type]
+            destination_name,
+        )
+
+    monkeypatch.setattr(pdf_qa_module, "_publish_new_directory", swap_source_then_publish)
+
+    with pytest.raises(PdfQAFailure, match="identity"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    markers = list(assembled_pdf_run.run_dir.rglob("keep.txt"))
+    assert len(markers) == 1
+    assert markers[0].read_text(encoding="utf-8") == racer_marker
+
+
+def test_publish_new_directory_quarantines_swap_during_posix_rename(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if pdf_qa_module.os.name == "nt":
+        pytest.skip("POSIX dirfd rename race")
+    real_publish = pdf_qa_module._publish_new_directory
+    real_rename = pdf_qa_module.os.rename
+    racer_marker = "post-check-racer"
+
+    def publish_with_rename_race(
+        source_parent: object,
+        source_name: str,
+        source: object,
+        destination_parent: object,
+        destination_name: str,
+    ) -> None:
+        raced = False
+
+        def race_rename(
+            source_path: object,
+            destination_path: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal raced
+            if (
+                not raced
+                and source_path == source_name
+                and destination_path == destination_name
+            ):
+                raced = True
+                parent_path = source_parent.current_path()  # type: ignore[attr-defined]
+                real_rename(
+                    parent_path / source_name,
+                    parent_path / "held-original-after-precheck",
+                )
+                racer = parent_path / source_name
+                racer.mkdir()
+                (racer / "keep.txt").write_text(racer_marker, encoding="utf-8")
+            real_rename(source_path, destination_path, *args, **kwargs)
+
+        monkeypatch.setattr(pdf_qa_module.os, "rename", race_rename)
+        real_publish(
+            source_parent,  # type: ignore[arg-type]
+            source_name,
+            source,  # type: ignore[arg-type]
+            destination_parent,  # type: ignore[arg-type]
+            destination_name,
+        )
+
+    monkeypatch.setattr(pdf_qa_module, "_publish_new_directory", publish_with_rename_race)
+
+    with pytest.raises(PdfQAFailure, match="identity"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    markers = list(assembled_pdf_run.run_dir.rglob("keep.txt"))
+    assert len(markers) == 1
+    assert markers[0].read_text(encoding="utf-8") == racer_marker

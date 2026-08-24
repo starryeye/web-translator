@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 from typing import Any
 
 import pdfplumber
@@ -209,6 +210,8 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
     opened: dict[str, assembly._OpenedFile] = {}
     qa_artifacts: dict[str, assembly._OpenedFile] = {}
     staged_pdf: assembly._OpenedFile | None = None
+    render_input: assembly._OpenedFile | None = None
+    render_input_candidate: assembly._PublishedFile | None = None
     qa_json: assembly._OpenedFile | None = None
     qa_pages_publication_attempted = False
     published_json: assembly._PublishedFile | None = None
@@ -266,11 +269,33 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         temporary_name, staging_anchor = assembly._create_unique_child_directory(
             run_anchor, ".pdf-qa-preparing-", "PDF QA preparation"
         )
+        render_input = assembly._create_anchored_binary_file(
+            staging_anchor, "render-input.pdf"
+        )
+        render_input_candidate = assembly._PublishedFile(render_input.identity)
+        render_input.stream.write(pdf_bytes)
+        assembly._finalize_opened_file(render_input, "held PDF QA render input")
+        render_input.stream.close()
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        assembly._verify_anchored_evidence(
+            staging_anchor, {"render-input.pdf": render_input}
+        )
         raw_pages = render_pdf_pages(
-            staged_output_anchor.current_path() / "translated.pdf",
+            staging_anchor.current_path() / "render-input.pdf",
             staging_anchor.current_path() / "qa-pages",
             dpi=144,
             name_width=3,
+        )
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        assembly._verify_anchored_evidence(
+            staging_anchor, {"render-input.pdf": render_input}
+        )
+        assembly._remove_owned_file(
+            staging_anchor, "render-input.pdf", render_input_candidate
         )
         qa_pages_anchor = assembly._open_existing_child_directory(
             staging_anchor, "qa-pages", "rendered PDF QA pages"
@@ -284,7 +309,13 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             )
         if len(raw_pages) != structure["page_count"]:
             raise PdfQAFailure("Poppler did not render every staged PDF page")
-        _validate_rendered_pages(raw_pages, structure["page_count"], layout)
+        _validate_rendered_pages(
+            raw_pages,
+            structure["page_count"],
+            layout,
+            normalized,
+            structure["page_sizes"],
+        )
         contacts = build_contact_sheets(raw_pages, qa_pages_anchor.current_path())
         _validate_contact_coverage(contacts, structure["page_count"])
         for name in contacts:
@@ -373,9 +404,9 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         published_json = assembly._publish_new_file(
             staging_anchor, "pdf-qa.json", run_anchor, "pdf-qa.json"
         )
+        completed = True
         if prior is not None:
             _discard_prior_evidence(staging_anchor, prior)
-        completed = True
         return result
     except PdfQAFailure:
         raise
@@ -394,7 +425,13 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                 _remove_qa_pages(run_anchor, "qa-pages", qa_pages_anchor)
             if prior is not None and staging_anchor is not None:
                 _restore_prior_evidence(run_anchor, staging_anchor, prior)
-        for file in [qa_json, staged_pdf, *opened.values(), *qa_artifacts.values()]:
+        for file in [
+            qa_json,
+            render_input,
+            staged_pdf,
+            *opened.values(),
+            *qa_artifacts.values(),
+        ]:
             assembly._close_opened_file(file)
         assembly._close_published_file(published_json)
         if prior is not None:
@@ -409,6 +446,11 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         if staged_output_anchor is not None:
             staged_output_anchor.close()
         if staging_anchor is not None:
+            assembly._remove_owned_file(
+                staging_anchor,
+                "render-input.pdf",
+                render_input_candidate,
+            )
             assembly._remove_owned_file(
                 staging_anchor,
                 "pdf-qa.json",
@@ -750,7 +792,7 @@ def _validate_pdf_structure(
     document: PdfDocument,
     layout: PdfAssemblyLayout,
     normalized: Sequence[tuple[Any, Segment, str]],
-) -> dict[str, int]:
+) -> dict[str, Any]:
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
     except Exception as error:
@@ -767,10 +809,19 @@ def _validate_pdf_structure(
         block.destination is not None for block in document.blocks
     )
     actual_uris: set[str] = set()
+    validated_font_programs: set[str] = set()
+    page_sizes: list[tuple[float, float]] = []
     link_annotations: list[
         tuple[int, tuple[float, float, float, float], str | None, object | None]
     ] = []
     for page_number, page in enumerate(reader.pages, start=1):
+        page_box = page.mediabox
+        page_sizes.append(
+            (
+                float(page_box.right) - float(page_box.left),
+                float(page_box.top) - float(page_box.bottom),
+            )
+        )
         try:
             contents = page.get_contents()
             if contents is None or not contents.get_data():
@@ -793,7 +844,7 @@ def _validate_pdf_structure(
                 unicode_map = font.get("/ToUnicode")
                 if unicode_map is None or not unicode_map.get_object().get_data():
                     raise PdfQAFailure(f"embedded Korean font {base} is missing /ToUnicode")
-                _require_embedded_font(font, base)
+                _require_embedded_font(font, base, validated_font_programs)
         annotations = page.get("/Annots", [])
         for reference in annotations:
             annotation = reference.get_object()
@@ -908,17 +959,81 @@ def _validate_pdf_structure(
         "embedded_font_count": len(font_faces),
         "link_count": link_count,
         "page_count": len(reader.pages),
+        "page_sizes": tuple(page_sizes),
     }
 
 
-def _require_embedded_font(font: Mapping[str, Any], base: str) -> None:
+def _require_embedded_font(
+    font: Mapping[str, Any],
+    base: str,
+    validated_programs: set[str],
+) -> None:
     descendants = font.get("/DescendantFonts", [])
     candidates = [item.get_object() for item in descendants] or [font]
     for candidate in candidates:
         descriptor = candidate.get("/FontDescriptor")
-        if descriptor is not None and descriptor.get_object().get("/FontFile2") is not None:
-            return
+        if descriptor is None:
+            continue
+        font_file = descriptor.get_object().get("/FontFile2")
+        if font_file is None:
+            continue
+        try:
+            payload = font_file.get_object().get_data()
+        except Exception as error:
+            raise PdfQAFailure(
+                f"embedded Korean font {base} has an unreadable font program"
+            ) from error
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest not in validated_programs:
+            _validate_true_type_program(payload, base)
+            validated_programs.add(digest)
+        return
     raise PdfQAFailure(f"Korean font {base} is not embedded")
+
+
+def _validate_true_type_program(payload: bytes, base: str) -> None:
+    failure = f"embedded Korean font {base} has an invalid TrueType font program"
+    if len(payload) < 12 or payload[:4] != b"\x00\x01\x00\x00":
+        raise PdfQAFailure(failure)
+    table_count = struct.unpack_from(">H", payload, 4)[0]
+    if table_count == 0 or table_count > 4096 or len(payload) < 12 + 16 * table_count:
+        raise PdfQAFailure(failure)
+    tables: dict[bytes, tuple[int, int, int]] = {}
+    for index in range(table_count):
+        offset = 12 + index * 16
+        tag, checksum, table_offset, table_length = struct.unpack_from(
+            ">4sIII", payload, offset
+        )
+        if (
+            tag in tables
+            or table_length == 0
+            or table_offset < 12 + 16 * table_count
+            or table_offset + table_length > len(payload)
+        ):
+            raise PdfQAFailure(failure)
+        table_data = bytearray(payload[table_offset : table_offset + table_length])
+        if tag == b"head" and len(table_data) >= 12:
+            table_data[8:12] = b"\x00\x00\x00\x00"
+        table_data.extend(b"\x00" * (-len(table_data) % 4))
+        words = struct.unpack(f">{len(table_data) // 4}I", table_data)
+        if sum(words) & 0xFFFFFFFF != checksum:
+            raise PdfQAFailure(failure)
+        tables[tag] = (table_offset, table_length, checksum)
+    required = {b"cmap", b"glyf", b"head", b"loca", b"maxp", b"name"}
+    if not required.issubset(tables):
+        raise PdfQAFailure(failure)
+    head_offset, head_length, _head_checksum = tables[b"head"]
+    maxp_offset, maxp_length, _maxp_checksum = tables[b"maxp"]
+    cmap_offset, cmap_length, _cmap_checksum = tables[b"cmap"]
+    if (
+        head_length < 16
+        or payload[head_offset + 12 : head_offset + 16] != b"_\x0f<\xf5"
+        or maxp_length < 6
+        or struct.unpack_from(">H", payload, maxp_offset + 4)[0] == 0
+        or cmap_length < 4
+        or struct.unpack_from(">H", payload, cmap_offset)[0] != 0
+    ):
+        raise PdfQAFailure(failure)
 
 
 def _annotation_rectangle(value: object) -> tuple[float, float, float, float]:
@@ -962,13 +1077,23 @@ def _valid_destination(reader: PdfReader, destination: object) -> bool:
 
 
 def _validate_rendered_pages(
-    pages: Sequence[Path], page_count: int, layout: PdfAssemblyLayout
+    pages: Sequence[Path],
+    page_count: int,
+    layout: PdfAssemblyLayout,
+    normalized: Sequence[tuple[Any, Segment, str]],
+    page_sizes: Sequence[tuple[float, float]],
 ) -> None:
     if [path.name for path in pages] != [
         f"page-{number:03d}.png" for number in range(1, page_count + 1)
     ]:
         raise PdfQAFailure("rendered page names or coverage are not exact")
-    flowable_pages = {item.page_number for item in layout.flowables}
+    korean_block_ids = {
+        block.id for block, _segment, translated in normalized if _HANGUL.search(translated)
+    }
+    korean_flowables: dict[int, list[Any]] = {}
+    for item in layout.flowables:
+        if item.block_id in korean_block_ids:
+            korean_flowables.setdefault(item.page_number, []).append(item)
     for page_number, path in enumerate(pages, start=1):
         try:
             with Image.open(path) as image:
@@ -976,12 +1101,115 @@ def _validate_rendered_pages(
                 if image.width <= 0 or image.height <= 0:
                     raise PdfQAFailure(f"rendered page {page_number} has invalid dimensions")
                 extrema = image.convert("L").getextrema()
+                if extrema == (255, 255):
+                    raise PdfQAFailure(f"unintended blank output page: {page_number}")
+                page_width, page_height = page_sizes[page_number - 1]
+                for item in korean_flowables.get(page_number, []):
+                    crop = _rendered_flowable_crop(
+                        image,
+                        item.bounds,
+                        page_width,
+                        page_height,
+                    )
+                    try:
+                        crop_extrema = crop.getextrema()
+                        if crop_extrema[1] - crop_extrema[0] < 24:
+                            raise PdfQAFailure(
+                                "rendered Korean block has no visible glyph evidence: "
+                                f"{item.block_id}"
+                            )
+                        if _looks_like_replacement_boxes(crop):
+                            raise PdfQAFailure(
+                                "rendered Korean block contains known tofu replacement boxes: "
+                                f"{item.block_id}"
+                            )
+                    finally:
+                        crop.close()
         except PdfQAFailure:
             raise
         except (OSError, ValueError) as error:
             raise PdfQAFailure(f"cannot inspect rendered page {page_number}: {error}") from error
-        if extrema == (255, 255) and page_number not in flowable_pages:
-            raise PdfQAFailure(f"unintended blank output page: {page_number}")
+
+
+def _rendered_flowable_crop(
+    image: Image.Image,
+    bounds: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+) -> Image.Image:
+    x, y, width, height = bounds
+    scale_x = image.width / page_width
+    scale_y = image.height / page_height
+    left = max(0, math.floor((x - 1.0) * scale_x))
+    top = max(0, math.floor((page_height - y - height - 1.0) * scale_y))
+    right = min(image.width, math.ceil((x + width + 1.0) * scale_x))
+    bottom = min(image.height, math.ceil((page_height - y + 1.0) * scale_y))
+    if right <= left or bottom <= top:
+        raise PdfQAFailure("rendered Korean block has invalid raster bounds")
+    return image.crop((left, top, right, bottom)).convert("L")
+
+
+def _looks_like_replacement_boxes(image: Image.Image) -> bool:
+    width, height = image.size
+    pixels = list(image.tobytes())
+    background = Counter(pixels).most_common(1)[0][0]
+    mask = bytearray(abs(value - background) >= 48 for value in pixels)
+    visited = bytearray(width * height)
+    components: list[tuple[int, int, int, int, int, int]] = []
+    for start, ink in enumerate(mask):
+        if not ink or visited[start]:
+            continue
+        queue: deque[int] = deque([start])
+        visited[start] = 1
+        min_x = max_x = start % width
+        min_y = max_y = start // width
+        points: list[int] = []
+        while queue:
+            point = queue.popleft()
+            points.append(point)
+            point_x = point % width
+            point_y = point // width
+            min_x = min(min_x, point_x)
+            max_x = max(max_x, point_x)
+            min_y = min(min_y, point_y)
+            max_y = max(max_y, point_y)
+            for neighbor_y in range(max(0, point_y - 1), min(height, point_y + 2)):
+                for neighbor_x in range(max(0, point_x - 1), min(width, point_x + 2)):
+                    neighbor = neighbor_y * width + neighbor_x
+                    if mask[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        queue.append(neighbor)
+        component_width = max_x - min_x + 1
+        component_height = max_y - min_y + 1
+        if component_width < 5 or component_height < 5:
+            continue
+        border_pixels = sum(
+            point % width in {min_x, max_x}
+            or point // width in {min_y, max_y}
+            for point in points
+        )
+        perimeter = 2 * component_width + 2 * component_height - 4
+        components.append(
+            (
+                component_width,
+                component_height,
+                len(points),
+                border_pixels,
+                perimeter,
+                max(0, (component_width - 2) * (component_height - 2)),
+            )
+        )
+    boxes = [
+        component
+        for component in components
+        if component[3] / component[4] >= 0.75
+        and component[2] - component[3] <= max(2, round(component[5] * 0.1))
+    ]
+    if len(boxes) < 3 or len(boxes) != len(components):
+        return False
+    widths = [component[0] for component in boxes]
+    heights = [component[1] for component in boxes]
+    return max(widths) - min(widths) <= 1 and max(heights) - min(heights) <= 1
 
 
 def _validate_contact_coverage(mapping: Mapping[str, list[int]], page_count: int) -> None:
@@ -1166,6 +1394,12 @@ def _publish_new_directory(
     destination_name: str,
 ) -> None:
     try:
+        _require_anchored_directory_identity(
+            source_parent,
+            source_name,
+            source.identity,
+            "PDF QA publication source",
+        )
         if source_parent.descriptor is not None and destination_parent.descriptor is not None:
             os.rename(
                 source_name,
@@ -1181,11 +1415,76 @@ def _publish_new_directory(
             )
         else:
             raise PdfQAFailure("safe anchored QA directory publication is unavailable")
+        try:
+            _require_anchored_directory_identity(
+                destination_parent,
+                destination_name,
+                source.identity,
+                "published PDF QA directory",
+            )
+        except PdfQAFailure:
+            _quarantine_raced_directory(
+                source_parent,
+                destination_parent,
+                destination_name,
+            )
+            raise
         destination_parent.verify_visible()
     except FileExistsError as error:
         raise PdfQAFailure(f"PDF QA destination already exists: {destination_name}") from error
     except (NotImplementedError, OSError) as error:
         raise PdfQAFailure(f"cannot publish PDF QA directory: {error}") from error
+
+
+def _require_anchored_directory_identity(
+    parent: assembly._DirectoryAnchor,
+    name: str,
+    expected: tuple[int, int],
+    context: str,
+) -> None:
+    try:
+        result = assembly._anchored_entry_stat(parent, name)
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"{context} changed identity") from error
+    if (
+        not stat.S_ISDIR(result.st_mode)
+        or assembly._is_reparse_stat(result)
+        or (result.st_dev, result.st_ino) != expected
+    ):
+        raise PdfQAFailure(f"{context} changed identity")
+
+
+def _quarantine_raced_directory(
+    staging_parent: assembly._DirectoryAnchor,
+    public_parent: assembly._DirectoryAnchor,
+    public_name: str,
+) -> None:
+    quarantine_name = f".pdf-qa-raced-{os.urandom(16).hex()}"
+    raced_anchor: assembly._DirectoryAnchor | None = None
+    try:
+        if staging_parent.descriptor is not None and public_parent.descriptor is not None:
+            os.rename(
+                public_name,
+                quarantine_name,
+                src_dir_fd=public_parent.descriptor,
+                dst_dir_fd=staging_parent.descriptor,
+            )
+        elif os.name == "nt":
+            raced_anchor = assembly._open_existing_child_directory(
+                public_parent,
+                public_name,
+                "raced published PDF QA directory",
+            )
+            assembly._windows_rename_open_file(
+                assembly._windows_anchor_handle(raced_anchor),
+                assembly._windows_anchor_handle(staging_parent),
+                quarantine_name,
+            )
+    except (PdfAssemblyError, NotImplementedError, OSError):
+        return
+    finally:
+        if raced_anchor is not None:
+            raced_anchor.close()
 
 
 def _remove_qa_pages(
