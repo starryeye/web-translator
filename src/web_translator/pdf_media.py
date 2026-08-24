@@ -12,10 +12,16 @@ import subprocess
 import tempfile
 
 from PIL import Image
+from PIL import ImageDraw, ImageFont
 
 
 _POPPLER_TIMEOUT_SECONDS = 60
 _GRAPHIC_JOIN_TOLERANCE = 6.0
+_CONTACT_PAGES_PER_SHEET = 12
+_CONTACT_COLUMNS = 4
+_CONTACT_THUMBNAIL = (360, 480)
+_CONTACT_LABEL_HEIGHT = 28
+_CONTACT_GAP = 16
 
 
 class PdfMediaError(RuntimeError):
@@ -65,7 +71,11 @@ def find_poppler() -> PopplerTools:
 
 
 def render_pdf_pages(
-    source_pdf: Path, destination: Path, *, dpi: int = 144
+    source_pdf: Path,
+    destination: Path,
+    *,
+    dpi: int = 144,
+    name_width: int | None = None,
 ) -> list[Path]:
     """Render every source page to a deterministic PNG prefix."""
     if type(dpi) is not int or dpi <= 0:
@@ -91,7 +101,99 @@ def render_pdf_pages(
     pages = sorted(destination.glob("page-*.png"))
     if not pages:
         raise PdfMediaError("render PDF pages produced no PNG output")
+    if name_width is not None:
+        if type(name_width) is not int or name_width <= 0:
+            raise PdfMediaError("PDF render name width must be a positive integer")
+        renamed: list[Path] = []
+        for page_number, page in enumerate(pages, start=1):
+            destination_name = destination / f"page-{page_number:0{name_width}d}.png"
+            if destination_name != page:
+                try:
+                    os.replace(page, destination_name)
+                except OSError as error:
+                    raise PdfMediaError(
+                        f"cannot normalize rendered PDF page name: {error}"
+                    ) from error
+            renamed.append(destination_name)
+        pages = renamed
     return pages
+
+
+def build_contact_sheets(
+    rendered_pages: Sequence[Path],
+    destination: Path,
+) -> dict[str, list[int]]:
+    """Build deterministic numbered contact sheets covering at most 12 pages."""
+    pages = [Path(path) for path in rendered_pages]
+    if not pages:
+        raise PdfMediaError("contact sheets require at least one rendered page")
+    expected_names = [f"page-{number:03d}.png" for number in range(1, len(pages) + 1)]
+    if [path.name for path in pages] != expected_names:
+        raise PdfMediaError("rendered pages must be exact sequential page-NNN.png files")
+    destination = Path(destination)
+    if destination.exists():
+        try:
+            if destination.resolve(strict=True) != pages[0].parent.resolve(strict=True):
+                raise PdfMediaError(
+                    f"contact-sheet destination already exists: {destination}"
+                )
+        except OSError as error:
+            raise PdfMediaError(f"cannot inspect contact-sheet destination: {error}") from error
+    else:
+        try:
+            destination.mkdir(parents=True, exist_ok=False)
+        except OSError as error:
+            raise PdfMediaError(
+                f"cannot create contact-sheet destination {destination}: {error}"
+            ) from error
+
+    mapping: dict[str, list[int]] = {}
+    rows = 3
+    cell_width = _CONTACT_THUMBNAIL[0] + _CONTACT_GAP * 2
+    cell_height = _CONTACT_THUMBNAIL[1] + _CONTACT_LABEL_HEIGHT + _CONTACT_GAP * 2
+    font = ImageFont.load_default()
+    for sheet_index, offset in enumerate(
+        range(0, len(pages), _CONTACT_PAGES_PER_SHEET), start=1
+    ):
+        selected = pages[offset : offset + _CONTACT_PAGES_PER_SHEET]
+        sheet = Image.new(
+            "RGB",
+            (_CONTACT_COLUMNS * cell_width, rows * cell_height),
+            "white",
+        )
+        draw = ImageDraw.Draw(sheet)
+        covered: list[int] = []
+        try:
+            for cell_index, page_path in enumerate(selected):
+                page_number = offset + cell_index + 1
+                covered.append(page_number)
+                with Image.open(page_path) as page:
+                    page.load()
+                    thumbnail = page.convert("RGB")
+                    thumbnail.thumbnail(_CONTACT_THUMBNAIL)
+                column = cell_index % _CONTACT_COLUMNS
+                row = cell_index // _CONTACT_COLUMNS
+                cell_x = column * cell_width
+                cell_y = row * cell_height
+                x = cell_x + (cell_width - thumbnail.width) // 2
+                y = cell_y + _CONTACT_LABEL_HEIGHT + _CONTACT_GAP
+                draw.text(
+                    (cell_x + _CONTACT_GAP, cell_y + _CONTACT_GAP // 2),
+                    f"Page {page_number}",
+                    fill="black",
+                    font=font,
+                )
+                draw.rectangle(
+                    (x - 1, y - 1, x + thumbnail.width, y + thumbnail.height),
+                    outline="#666666",
+                )
+                sheet.paste(thumbnail, (x, y))
+            name = f"contact-sheet-{sheet_index:03d}.png"
+            sheet.save(destination / name, format="PNG", optimize=False)
+            mapping[name] = covered
+        finally:
+            sheet.close()
+    return mapping
 
 
 def crop_figure_regions(

@@ -1,0 +1,979 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+
+from PIL import Image
+import pytest
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject, TextStringObject
+from reportlab.pdfgen.canvas import Canvas
+
+from web_translator.models import ProtectedToken, Segment, Translation, write_segments
+from web_translator.pdf_assemble import assemble_pdf
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfBlockStyle,
+    PdfDocument,
+    PdfPage,
+    PdfSourceRecord,
+    PdfTableCell,
+)
+from web_translator.pdf_qa import PdfQAFailure, PdfQAResult, prepare_pdf_qa
+from web_translator.pdf_media import build_contact_sheets, render_pdf_pages
+import web_translator.pdf_qa as pdf_qa_module
+from tests.pdf_fixtures import make_text_pdf
+
+
+REVIEW_DIMENSIONS = (
+    "semantic_fidelity",
+    "qualification_preservation",
+    "naturalness",
+    "terminology",
+    "boundary_consistency",
+    "protected_content",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PdfQARun:
+    run_dir: Path
+    output_dir: Path
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_review(run_dir: Path) -> None:
+    _write_json(
+        run_dir / "review.json",
+        {
+            "retries": {"zone-001": 0},
+            "section_findings": {
+                "zone-001": [
+                    {
+                        "dimension": dimension,
+                        "verdict": "pass",
+                        "evidence": f"Checked {dimension} against the source.",
+                    }
+                    for dimension in REVIEW_DIMENSIONS
+                ]
+            },
+            "unresolved_required": [],
+        },
+    )
+
+
+@pytest.fixture
+def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    source_pdf = make_text_pdf(run_dir / "source.pdf")
+    source_sha256 = _sha256(source_pdf)
+    blocks = [
+        PdfBlock(
+            id="pdf:page-0001:block-0001",
+            page_number=1,
+            order=0,
+            kind="heading",
+            bbox=(72.0, 72.0, 540.0, 100.0),
+            style=PdfBlockStyle(18.0, True, "left", 0.0, 8.0),
+            source_text="Quality evidence",
+            segment_id="seg-000001",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0002",
+            page_number=1,
+            order=1,
+            kind="paragraph",
+            bbox=(72.0, 112.0, 540.0, 148.0),
+            style=PdfBlockStyle(11.0, False, "left", 0.0, 8.0),
+            source_text="Read https://example.com/a%20b",
+            segment_id="seg-000002",
+            uri="https://example.com/a%20b",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:table-0001:row-0000:cell-0000",
+            page_number=1,
+            order=2,
+            kind="table-cell",
+            bbox=(72.0, 170.0, 260.0, 198.0),
+            style=PdfBlockStyle(10.0, True, "left", 0.0, 4.0),
+            source_text="Item",
+            segment_id="seg-000003",
+            table_id="pdf:page-0001:table-0001",
+            row=0,
+            column=0,
+        ),
+        PdfBlock(
+            id="pdf:page-0001:table-0001:row-0000:cell-0001",
+            page_number=1,
+            order=3,
+            kind="table-cell",
+            bbox=(260.0, 170.0, 448.0, 198.0),
+            style=PdfBlockStyle(10.0, True, "left", 0.0, 4.0),
+            source_text="Value",
+            segment_id="seg-000004",
+            table_id="pdf:page-0001:table-0001",
+            row=0,
+            column=1,
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0003",
+            page_number=1,
+            order=4,
+            kind="figure",
+            bbox=(72.0, 230.0, 192.0, 290.0),
+            style=PdfBlockStyle(11.0, False, "center", 0.0, 4.0),
+            media_path="media/figure-0001.png",
+            caption_id="pdf:page-0001:block-0004",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0004",
+            page_number=1,
+            order=5,
+            kind="caption",
+            bbox=(72.0, 296.0, 300.0, 320.0),
+            style=PdfBlockStyle(9.0, False, "left", 0.0, 4.0),
+            source_text="Figure caption",
+            segment_id="seg-000005",
+            caption_id="pdf:page-0001:block-0003",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0005",
+            page_number=1,
+            order=6,
+            kind="paragraph",
+            bbox=(72.0, 336.0, 540.0, 366.0),
+            style=PdfBlockStyle(11.0, False, "left", 0.0, 8.0),
+            source_text="Jump to heading",
+            segment_id="seg-000006",
+            destination="pdf:page-0001:block-0001",
+        ),
+    ]
+    document = PdfDocument(
+        schema_version="1.0",
+        source_sha256=source_sha256,
+        page_count=1,
+        selectable_characters=120,
+        scan_candidate_pages=[],
+        pages=[PdfPage(number=1, width=612.0, height=792.0, rotation=0)],
+        blocks=blocks,
+        table_cells=[
+            PdfTableCell(
+                id=blocks[2].id,
+                table_id="pdf:page-0001:table-0001",
+                page_number=1,
+                row=0,
+                column=0,
+                row_span=1,
+                column_span=1,
+                is_header=True,
+                block_id=blocks[2].id,
+            ),
+            PdfTableCell(
+                id=blocks[3].id,
+                table_id="pdf:page-0001:table-0001",
+                page_number=1,
+                row=0,
+                column=1,
+                row_span=1,
+                column_span=1,
+                is_header=True,
+                block_id=blocks[3].id,
+            ),
+        ],
+    )
+    source = PdfSourceRecord(
+        schema_version="1.0",
+        input_kind="local",
+        requested_source="source.pdf",
+        final_source="source.pdf",
+        content_type="application/pdf",
+        byte_length=source_pdf.stat().st_size,
+        sha256=source_sha256,
+        acquired_at="2026-08-21T01:02:03Z",
+        redirects=[],
+        warnings=[],
+    )
+    token = ProtectedToken(
+        token="⟦WT:000001⟧",
+        kind="url",
+        value="https://example.com/a%20b",
+    )
+    segments = [
+        Segment(
+            id="seg-000001",
+            locator=blocks[0].id,
+            semantic_type="heading",
+            heading_path=[],
+            source_text="Quality evidence",
+            protected=[],
+            context_ids=[],
+            target=True,
+        ),
+        Segment(
+            id="seg-000002",
+            locator=blocks[1].id,
+            semantic_type="paragraph",
+            heading_path=["Quality evidence"],
+            source_text="Read ⟦WT:000001⟧",
+            protected=[token],
+            context_ids=["seg-000001"],
+            target=True,
+        ),
+        Segment(
+            id="seg-000003",
+            locator=blocks[2].id,
+            semantic_type="table-cell",
+            heading_path=["Quality evidence"],
+            source_text="Item",
+            protected=[],
+            context_ids=["seg-000002", "seg-000004"],
+            target=True,
+        ),
+        Segment(
+            id="seg-000004",
+            locator=blocks[3].id,
+            semantic_type="table-cell",
+            heading_path=["Quality evidence"],
+            source_text="Value",
+            protected=[],
+            context_ids=["seg-000003", "seg-000005"],
+            target=True,
+        ),
+        Segment(
+            id="seg-000005",
+            locator=blocks[5].id,
+            semantic_type="caption",
+            heading_path=["Quality evidence"],
+            source_text="Figure caption",
+            protected=[],
+            context_ids=["seg-000004", "seg-000006"],
+            target=True,
+        ),
+        Segment(
+            id="seg-000006",
+            locator=blocks[6].id,
+            semantic_type="paragraph",
+            heading_path=["Quality evidence"],
+            source_text="Jump to heading",
+            protected=[],
+            context_ids=["seg-000005"],
+            target=True,
+        ),
+    ]
+    translations = {
+        "seg-000001": Translation("seg-000001", "PDF 품질 검증"),
+        "seg-000002": Translation("seg-000002", "⟦WT:000001⟧ 문서를 읽으세요"),
+        "seg-000003": Translation("seg-000003", "항목"),
+        "seg-000004": Translation("seg-000004", "값"),
+        "seg-000005": Translation("seg-000005", "그림 설명"),
+        "seg-000006": Translation("seg-000006", "제목으로 이동"),
+    }
+    _write_json(run_dir / "document.json", document.to_dict())
+    _write_json(run_dir / "source.json", source.to_dict())
+    write_segments(run_dir / "segments.jsonl", segments)
+    _write_json(run_dir / "glossary.json", {})
+    zones = run_dir / "zones"
+    zones.mkdir()
+    _write_json(
+        zones / "zone-001.json",
+        {
+            "attempt": 0,
+            "context_after_ids": [],
+            "context_before_ids": [],
+            "expected_tokens": {
+                "seg-000001": [],
+                "seg-000002": ["⟦WT:000001⟧"],
+                "seg-000003": [],
+                "seg-000004": [],
+                "seg-000005": [],
+                "seg-000006": [],
+            },
+            "heading_path": [],
+            "id": "zone-001",
+            "target_ids": [
+                "seg-000001",
+                "seg-000002",
+                "seg-000003",
+                "seg-000004",
+                "seg-000005",
+                "seg-000006",
+            ],
+        },
+    )
+    translation_dir = run_dir / "translations"
+    translation_dir.mkdir()
+    (translation_dir / "zone-001.jsonl").write_text(
+        "".join(
+            json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+            for record in translations.values()
+        ),
+        encoding="utf-8",
+    )
+    _write_review(run_dir)
+    media = run_dir / "media"
+    media.mkdir()
+    figure = Image.new("RGB", (240, 120), "#336699")
+    for x in range(240):
+        figure.putpixel((x, x // 2), (220, 120, 20))
+    figure.save(media / "figure-0001.png")
+    figure.close()
+    output_dir = tmp_path / "translated-pdfs" / "result"
+    assemble_pdf(run_dir, translations, {}, output_dir)
+    assert not output_dir.exists()
+    return PdfQARun(run_dir, output_dir)
+
+
+def test_prepare_pdf_qa_renders_every_page_and_covers_contact_sheets(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    result = prepare_pdf_qa(
+        assembled_pdf_run.run_dir,
+        assembled_pdf_run.output_dir,
+    )
+
+    reader = PdfReader(assembled_pdf_run.run_dir / "staged-output" / "translated.pdf")
+    expected_pages = list(range(1, len(reader.pages) + 1))
+    assert result.passed is True
+    assert [path.name for path in result.rendered_pages] == [
+        f"page-{page:03d}.png" for page in expected_pages
+    ]
+    assert result.contact_sheet_pages == {"contact-sheet-001.png": expected_pages}
+    assert result.staged_pdf_sha256 == _sha256(
+        assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    )
+    assert (assembled_pdf_run.run_dir / "pdf-qa.json").is_file()
+    record = json.loads(
+        (assembled_pdf_run.run_dir / "pdf-qa.json").read_text(encoding="utf-8")
+    )
+    assert set(record) == {
+        "contact_sheet_hashes",
+        "contact_sheet_pages",
+        "findings",
+        "metrics",
+        "passed",
+        "rendered_page_hashes",
+        "schema_version",
+        "staged_pdf_sha256",
+    }
+    assert record["rendered_page_hashes"] == result.rendered_page_hashes
+    assert record["contact_sheet_hashes"] == result.contact_sheet_hashes
+    assert [finding["code"] for finding in record["findings"]] == sorted(
+        finding["code"] for finding in record["findings"]
+    )
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def _rewrite_layout_hash(run: PdfQARun) -> None:
+    pdf = run.run_dir / "staged-output" / "translated.pdf"
+    layout_path = run.run_dir / "layout.json"
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    layout["staged_pdf_sha256"] = _sha256(pdf)
+    _write_json(layout_path, layout)
+
+
+def _rewrite_pdf(run: PdfQARun, mutate: object) -> None:
+    pdf = run.run_dir / "staged-output" / "translated.pdf"
+    reader = PdfReader(pdf)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    mutate(writer)  # type: ignore[operator]
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    _rewrite_layout_hash(run)
+
+
+def test_build_contact_sheets_limits_each_sheet_to_twelve_numbered_pages(
+    tmp_path: Path,
+) -> None:
+    pages = tmp_path / "pages"
+    pages.mkdir()
+    rendered: list[Path] = []
+    for number in range(1, 26):
+        path = pages / f"page-{number:03d}.png"
+        Image.new("RGB", (80, 120), (number, number, number)).save(path)
+        rendered.append(path)
+
+    mapping = build_contact_sheets(rendered, tmp_path / "contacts")
+
+    assert mapping == {
+        "contact-sheet-001.png": list(range(1, 13)),
+        "contact-sheet-002.png": list(range(13, 25)),
+        "contact-sheet-003.png": [25],
+    }
+    for name in mapping:
+        with Image.open(tmp_path / "contacts" / name) as sheet:
+            assert sheet.width > 0
+            assert sheet.height > 0
+            assert sheet.getbbox() is not None
+
+
+def test_prepare_pdf_qa_rejects_missing_bold_font(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    pdf = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    reader = PdfReader(pdf)
+    writer = PdfWriter()
+    writer.append(reader)
+    for page in writer.pages:
+        fonts = page["/Resources"].get_object()["/Font"].get_object()
+        for key in list(fonts):
+            base_font = str(fonts[key].get_object().get("/BaseFont", ""))
+            if "Bold" in base_font:
+                del fonts[key]
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    layout_path = assembled_pdf_run.run_dir / "layout.json"
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    layout["staged_pdf_sha256"] = _sha256(pdf)
+    _write_json(layout_path, layout)
+
+    with pytest.raises(PdfQAFailure, match="Bold"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_prepare_pdf_qa_rejects_linked_prior_evidence_without_touching_target(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    keep = target / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    (assembled_pdf_run.run_dir / "qa-pages").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(PdfQAFailure, match="qa-pages"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert keep.read_text(encoding="utf-8") == "keep"
+    assert (assembled_pdf_run.run_dir / "qa-pages").is_symlink()
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_prepare_pdf_qa_rejects_missing_translation_id(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    translations = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
+    lines = translations.read_text(encoding="utf-8").splitlines()
+    translations.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+
+    with pytest.raises(PdfQAFailure, match="translations must exactly cover"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_changed_protected_token(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    translations = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
+    translations.write_text(
+        translations.read_text(encoding="utf-8").replace(
+            "⟦WT:000001⟧", "⟦WT:999999⟧"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PdfQAFailure, match="protected-token|restore"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_table_grid_mismatch(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "document.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["table_cells"] = document["table_cells"][:-1]
+    _write_json(path, document)
+
+    with pytest.raises(PdfQAFailure, match="table cells"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_missing_or_tampered_figure_media(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    media = assembled_pdf_run.run_dir / "media" / "figure-0001.png"
+    Image.new("RGB", (240, 120), "magenta").save(media)
+
+    with pytest.raises(PdfQAFailure, match="figure media"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_unresolved_semantic_review(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "review.json"
+    review = json.loads(path.read_text(encoding="utf-8"))
+    review["section_findings"]["zone-001"][0]["verdict"] = "required-fix"
+    review["unresolved_required"] = ["zone-001:semantic_fidelity"]
+    _write_json(path, review)
+
+    with pytest.raises(PdfQAFailure, match="unresolved required"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_encrypted_staged_pdf(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    pdf = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    reader = PdfReader(pdf)
+    writer = PdfWriter()
+    writer.append(reader)
+    writer.encrypt("secret")
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    _rewrite_layout_hash(assembled_pdf_run)
+
+    with pytest.raises(PdfQAFailure, match="encrypted"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_missing_unicode_map(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def remove_unicode_map(writer: PdfWriter) -> None:
+        for page in writer.pages:
+            fonts = page["/Resources"].get_object()["/Font"].get_object()
+            for reference in fonts.values():
+                font = reference.get_object()
+                if "NotoSansCJKKR-Regular" in str(font.get("/BaseFont", "")):
+                    del font[NameObject("/ToUnicode")]
+                    return
+        raise AssertionError("fixture Regular font was not found")
+
+    _rewrite_pdf(assembled_pdf_run, remove_unicode_map)
+
+    with pytest.raises(PdfQAFailure, match="/ToUnicode"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_unselectable_translated_block(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("그림 설명", "스테이지에 없는 번역"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PdfQAFailure, match="not selectable"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_invalid_external_link_annotation(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def corrupt_uri(writer: PdfWriter) -> None:
+        for page in writer.pages:
+            for reference in page.get("/Annots", []):
+                annotation = reference.get_object()
+                action = annotation.get("/A")
+                if action is not None and action.get_object().get("/S") == "/URI":
+                    action.get_object()[NameObject("/URI")] = TextStringObject(
+                        "javascript:alert(1)"
+                    )
+                    return
+        raise AssertionError("fixture external link was not found")
+
+    _rewrite_pdf(assembled_pdf_run, corrupt_uri)
+
+    with pytest.raises(PdfQAFailure, match="unsafe external URI"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_invalid_page_content_stream(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def empty_stream(writer: PdfWriter) -> None:
+        stream = DecodedStreamObject()
+        stream.set_data(b"")
+        writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+
+    _rewrite_pdf(assembled_pdf_run, empty_stream)
+
+    with pytest.raises(PdfQAFailure, match="content stream"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+@pytest.mark.parametrize("mutation", ["overflow", "overlap", "small-font"])
+def test_prepare_pdf_qa_rejects_invalid_layout_evidence(
+    assembled_pdf_run: PdfQARun,
+    mutation: str,
+) -> None:
+    path = assembled_pdf_run.run_dir / "layout.json"
+    layout = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "overflow":
+        layout["flowables"][0]["bounds"][0] = -1.0
+    elif mutation == "overlap":
+        layout["flowables"][1]["bounds"] = layout["flowables"][0]["bounds"]
+        layout["flowables"][1]["frame"] = layout["flowables"][0]["frame"]
+    else:
+        layout["flowables"][0]["font_size"] = 8.0
+    _write_json(path, layout)
+
+    with pytest.raises(PdfQAFailure, match="layout"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_unintended_blank_page(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def append_blank(writer: PdfWriter) -> None:
+        page = writer.add_blank_page(width=612, height=792)
+        stream = DecodedStreamObject()
+        stream.set_data(b"q Q\n")
+        page[NameObject("/Contents")] = writer._add_object(stream)
+
+    _rewrite_pdf(assembled_pdf_run, append_blank)
+
+    with pytest.raises(PdfQAFailure, match="blank output page"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_render_failure_without_publishing(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_translator.pdf_media import PdfMediaError
+
+    def fail_render(*args: object, **kwargs: object) -> list[Path]:
+        raise PdfMediaError("Poppler render failed")
+
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", fail_render)
+
+    with pytest.raises(PdfQAFailure, match="Poppler render failed"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+
+
+def test_prepare_pdf_qa_regenerates_safe_prior_evidence_and_preserves_unrelated_files(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    first = prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    keep = assembled_pdf_run.run_dir / "keep.txt"
+    keep.write_text("unrelated", encoding="utf-8")
+
+    second = prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert second.staged_pdf_sha256 == first.staged_pdf_sha256
+    assert second.rendered_page_hashes == first.rendered_page_hashes
+    assert second.contact_sheet_pages == first.contact_sheet_pages
+    assert keep.read_text(encoding="utf-8") == "unrelated"
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_prepare_pdf_qa_preserves_unrelated_racer_across_base_exception(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    keep = assembled_pdf_run.run_dir / "keep.txt"
+    keep.write_text("unrelated", encoding="utf-8")
+    real_publish = pdf_qa_module.assembly._publish_new_file
+
+    def interrupt_json_publication(*args: object, **kwargs: object) -> object:
+        destination = assembled_pdf_run.run_dir / "pdf-qa.json"
+        destination.write_text("racer", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_publish_new_file",
+        interrupt_json_publication,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    monkeypatch.setattr(pdf_qa_module.assembly, "_publish_new_file", real_publish)
+
+    assert (assembled_pdf_run.run_dir / "pdf-qa.json").read_text(encoding="utf-8") == "racer"
+    assert keep.read_text(encoding="utf-8") == "unrelated"
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_pdf_qa_result_contract_rejects_unknown_fields_and_inexact_coverage(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    path = assembled_pdf_run.run_dir / "pdf-qa.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    parsed = PdfQAResult.from_dict(value, assembled_pdf_run.run_dir / "qa-pages")
+    assert parsed.passed is True
+
+    value["unknown"] = True
+    with pytest.raises(PdfQAFailure, match="fields must be exactly"):
+        PdfQAResult.from_dict(value, assembled_pdf_run.run_dir / "qa-pages")
+    del value["unknown"]
+    value["contact_sheet_pages"]["contact-sheet-001.png"].append(1)
+    with pytest.raises(PdfQAFailure, match="coverage"):
+        PdfQAResult.from_dict(value, assembled_pdf_run.run_dir / "qa-pages")
+
+
+def test_prepare_pdf_qa_rejects_broken_figure_caption_relationship(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "document.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    caption = next(block for block in document["blocks"] if block["kind"] == "caption")
+    caption["caption_id"] = "pdf:page-0001:block-0001"
+    _write_json(path, document)
+
+    with pytest.raises(PdfQAFailure, match="figure-caption"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_rendered_glyph_replacement_box(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    translation_path = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
+    records = [
+        Translation.from_dict(json.loads(line))
+        for line in translation_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    translations = {
+        record.segment_id: (
+            Translation(record.segment_id, "□")
+            if record.segment_id == "seg-000005"
+            else record
+        )
+        for record in records
+    }
+    translation_path.write_text(
+        "".join(
+            json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+            for record in translations.values()
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        assembled_pdf_run.run_dir / "layout.json",
+        assembled_pdf_run.run_dir / "staged-output" / "translated.pdf",
+    ):
+        path.unlink()
+    (assembled_pdf_run.run_dir / "staged-output").rmdir()
+    assemble_pdf(
+        assembled_pdf_run.run_dir,
+        translations,
+        {},
+        assembled_pdf_run.output_dir,
+    )
+
+    with pytest.raises(PdfQAFailure, match="glyph replacement boxes"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_link_inside_prior_qa_pages(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (10, 10), "red").save(outside)
+    (assembled_pdf_run.run_dir / "qa-pages" / "page-999.png").symlink_to(outside)
+
+    with pytest.raises(PdfQAFailure, match="regular file|unsafe|symbolic links"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert outside.is_file()
+    assert (assembled_pdf_run.run_dir / "qa-pages" / "page-999.png").is_symlink()
+
+
+def test_render_pdf_pages_orders_double_digit_poppler_names_numerically(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "thirteen.pdf"
+    canvas = Canvas(str(source), pagesize=(100, 100))
+    for number in range(1, 14):
+        shade = number / 20
+        canvas.setFillColorRGB(shade, shade, shade)
+        canvas.rect(0, 0, 100, 100, stroke=0, fill=1)
+        canvas.showPage()
+    canvas.save()
+
+    pages = render_pdf_pages(source, tmp_path / "rendered", dpi=72, name_width=3)
+
+    assert [path.name for path in pages] == [
+        f"page-{number:03d}.png" for number in range(1, 14)
+    ]
+    shades = []
+    for path in pages:
+        with Image.open(path) as image:
+            shades.append(image.convert("RGB").getpixel((50, 50))[0])
+    assert shades == sorted(shades)
+
+
+def test_prepare_pdf_qa_rejects_layout_block_text_mapping_swap(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "layout.json"
+    layout = json.loads(path.read_text(encoding="utf-8"))
+    heading = next(item for item in layout["flowables"] if item["kind"] == "heading")
+    caption = next(item for item in layout["flowables"] if item["kind"] == "caption")
+    heading["block_id"], caption["block_id"] = caption["block_id"], heading["block_id"]
+    _write_json(path, layout)
+
+    with pytest.raises(PdfQAFailure, match="not selectable.*seg-000001|not selectable.*seg-000005"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_missing_required_internal_link(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def remove_internal_link(writer: PdfWriter) -> None:
+        for page in writer.pages:
+            annotations = page.get("/Annots")
+            if annotations is None:
+                continue
+            retained = [
+                item
+                for item in annotations
+                if item.get_object().get("/A") is not None
+            ]
+            page[NameObject("/Annots")] = type(annotations)(retained)
+
+    _rewrite_pdf(assembled_pdf_run, remove_internal_link)
+
+    with pytest.raises(PdfQAFailure, match="internal link"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_review_retry_zone_disagreement(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "review.json"
+    review = json.loads(path.read_text(encoding="utf-8"))
+    review["retries"] = {"zone-999": 0}
+    _write_json(path, review)
+
+    with pytest.raises(PdfQAFailure, match="zones|retries"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_frame_outside_actual_pdf_page(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "layout.json"
+    layout = json.loads(path.read_text(encoding="utf-8"))
+    layout["flowables"][0]["frame"] = [54.0, 54.0, 700.0, 684.0]
+    _write_json(path, layout)
+
+    with pytest.raises(PdfQAFailure, match="page bounds"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_cleans_post_publication_base_exception_by_identity(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_publish = pdf_qa_module.assembly._publish_new_file
+
+    def publish_then_interrupt(*args: object, **kwargs: object) -> object:
+        real_publish(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_publish_new_file",
+        publish_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_prepare_pdf_qa_rejects_raced_render_symlink_without_following_it(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (40, 40), "magenta").save(outside)
+    real_build = pdf_qa_module.build_contact_sheets
+
+    def build_then_race(*args: object, **kwargs: object) -> dict[str, list[int]]:
+        mapping = real_build(*args, **kwargs)  # type: ignore[arg-type]
+        page = assembled_pdf_run.run_dir / next(
+            path.name
+            for path in assembled_pdf_run.run_dir.iterdir()
+            if path.name.startswith(".pdf-qa-preparing-")
+        ) / "qa-pages" / "page-001.png"
+        page.unlink()
+        page.symlink_to(outside)
+        return mapping
+
+    monkeypatch.setattr(pdf_qa_module, "build_contact_sheets", build_then_race)
+
+    with pytest.raises(PdfQAFailure, match="regular file|symbolic|identity"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert outside.is_file()
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+
+
+def test_prepare_pdf_qa_removes_owned_staging_after_prepublication_failure(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_publication(*args: object, **kwargs: object) -> None:
+        raise PdfQAFailure("injected directory publication failure")
+
+    monkeypatch.setattr(pdf_qa_module, "_publish_new_directory", fail_publication)
+
+    with pytest.raises(PdfQAFailure, match="injected directory publication failure"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+
+
+def test_pdf_qa_result_requires_sequential_contact_sheet_names(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    path = assembled_pdf_run.run_dir / "pdf-qa.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    digest = value["contact_sheet_hashes"].pop("contact-sheet-001.png")
+    pages = value["contact_sheet_pages"].pop("contact-sheet-001.png")
+    value["contact_sheet_hashes"]["contact-sheet-002.png"] = digest
+    value["contact_sheet_pages"]["contact-sheet-002.png"] = pages
+
+    with pytest.raises(PdfQAFailure, match="contact-sheet.*sequential"):
+        PdfQAResult.from_dict(value, assembled_pdf_run.run_dir / "qa-pages")
+
+
+def test_prepare_pdf_qa_requires_external_link_for_each_source_block(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    path = assembled_pdf_run.run_dir / "document.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    internal = next(
+        block for block in document["blocks"] if block["destination"] is not None
+    )
+    internal["destination"] = None
+    internal["uri"] = "https://example.com/a%20b"
+    _write_json(path, document)
+
+    with pytest.raises(PdfQAFailure, match="external URI annotation.*block"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
