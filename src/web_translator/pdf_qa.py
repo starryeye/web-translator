@@ -29,7 +29,12 @@ from web_translator.pdf_media import (
     build_contact_sheets,
     render_pdf_pages,
 )
-from web_translator.pdf_models import PdfContractError, PdfDocument, PdfSourceRecord
+from web_translator.pdf_models import (
+    PdfContractError,
+    PdfDocument,
+    PdfLayoutReview,
+    PdfSourceRecord,
+)
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -45,6 +50,16 @@ _REVIEW_DIMENSIONS = {
     "terminology",
     "boundary_consistency",
     "protected_content",
+}
+_VISUAL_DIMENSIONS = {
+    "heading_hierarchy",
+    "text_legibility",
+    "table_legibility",
+    "figure_caption_pairing",
+    "footnote_placement",
+    "page_transitions",
+    "clipping_overlap",
+    "glyph_rendering",
 }
 
 
@@ -189,6 +204,303 @@ class PdfQAResult:
             metrics=metrics,
             passed=value["passed"],  # type: ignore[arg-type]
         )
+
+
+def read_pdf_layout_review(
+    review_path: Path, qa_path: Path
+) -> PdfLayoutReview:
+    """Read strict visual-review evidence and cross-check all QA coverage."""
+    review_path = Path(review_path)
+    qa_path = Path(qa_path)
+    qa = _pdf_qa_from_value(
+        _strict_json_path(qa_path, "automated PDF QA"),
+        qa_path.parent / "qa-pages",
+    )
+    return _pdf_layout_review_from_values(
+        _strict_json_path(review_path, "PDF layout review"), qa
+    )
+
+
+def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
+    """Publish exactly the reviewed PDF and its reports by one atomic rename."""
+    from web_translator.pdf_report import (
+        write_pdf_manifest,
+        write_pdf_review_report,
+    )
+
+    run_dir = Path(run_dir)
+    output_dir = Path(output_dir)
+    run_anchor: assembly._DirectoryAnchor | None = None
+    staged_anchor: assembly._DirectoryAnchor | None = None
+    opened: dict[str, assembly._OpenedFile] = {}
+    staged_pdf: assembly._OpenedFile | None = None
+    completed = False
+    report_paths = (
+        run_dir / "staged-output" / "manifest.json",
+        run_dir / "staged-output" / "review-report.md",
+    )
+    try:
+        run_anchor = assembly._open_directory_anchor(run_dir, "run")
+        _validate_locations(run_anchor, output_dir)
+        staged_anchor = assembly._open_existing_child_directory(
+            run_anchor, "staged-output", "staged PDF output"
+        )
+        names = sorted(path.name for path in staged_anchor.current_path().iterdir())
+        if names != ["translated.pdf"]:
+            raise PdfQAFailure(
+                "staged PDF output must contain exactly translated.pdf before finalization"
+            )
+        staged_pdf = assembly._open_anchored_input_file(
+            staged_anchor, "translated.pdf", "staged translated PDF"
+        )
+        for name, label in (
+            ("layout.json", "PDF layout"),
+            ("pdf-qa.json", "automated PDF QA"),
+            ("pdf-layout-review.json", "PDF layout review"),
+        ):
+            opened[name] = assembly._open_anchored_input_file(run_anchor, name, label)
+        assembly._verify_anchored_evidence(run_anchor, opened)
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"translated.pdf": staged_pdf}
+        )
+        qa = _pdf_qa_from_value(
+            _strict_json_text(
+                assembly._read_opened_utf8(
+                    opened["pdf-qa.json"],
+                    run_dir / "pdf-qa.json",
+                    "automated PDF QA",
+                ),
+                "automated PDF QA",
+            ),
+            run_dir / "qa-pages",
+        )
+        review = _pdf_layout_review_from_values(
+            _strict_json_text(
+                assembly._read_opened_utf8(
+                    opened["pdf-layout-review.json"],
+                    run_dir / "pdf-layout-review.json",
+                    "PDF layout review",
+                ),
+                "PDF layout review",
+            ),
+            qa,
+        )
+        layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        if layout.reserved_output_dir != str(output_dir):
+            raise PdfQAFailure(
+                "layout reserved output directory does not match the request"
+            )
+        if not qa.passed:
+            raise PdfQAFailure("automated PDF QA did not pass")
+        if review.unresolved_required:
+            raise PdfQAFailure(
+                "PDF layout review has unresolved required findings: "
+                + ", ".join(review.unresolved_required)
+            )
+        pdf_bytes = assembly._read_opened_bytes(
+            staged_pdf,
+            run_dir / "staged-output" / "translated.pdf",
+            "staged translated PDF",
+        )
+        staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if (
+            staged_hash != qa.staged_pdf_sha256
+            or staged_hash != review.staged_pdf_sha256
+            or staged_hash != layout.staged_pdf_sha256
+        ):
+            raise PdfQAFailure(
+                "staged PDF hash does not match current automated, visual, and layout evidence"
+            )
+        _verify_pdf_qa_artifacts(run_anchor, qa)
+        manifest = write_pdf_manifest(run_dir, report_paths[0])
+        write_pdf_review_report(manifest, report_paths[1])
+        names = sorted(path.name for path in staged_anchor.current_path().iterdir())
+        if names != ["manifest.json", "review-report.md", "translated.pdf"]:
+            raise PdfQAFailure(
+                "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
+            )
+        assembly._verify_anchored_evidence(run_anchor, opened)
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
+        _fsync_final_files(staged_anchor.current_path())
+        _ensure_output_parent(output_dir)
+        _validate_locations(run_anchor, output_dir)
+        assembly._close_opened_file(staged_pdf)
+        staged_pdf = None
+        staged_anchor.close()
+        staged_anchor = None
+        try:
+            os.replace(run_dir / "staged-output", output_dir)
+        except OSError as error:
+            raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+        completed = True
+        return output_dir
+    except PdfQAFailure:
+        raise
+    except (PdfAssemblyError, PdfContractError) as error:
+        raise PdfQAFailure(str(error)) from error
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+    finally:
+        if not completed:
+            for path in report_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        assembly._close_opened_file(staged_pdf)
+        for item in opened.values():
+            assembly._close_opened_file(item)
+        if staged_anchor is not None:
+            staged_anchor.close()
+        if run_anchor is not None:
+            run_anchor.close()
+
+
+def _pdf_qa_from_value(value: object, qa_pages_dir: Path) -> PdfQAResult:
+    try:
+        return PdfQAResult.from_dict(value, qa_pages_dir)
+    except PdfQAFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        raise PdfQAFailure(f"invalid automated PDF QA: {error}") from error
+
+
+def _pdf_layout_review_from_values(
+    value: object, qa: PdfQAResult
+) -> PdfLayoutReview:
+    try:
+        review = PdfLayoutReview.from_dict(value)  # type: ignore[arg-type]
+    except (PdfContractError, TypeError, ValueError) as error:
+        if "pages_reviewed" in str(error):
+            raise PdfQAFailure(
+                f"invalid PDF layout review page coverage: {error}"
+            ) from error
+        if "contact_sheets_reviewed" in str(error):
+            raise PdfQAFailure(
+                f"invalid PDF layout review contact-sheet coverage: {error}"
+            ) from error
+        raise PdfQAFailure(f"invalid PDF layout review: {error}") from error
+    expected_pages = list(range(1, len(qa.rendered_page_hashes) + 1))
+    if review.pages_reviewed != expected_pages:
+        raise PdfQAFailure(
+            "PDF layout review page coverage must exactly match automated QA"
+        )
+    if review.contact_sheets_reviewed != qa.contact_sheet_pages:
+        raise PdfQAFailure(
+            "PDF layout review contact-sheet coverage must exactly match automated QA"
+        )
+    if set(review.findings) != _VISUAL_DIMENSIONS:
+        raise PdfQAFailure(
+            "PDF layout review visual dimensions must contain exactly the eight canonical dimensions"
+        )
+    expected_unresolved = sorted(
+        dimension
+        for dimension, finding in review.findings.items()
+        if finding["verdict"] == "required-fix"
+    )
+    if review.unresolved_required != expected_unresolved:
+        raise PdfQAFailure(
+            "PDF layout review unresolved_required must exactly match required-fix findings"
+        )
+    if review.staged_pdf_sha256 != qa.staged_pdf_sha256:
+        raise PdfQAFailure(
+            "PDF layout review staged PDF hash does not match automated QA"
+        )
+    return review
+
+
+def _strict_json_path(path: Path, label: str) -> object:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise PdfQAFailure(f"cannot read {label} {path}: {error}") from error
+    return _strict_json_text(text, label)
+
+
+def _strict_json_text(text: str, label: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise PdfQAFailure(f"{label} contains duplicate JSON field: {key}")
+            result[key] = item
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=unique_object)
+    except PdfQAFailure:
+        raise
+    except json.JSONDecodeError as error:
+        raise PdfQAFailure(f"cannot read {label}: {error}") from error
+
+
+def _verify_pdf_qa_artifacts(
+    run_anchor: assembly._DirectoryAnchor, qa: PdfQAResult
+) -> None:
+    pages = assembly._open_existing_child_directory(
+        run_anchor, "qa-pages", "rendered PDF QA pages"
+    )
+    opened: dict[str, assembly._OpenedFile] = {}
+    expected = {**qa.rendered_page_hashes, **qa.contact_sheet_hashes}
+    try:
+        names = sorted(path.name for path in pages.current_path().iterdir())
+        if names != sorted(expected):
+            raise PdfQAFailure(
+                "rendered PDF QA artifacts do not exactly match recorded coverage"
+            )
+        for name, digest in expected.items():
+            item = assembly._open_anchored_input_file(
+                pages, name, "rendered PDF QA artifact"
+            )
+            opened[name] = item
+            payload = assembly._read_opened_bytes(
+                item, pages.path / name, "rendered PDF QA artifact"
+            )
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise PdfQAFailure(f"rendered PDF QA artifact hash changed: {name}")
+        assembly._verify_anchored_evidence(pages, opened)
+    finally:
+        for item in opened.values():
+            assembly._close_opened_file(item)
+        pages.close()
+
+
+def _ensure_output_parent(output_dir: Path) -> None:
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        assembly._reject_linked_ancestors(output_dir)
+        metadata = output_dir.parent.lstat()
+    except (PdfAssemblyError, OSError) as error:
+        raise PdfQAFailure(f"cannot prepare final PDF output parent: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or assembly._is_reparse_stat(metadata):
+        raise PdfQAFailure(
+            f"final PDF output parent is not a safe directory: {output_dir.parent}"
+        )
+
+
+def _fsync_final_files(staged_output: Path) -> None:
+    try:
+        for name in ("translated.pdf", "manifest.json", "review-report.md"):
+            with (staged_output / name).open("rb") as stream:
+                os.fsync(stream.fileno())
+        if os.name != "nt":
+            descriptor = os.open(
+                staged_output,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except OSError as error:
+        raise PdfQAFailure(f"cannot fsync final PDF output: {error}") from error
 
 
 @dataclass(slots=True)

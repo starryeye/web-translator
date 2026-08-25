@@ -24,7 +24,13 @@ from web_translator.pdf_models import (
     PdfSourceRecord,
     PdfTableCell,
 )
-from web_translator.pdf_qa import PdfQAFailure, PdfQAResult, prepare_pdf_qa
+from web_translator.pdf_qa import (
+    PdfQAFailure,
+    PdfQAResult,
+    finalize_pdf_output,
+    prepare_pdf_qa,
+    read_pdf_layout_review,
+)
 from web_translator.pdf_media import build_contact_sheets, render_pdf_pages
 import web_translator.pdf_qa as pdf_qa_module
 from tests.pdf_fixtures import make_text_pdf
@@ -37,6 +43,17 @@ REVIEW_DIMENSIONS = (
     "terminology",
     "boundary_consistency",
     "protected_content",
+)
+
+VISUAL_DIMENSIONS = (
+    "heading_hierarchy",
+    "text_legibility",
+    "table_legibility",
+    "figure_caption_pairing",
+    "footnote_placement",
+    "page_transitions",
+    "clipping_overlap",
+    "glyph_rendering",
 )
 
 
@@ -71,6 +88,24 @@ def _write_review(run_dir: Path) -> None:
                     }
                     for dimension in REVIEW_DIMENSIONS
                 ]
+            },
+            "unresolved_required": [],
+        },
+    )
+
+
+def _write_passing_layout_review(run_dir: Path, *, staged_sha256: str | None = None) -> None:
+    qa = json.loads((run_dir / "pdf-qa.json").read_text(encoding="utf-8"))
+    _write_json(
+        run_dir / "pdf-layout-review.json",
+        {
+            "schema_version": "1.0",
+            "staged_pdf_sha256": staged_sha256 or qa["staged_pdf_sha256"],
+            "pages_reviewed": list(range(1, len(qa["rendered_page_hashes"]) + 1)),
+            "contact_sheets_reviewed": qa["contact_sheet_pages"],
+            "findings": {
+                dimension: {"verdict": "pass", "evidence": f"Reviewed {dimension}."}
+                for dimension in VISUAL_DIMENSIONS
             },
             "unresolved_required": [],
         },
@@ -377,6 +412,186 @@ def test_prepare_pdf_qa_renders_every_page_and_covers_contact_sheets(
         finding["code"] for finding in record["findings"]
     )
     assert not assembled_pdf_run.output_dir.exists()
+
+
+# Production mutation caught: accepting malformed or incomplete visual-review evidence.
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda review: review.__setitem__("unexpected", True), "fields must be exactly"),
+        (lambda review: review.__setitem__("pages_reviewed", []), "page coverage"),
+        (lambda review: review["pages_reviewed"].append(1), "page coverage"),
+        (
+            lambda review: review.__setitem__("contact_sheets_reviewed", {}),
+            "contact-sheet coverage",
+        ),
+        (
+            lambda review: review["findings"].pop("glyph_rendering"),
+            "visual dimensions",
+        ),
+        (
+            lambda review: review["findings"].__setitem__(
+                "extra", {"verdict": "pass", "evidence": "Unexpected dimension."}
+            ),
+            "visual dimensions",
+        ),
+        (
+            lambda review: review["findings"]["glyph_rendering"].__setitem__(
+                "evidence", ""
+            ),
+            "nonempty",
+        ),
+        (
+            lambda review: review["findings"]["glyph_rendering"].__setitem__(
+                "verdict", "warning"
+            ),
+            "not supported",
+        ),
+        (
+            lambda review: review.__setitem__("unresolved_required", ["glyph_rendering"]),
+            "required-fix",
+        ),
+    ],
+)
+def test_read_pdf_layout_review_rejects_noncanonical_evidence(
+    assembled_pdf_run: PdfQARun,
+    mutate: object,
+    message: str,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    review_path = assembled_pdf_run.run_dir / "pdf-layout-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    mutate(review)  # type: ignore[operator]
+    _write_json(review_path, review)
+
+    with pytest.raises(PdfQAFailure, match=message):
+        read_pdf_layout_review(review_path, assembled_pdf_run.run_dir / "pdf-qa.json")
+
+
+def test_read_pdf_layout_review_rejects_duplicate_dimension_keys(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    review_path = assembled_pdf_run.run_dir / "pdf-layout-review.json"
+    text = review_path.read_text(encoding="utf-8")
+    duplicate = (
+        '"glyph_rendering":{"evidence":"Duplicate.","verdict":"pass"},'
+        '"glyph_rendering":{"evidence":"Reviewed glyph_rendering.","verdict":"pass"}'
+    )
+    text = text.replace(
+        '"glyph_rendering": {"evidence": "Reviewed glyph_rendering.", "verdict": "pass"}',
+        duplicate,
+    )
+    review_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(PdfQAFailure, match="duplicate JSON field"):
+        read_pdf_layout_review(review_path, assembled_pdf_run.run_dir / "pdf-qa.json")
+
+
+def test_read_pdf_layout_review_accepts_matching_required_fix_evidence(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    review_path = assembled_pdf_run.run_dir / "pdf-layout-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["findings"]["glyph_rendering"]["verdict"] = "required-fix"
+    review["unresolved_required"] = ["glyph_rendering"]
+    _write_json(review_path, review)
+
+    parsed = read_pdf_layout_review(
+        review_path, assembled_pdf_run.run_dir / "pdf-qa.json"
+    )
+
+    assert parsed.unresolved_required == ["glyph_rendering"]
+
+
+def test_finalize_rejects_current_pdf_that_disagrees_with_qa_hash(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    staged_pdf = assembled_pdf_run.run_dir / "staged-output" / "translated.pdf"
+    staged_pdf.write_bytes(staged_pdf.read_bytes() + b"\n")
+
+    with pytest.raises(PdfQAFailure, match="staged PDF hash"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_finalize_rejects_unresolved_visual_finding(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    review_path = assembled_pdf_run.run_dir / "pdf-layout-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["findings"]["glyph_rendering"]["verdict"] = "required-fix"
+    review["unresolved_required"] = ["glyph_rendering"]
+    _write_json(review_path, review)
+
+    with pytest.raises(PdfQAFailure, match="unresolved required"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_finalize_rejects_failed_automated_qa_record(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    qa_path = assembled_pdf_run.run_dir / "pdf-qa.json"
+    qa = json.loads(qa_path.read_text(encoding="utf-8"))
+    qa["passed"] = False
+    _write_json(qa_path, qa)
+
+    with pytest.raises(PdfQAFailure, match="automated PDF QA did not pass"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+# Production mutation caught: publishing a PDF after its visual review has become stale.
+def test_finalize_rejects_stale_visual_review(assembled_pdf_run: PdfQARun) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir, staged_sha256="0" * 64)
+
+    with pytest.raises(PdfQAFailure, match="staged PDF hash"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+# Production mutation caught: replacing an already existing or linked final output path.
+def test_finalize_rejects_existing_output_and_keeps_staging(assembled_pdf_run: PdfQARun) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    assembled_pdf_run.output_dir.mkdir(parents=True)
+
+    with pytest.raises(PdfQAFailure, match="already exists"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert (assembled_pdf_run.run_dir / "staged-output" / "translated.pdf").is_file()
+
+
+def test_finalize_rejects_linked_output_and_keeps_staging(
+    assembled_pdf_run: PdfQARun, tmp_path: Path
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    linked_target = tmp_path / "linked-target"
+    linked_target.mkdir()
+    assembled_pdf_run.output_dir.parent.mkdir(parents=True)
+    assembled_pdf_run.output_dir.symlink_to(linked_target, target_is_directory=True)
+
+    with pytest.raises(PdfQAFailure, match="linked|already exists"):
+        finalize_pdf_output(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert (assembled_pdf_run.run_dir / "staged-output" / "translated.pdf").is_file()
 
 
 def _rewrite_layout_hash(run: PdfQARun) -> None:

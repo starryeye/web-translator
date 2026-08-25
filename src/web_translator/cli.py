@@ -41,7 +41,7 @@ from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
 from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
 from web_translator.pdf_extract import PdfExtractionError, extract_pdf
 from web_translator.pdf_models import PdfContractError, PdfSourceRecord
-from web_translator.pdf_qa import PdfQAFailure, prepare_pdf_qa
+from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -206,7 +206,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_output_dir(pdf_assemble)
     pdf_assemble.set_defaults(handler=_pdf_assemble_command)
 
-    pdf_qa = subparsers.add_parser("pdf-qa", help="Prepare rendered PDF QA evidence.")
+    pdf_qa = subparsers.add_parser(
+        "pdf-qa", help="Prepare or finalize rendered PDF QA evidence."
+    )
     pdf_qa_actions = pdf_qa.add_subparsers(
         dest="pdf_qa_action", required=True, parser_class=_CommandArgumentParser
     )
@@ -214,6 +216,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_dir(pdf_qa_prepare)
     _add_output_dir(pdf_qa_prepare)
     pdf_qa_prepare.set_defaults(handler=_pdf_qa_prepare_command)
+    pdf_qa_finalize = pdf_qa_actions.add_parser("finalize")
+    _add_run_dir(pdf_qa_finalize)
+    _add_output_dir(pdf_qa_finalize)
+    pdf_qa_finalize.set_defaults(handler=_pdf_qa_finalize_command)
 
     qa = subparsers.add_parser("qa", help="Run deterministic and browser QA.")
     _add_run_dir(qa)
@@ -604,6 +610,10 @@ def _pdf_assemble_command(args: argparse.Namespace) -> None:
 
 def _pdf_qa_prepare_command(args: argparse.Namespace) -> None:
     prepare_pdf_qa(args.run_dir, args.output_dir)
+
+
+def _pdf_qa_finalize_command(args: argparse.Namespace) -> None:
+    finalize_pdf_output(args.run_dir, args.output_dir)
 
 
 def _qa_command(args: argparse.Namespace) -> None:

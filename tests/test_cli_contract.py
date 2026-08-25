@@ -24,6 +24,7 @@ from web_translator.pdf_models import (
     PdfPage,
     PdfSourceRecord,
 )
+from web_translator.pdf_qa import PdfQAFailure
 from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
@@ -205,18 +206,17 @@ def test_pdf_assemble_cli_maps_pdf_assembly_error(
     }
 
 
-def test_pdf_qa_prepare_cli_requires_both_directories_and_does_not_offer_finalize(
+def test_pdf_qa_cli_requires_both_directories_and_offers_prepare_and_finalize(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert main(["pdf-qa", "prepare"]) == cli_module.EXIT_INVALID_ARGUMENTS
     assert main(["pdf-qa", "finalize"]) == cli_module.EXIT_INVALID_ARGUMENTS
-    invalid_output = capsys.readouterr()
-    assert "invalid choice: 'finalize'" in invalid_output.err
+    capsys.readouterr()
     assert main(["pdf-qa", "--help"]) == 0
 
     output = capsys.readouterr()
     assert "prepare" in output.err
-    assert "finalize" not in output.err
+    assert "finalize" in output.err
 
 
 def test_pdf_qa_prepare_cli_maps_pdf_qa_failure(
@@ -237,6 +237,73 @@ def test_pdf_qa_prepare_cli_maps_pdf_qa_failure(
         [
             "pdf-qa",
             "prepare",
+            "--run-dir",
+            str(run_dir),
+            "--output-dir",
+            str(tmp_path / "final"),
+        ]
+    )
+
+    assert exit_code == cli_module.EXIT_QA_FAILURE
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-qa",
+        "exit_code": cli_module.EXIT_QA_FAILURE,
+        "status": "error",
+    }
+
+
+def test_pdf_qa_finalize_cli_publishes_before_emitting_success(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output_dir = tmp_path / "final"
+
+    def finalize(run: Path, output: Path) -> Path:
+        assert run == run_dir
+        output.mkdir()
+        return output
+
+    monkeypatch.setattr(cli_module, "finalize_pdf_output", finalize)
+
+    exit_code = main(
+        [
+            "pdf-qa",
+            "finalize",
+            "--run-dir",
+            str(run_dir),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_dir.is_dir()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-qa",
+        "exit_code": 0,
+        "status": "ok",
+    }
+
+
+def test_pdf_qa_finalize_cli_maps_pdf_qa_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def fail_finalize(*args: object, **kwargs: object) -> object:
+        raise PdfQAFailure("visual review failed")
+
+    monkeypatch.setattr(cli_module, "finalize_pdf_output", fail_finalize)
+    exit_code = main(
+        [
+            "pdf-qa",
+            "finalize",
             "--run-dir",
             str(run_dir),
             "--output-dir",
