@@ -41,6 +41,162 @@ def test_finalize_rolls_back_publication_when_rename_fails(
     assert not (prepared_pdf_run.run_dir / "staged-output" / "manifest.json").exists()
 
 
+@pytest.mark.parametrize(
+    "verification",
+    ["destination-identity", "parent-visibility"],
+)
+def test_finalize_rolls_back_successful_move_when_postpublication_check_fails(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    verification: str,
+) -> None:
+    staging = prepared_pdf_run.run_dir / "staged-output"
+    staged_metadata = staging.stat()
+    staged_identity = (staged_metadata.st_dev, staged_metadata.st_ino)
+
+    if verification == "destination-identity":
+        real_require_identity = pdf_qa_module._require_anchored_directory_identity
+
+        def fail_published_identity(
+            parent: object,
+            name: str,
+            expected: tuple[int, int],
+            context: str,
+        ) -> None:
+            if context == "published final PDF output":
+                raise PdfQAFailure("injected post-publication identity failure")
+            real_require_identity(parent, name, expected, context)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            pdf_qa_module,
+            "_require_anchored_directory_identity",
+            fail_published_identity,
+        )
+    else:
+        real_verify_visible = pdf_qa_module.assembly._DirectoryAnchor.verify_visible
+        parent_checks = 0
+
+        def fail_published_parent_visibility(
+            anchor: pdf_qa_module.assembly._DirectoryAnchor,
+        ) -> None:
+            nonlocal parent_checks
+            if anchor.path == prepared_pdf_run.output_dir.parent:
+                parent_checks += 1
+                if parent_checks == 2:
+                    raise pdf_qa_module.PdfAssemblyError(
+                        "injected post-publication parent failure"
+                    )
+            real_verify_visible(anchor)
+
+        monkeypatch.setattr(
+            pdf_qa_module.assembly._DirectoryAnchor,
+            "verify_visible",
+            fail_published_parent_visibility,
+        )
+
+    with pytest.raises(PdfQAFailure, match="injected post-publication"):
+        finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
+
+    assert not prepared_pdf_run.output_dir.exists()
+    restored_metadata = staging.stat()
+    assert (restored_metadata.st_dev, restored_metadata.st_ino) == staged_identity
+    assert sorted(path.name for path in staging.iterdir()) == [
+        "manifest.json",
+        "review-report.md",
+        "translated.pdf",
+    ]
+
+
+def test_finalize_rollback_preserves_raced_private_name_and_moved_identity(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = prepared_pdf_run.run_dir
+    staging = run_dir / "staged-output"
+    staged_metadata = staging.stat()
+    staged_identity = (staged_metadata.st_dev, staged_metadata.st_ino)
+    real_require_identity = pdf_qa_module._require_anchored_directory_identity
+
+    def race_private_name_then_fail(
+        parent: object,
+        name: str,
+        expected: tuple[int, int],
+        context: str,
+    ) -> None:
+        if context == "published final PDF output":
+            staging.mkdir()
+            (staging / "unrelated.txt").write_text("racer", encoding="utf-8")
+            raise PdfQAFailure("injected post-publication identity failure")
+        real_require_identity(parent, name, expected, context)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_require_anchored_directory_identity",
+        race_private_name_then_fail,
+    )
+
+    with pytest.raises(PdfQAFailure, match="injected post-publication"):
+        finalize_pdf_output(run_dir, prepared_pdf_run.output_dir)
+
+    assert not prepared_pdf_run.output_dir.exists()
+    assert sorted(path.name for path in staging.iterdir()) == ["unrelated.txt"]
+    assert (staging / "unrelated.txt").read_text(encoding="utf-8") == "racer"
+    moved = [
+        path
+        for path in run_dir.iterdir()
+        if path.is_dir()
+        and not path.is_symlink()
+        and (path.stat().st_dev, path.stat().st_ino) == staged_identity
+    ]
+    assert len(moved) == 1
+    assert moved[0].name.startswith(".pdf-final-rollback-")
+    assert sorted(path.name for path in moved[0].iterdir()) == [
+        "manifest.json",
+        "review-report.md",
+        "translated.pdf",
+    ]
+
+
+def test_finalize_commits_success_if_postpublication_rollback_is_unavailable(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_require_identity = pdf_qa_module._require_anchored_directory_identity
+
+    def fail_published_identity(
+        parent: object,
+        name: str,
+        expected: tuple[int, int],
+        context: str,
+    ) -> None:
+        if context == "published final PDF output":
+            raise PdfQAFailure("injected post-publication identity failure")
+        real_require_identity(parent, name, expected, context)  # type: ignore[arg-type]
+
+    def fail_rollback(*args: object, **kwargs: object) -> str:
+        raise PdfQAFailure("injected rollback failure")
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_require_anchored_directory_identity",
+        fail_published_identity,
+    )
+    monkeypatch.setattr(pdf_qa_module, "_rollback_final_directory", fail_rollback)
+
+    finalized = finalize_pdf_output(
+        prepared_pdf_run.run_dir,
+        prepared_pdf_run.output_dir,
+    )
+
+    assert finalized == prepared_pdf_run.output_dir
+    assert sorted(path.name for path in finalized.iterdir()) == [
+        "manifest.json",
+        "review-report.md",
+        "translated.pdf",
+    ]
+    assert not (prepared_pdf_run.run_dir / "staged-output").exists()
+
+
 @pytest.mark.parametrize("racer_kind", ["empty-directory", "symlink"])
 def test_finalize_never_clobbers_destination_appearing_after_validation(
     prepared_pdf_run: PdfQARun,

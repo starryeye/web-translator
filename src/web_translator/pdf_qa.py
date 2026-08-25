@@ -68,6 +68,14 @@ class PdfQAFailure(RuntimeError):
     """The staged PDF or its immutable run evidence failed automated QA."""
 
 
+class _PdfPublicationRolledBack(PdfQAFailure):
+    """A failed post-publication check restored the output to private staging."""
+
+    def __init__(self, message: str, private_name: str) -> None:
+        super().__init__(message)
+        self.private_name = private_name
+
+
 @dataclass(frozen=True, slots=True)
 class PdfQAFinding:
     code: str
@@ -240,6 +248,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     zone_opened: dict[str, assembly._OpenedFile] = {}
     staged_pdf: assembly._OpenedFile | None = None
     completed = False
+    publication_rolled_back = False
     report_paths = (
         run_dir / "staged-output" / "manifest.json",
         run_dir / "staged-output" / "review-report.md",
@@ -412,6 +421,9 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         )
         completed = True
         return output_dir
+    except _PdfPublicationRolledBack:
+        publication_rolled_back = True
+        raise
     except PdfQAFailure:
         raise
     except (PdfAssemblyError, PdfContractError) as error:
@@ -419,7 +431,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     except (OSError, UnicodeError, ValueError, TypeError) as error:
         raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
     finally:
-        if not completed:
+        if not completed and not publication_rolled_back:
             for path in report_paths:
                 try:
                     path.unlink(missing_ok=True)
@@ -616,53 +628,43 @@ def _publish_final_directory_no_clobber(
             "final PDF publication source",
         )
         destination_parent.verify_visible()
-        if (
-            source_parent.descriptor is not None
-            and destination_parent.descriptor is not None
-        ):
-            _posix_rename_directory_no_replace(
-                source_parent.descriptor,
-                "staged-output",
-                destination_parent.descriptor,
-                destination_name,
-            )
-        elif assembly._IS_WINDOWS:
-            source_handle = assembly._windows_nt_create_relative(
-                assembly._windows_anchor_handle(source_parent),
-                "staged-output",
-                desired_access=0x00010000 | 0x00000080 | 0x00100000,
-                create_disposition=1,
-                create_options=0x00000001 | 0x00000020 | 0x00200000,
-                file_attributes=0,
-            )
-            try:
-                if (
-                    assembly._windows_file_identity(
-                        source_handle, require_regular=False
-                    )
-                    != source.identity
-                ):
-                    raise PdfQAFailure(
-                        "final PDF publication source changed identity"
-                    )
-                assembly._windows_rename_open_file(
-                    source_handle,
-                    assembly._windows_anchor_handle(destination_parent),
-                    destination_name,
-                )
-            finally:
-                assembly.pdf_acquire_module._close_windows_handle(source_handle)
-        else:
-            raise PdfQAFailure(
-                f"safe atomic no-clobber PDF publication is unavailable: {destination}"
-            )
-        _require_anchored_directory_identity(
+        _rename_anchored_directory_no_replace(
+            source_parent,
+            "staged-output",
+            source.identity,
             destination_parent,
             destination_name,
-            source.identity,
-            "published final PDF output",
         )
-        destination_parent.verify_visible()
+        try:
+            _require_anchored_directory_identity(
+                destination_parent,
+                destination_name,
+                source.identity,
+                "published final PDF output",
+            )
+            destination_parent.verify_visible()
+        except (PdfQAFailure, PdfAssemblyError) as error:
+            try:
+                private_name = _rollback_final_directory(
+                    destination_parent,
+                    destination_name,
+                    source,
+                    source_parent,
+                )
+            except (
+                AttributeError,
+                NotImplementedError,
+                OSError,
+                PdfAssemblyError,
+                PdfQAFailure,
+            ):
+                return
+            message = (
+                str(error)
+                if isinstance(error, PdfQAFailure)
+                else f"cannot publish final PDF output: {error}"
+            )
+            raise _PdfPublicationRolledBack(message, private_name) from error
     except FileExistsError as error:
         raise PdfQAFailure(f"reserved final output already exists: {destination}") from error
     except PdfQAFailure:
@@ -673,6 +675,86 @@ def _publish_final_directory_no_clobber(
                 f"reserved final output already exists: {destination}"
             ) from error
         raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+
+
+def _rename_anchored_directory_no_replace(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source_identity: tuple[int, int],
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+) -> None:
+    source_handle: int | None = None
+    try:
+        if (
+            source_parent.descriptor is not None
+            and destination_parent.descriptor is not None
+        ):
+            _posix_rename_directory_no_replace(
+                source_parent.descriptor,
+                source_name,
+                destination_parent.descriptor,
+                destination_name,
+            )
+        elif assembly._IS_WINDOWS:
+            source_handle = assembly._windows_nt_create_relative(
+                assembly._windows_anchor_handle(source_parent),
+                source_name,
+                desired_access=0x00010000 | 0x00000080 | 0x00100000,
+                create_disposition=1,
+                create_options=0x00000001 | 0x00000020 | 0x00200000,
+                file_attributes=0,
+            )
+            if (
+                assembly._windows_file_identity(
+                    source_handle, require_regular=False
+                )
+                != source_identity
+            ):
+                raise PdfQAFailure("final PDF publication source changed identity")
+            assembly._windows_rename_open_file(
+                source_handle,
+                assembly._windows_anchor_handle(destination_parent),
+                destination_name,
+            )
+        else:
+            raise PdfQAFailure(
+                "safe atomic no-clobber PDF directory rename is unavailable"
+            )
+    finally:
+        if source_handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(source_handle)
+
+
+def _rollback_final_directory(
+    public_parent: assembly._DirectoryAnchor,
+    public_name: str,
+    source: assembly._DirectoryAnchor,
+    private_parent: assembly._DirectoryAnchor,
+) -> str:
+    private_parent.verify_visible()
+    candidates = ["staged-output"] + [
+        f".pdf-final-rollback-{os.urandom(16).hex()}" for _ in range(100)
+    ]
+    for private_name in candidates:
+        try:
+            _require_anchored_directory_identity(
+                public_parent,
+                public_name,
+                source.identity,
+                "failed published final PDF output",
+            )
+            _rename_anchored_directory_no_replace(
+                public_parent,
+                public_name,
+                source.identity,
+                private_parent,
+                private_name,
+            )
+            return private_name
+        except FileExistsError:
+            continue
+    raise PdfQAFailure("cannot reserve private PDF publication rollback directory")
 
 
 def _posix_rename_directory_no_replace(
