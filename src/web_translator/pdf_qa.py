@@ -1572,6 +1572,29 @@ def _remove_qa_pages(
     if pages_anchor is None:
         return
     try:
+        if run_anchor.descriptor is not None:
+            if quarantine_parent is None or quarantine_parent.descriptor is None:
+                return
+            quarantine_name = f".pdf-qa-raced-{os.urandom(16).hex()}"
+            os.rename(
+                name,
+                quarantine_name,
+                src_dir_fd=run_anchor.descriptor,
+                dst_dir_fd=quarantine_parent.descriptor,
+            )
+            _require_anchored_directory_identity(
+                quarantine_parent,
+                quarantine_name,
+                pages_anchor.identity,
+                "privately moved failed PDF QA render directory",
+            )
+            try:
+                os.rmdir(quarantine_name, dir_fd=quarantine_parent.descriptor)
+            except OSError:
+                pass
+            return
+        if os.name != "nt":
+            return
         _require_anchored_directory_identity(
             run_anchor,
             name,
@@ -1579,19 +1602,11 @@ def _remove_qa_pages(
             "failed PDF QA render directory",
         )
         try:
-            if run_anchor.descriptor is not None:
-                os.rmdir(name, dir_fd=run_anchor.descriptor)
-            elif os.name == "nt":
-                assembly._windows_delete_open_file(
-                    assembly._windows_anchor_handle(pages_anchor)
-                )
-            else:
-                return
+            assembly._windows_delete_open_file(
+                assembly._windows_anchor_handle(pages_anchor)
+            )
         except (OSError, PdfAssemblyError):
             pass
-        else:
-            if run_anchor.descriptor is not None:
-                return
         try:
             _require_anchored_directory_identity(
                 run_anchor,

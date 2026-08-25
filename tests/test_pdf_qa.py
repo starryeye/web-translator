@@ -742,6 +742,99 @@ def test_prepare_pdf_qa_removes_empty_owned_render_destination_after_immediate_f
     assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
 
 
+@pytest.mark.parametrize(
+    "replacement_contents",
+    [None, b"nonempty cleanup replacement"],
+    ids=["empty-replacement", "nonempty-replacement"],
+)
+def test_prepare_pdf_qa_preserves_posix_cleanup_replacement_races(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_contents: bytes | None,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX dirfd-relative cleanup regression")
+
+    from web_translator.pdf_media import PdfMediaError
+
+    held_original = tmp_path / "racer-held-original"
+    held_identity: tuple[int, int] | None = None
+    replacement_identity: tuple[int, int] | None = None
+    real_rename = os.rename
+    real_rmdir = os.rmdir
+
+    def install_replacement() -> None:
+        nonlocal held_identity, replacement_identity
+        preparations = list(
+            assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")
+        )
+        assert len(preparations) == 1
+        pages = preparations[0] / "qa-pages"
+        held_metadata = pages.stat()
+        held_identity = held_metadata.st_dev, held_metadata.st_ino
+        real_rename(pages, held_original)
+        pages.mkdir()
+        if replacement_contents is not None:
+            (pages / "replacement.txt").write_bytes(replacement_contents)
+        metadata = pages.stat()
+        replacement_identity = metadata.st_dev, metadata.st_ino
+
+    def racing_rename(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        if source == "qa-pages" and replacement_identity is None:
+            install_replacement()
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    def racing_rmdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == "qa-pages" and replacement_identity is None:
+            install_replacement()
+        real_rmdir(path, dir_fd=dir_fd)
+
+    def fail_immediately(*args: object, **kwargs: object) -> list[Path]:
+        del args, kwargs
+        raise PdfMediaError("injected render failure before POSIX cleanup race")
+
+    monkeypatch.setattr(pdf_qa_module.os, "rename", racing_rename)
+    monkeypatch.setattr(pdf_qa_module.os, "rmdir", racing_rmdir)
+    monkeypatch.setattr(pdf_qa_module, "render_pdf_pages", fail_immediately)
+
+    with pytest.raises(PdfQAFailure, match="before POSIX cleanup race"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert replacement_identity is not None
+    assert held_original.is_dir()
+    held_metadata = held_original.stat()
+    assert (held_metadata.st_dev, held_metadata.st_ino) == held_identity
+    _assert_no_public_qa_evidence(assembled_pdf_run)
+    assert list(assembled_pdf_run.run_dir.glob(".pdf-qa-preparing-*")) == []
+    assert list(assembled_pdf_run.run_dir.rglob("render-input.pdf")) == []
+    quarantines = list(assembled_pdf_run.run_dir.glob(".pdf-qa-raced-*"))
+    assert len(quarantines) == 1
+    quarantine_metadata = quarantines[0].stat()
+    assert (quarantine_metadata.st_dev, quarantine_metadata.st_ino) == (
+        replacement_identity
+    )
+    if replacement_contents is not None:
+        assert (quarantines[0] / "replacement.txt").read_bytes() == (
+            replacement_contents
+        )
+
+
 @pytest.mark.parametrize("partial_page", [False, True])
 @pytest.mark.parametrize("failure", ["media-error", "interrupt"])
 def test_prepare_pdf_qa_cleans_owned_destination_after_render_failure(
@@ -890,8 +983,12 @@ def test_remove_qa_pages_quarantines_exact_directory_when_posix_rmdir_races(
         *,
         dir_fd: int | None = None,
     ) -> None:
-        if path == "qa-pages" and dir_fd == staging_anchor.descriptor:
-            (pages_path / "page-999.png").write_bytes(racer_bytes)
+        if (
+            isinstance(path, str)
+            and path.startswith(".pdf-qa-raced-")
+            and dir_fd == run_anchor.descriptor
+        ):
+            (run_path / path / "page-999.png").write_bytes(racer_bytes)
         real_rmdir(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(pdf_qa_module.os, "rmdir", racing_rmdir)
@@ -927,7 +1024,7 @@ def test_remove_qa_pages_quarantines_exact_directory_on_unexpected_posix_delete_
     pages_anchor = pdf_qa_module.assembly._open_existing_child_directory(
         staging_anchor, "qa-pages", "pages"
     )
-    staging_descriptor = staging_anchor.descriptor
+    run_descriptor = run_anchor.descriptor
     attempts: list[tuple[object, int | None]] = []
 
     def denied_rmdir(
@@ -951,7 +1048,10 @@ def test_remove_qa_pages_quarantines_exact_directory_on_unexpected_posix_delete_
         staging_anchor.close()
         run_anchor.close()
 
-    assert attempts == [("qa-pages", staging_descriptor)]
+    assert len(attempts) == 1
+    assert isinstance(attempts[0][0], str)
+    assert attempts[0][0].startswith(".pdf-qa-raced-")
+    assert attempts[0][1] == run_descriptor
     assert not pages_path.exists()
     quarantines = list(run_path.glob(".pdf-qa-raced-*"))
     assert len(quarantines) == 1
