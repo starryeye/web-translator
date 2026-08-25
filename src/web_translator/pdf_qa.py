@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import sys
 from typing import Any
 
 import pdfplumber
@@ -224,6 +225,7 @@ def read_pdf_layout_review(
 def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     """Publish exactly the reviewed PDF and its reports by one atomic rename."""
     from web_translator.pdf_report import (
+        build_pdf_report_evidence,
         write_pdf_manifest,
         write_pdf_review_report,
     )
@@ -232,7 +234,10 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     run_anchor: assembly._DirectoryAnchor | None = None
     staged_anchor: assembly._DirectoryAnchor | None = None
+    zone_anchor: assembly._DirectoryAnchor | None = None
+    output_parent_anchor: assembly._DirectoryAnchor | None = None
     opened: dict[str, assembly._OpenedFile] = {}
+    zone_opened: dict[str, assembly._OpenedFile] = {}
     staged_pdf: assembly._OpenedFile | None = None
     completed = False
     report_paths = (
@@ -254,6 +259,12 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             staged_anchor, "translated.pdf", "staged translated PDF"
         )
         for name, label in (
+            ("source.pdf", "PDF source"),
+            ("source.json", "PDF source record"),
+            ("document.json", "PDF document"),
+            ("segments.jsonl", "PDF segments"),
+            ("glossary.json", "PDF glossary"),
+            ("review.json", "semantic review"),
             ("layout.json", "PDF layout"),
             ("pdf-qa.json", "automated PDF QA"),
             ("pdf-layout-review.json", "PDF layout review"),
@@ -263,29 +274,86 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         assembly._verify_anchored_evidence(
             staged_anchor, {"translated.pdf": staged_pdf}
         )
+        snapshot_bytes = {
+            name: assembly._read_opened_bytes(
+                item, run_dir / name, f"PDF report evidence {name}"
+            )
+            for name, item in opened.items()
+        }
+        snapshot_hashes = {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in snapshot_bytes.items()
+        }
+        zone_anchor = assembly._open_existing_child_directory(
+            run_anchor, "zones", "PDF zones"
+        )
+        zone_names = sorted(path.name for path in zone_anchor.current_path().iterdir())
+        if not zone_names or any(
+            re.fullmatch(r"zone-\d{3}\.json", name) is None for name in zone_names
+        ):
+            raise PdfQAFailure("PDF zones must contain only zone-NNN.json files")
+        for name in zone_names:
+            zone_opened[name] = assembly._open_anchored_input_file(
+                zone_anchor, name, "PDF zone"
+            )
+        assembly._verify_anchored_evidence(zone_anchor, zone_opened)
+        zone_bytes = {
+            name: assembly._read_opened_bytes(
+                item, zone_anchor.path / name, f"PDF zone {name}"
+            )
+            for name, item in zone_opened.items()
+        }
+        zone_hashes = {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in zone_bytes.items()
+        }
         qa = _pdf_qa_from_value(
             _strict_json_text(
-                assembly._read_opened_utf8(
-                    opened["pdf-qa.json"],
-                    run_dir / "pdf-qa.json",
-                    "automated PDF QA",
-                ),
+                _snapshot_utf8(snapshot_bytes["pdf-qa.json"], "automated PDF QA"),
                 "automated PDF QA",
             ),
             run_dir / "qa-pages",
         )
         review = _pdf_layout_review_from_values(
             _strict_json_text(
-                assembly._read_opened_utf8(
-                    opened["pdf-layout-review.json"],
-                    run_dir / "pdf-layout-review.json",
-                    "PDF layout review",
+                _snapshot_utf8(
+                    snapshot_bytes["pdf-layout-review.json"], "PDF layout review"
                 ),
                 "PDF layout review",
             ),
             qa,
         )
         layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        source_value = _strict_json_mapping(
+            snapshot_bytes["source.json"], "PDF source record"
+        )
+        document_value = _strict_json_mapping(
+            snapshot_bytes["document.json"], "PDF document"
+        )
+        glossary_value = _strict_json_mapping(
+            snapshot_bytes["glossary.json"], "PDF glossary"
+        )
+        semantic_value = _strict_json_mapping(
+            snapshot_bytes["review.json"], "semantic review"
+        )
+        zone_values = {
+            Path(name).stem: _strict_json_mapping(payload, f"PDF zone {name}")
+            for name, payload in zone_bytes.items()
+        }
+        report_evidence = build_pdf_report_evidence(
+            source_pdf=snapshot_bytes["source.pdf"],
+            source_value=source_value,
+            document_value=document_value,
+            segments_text=_snapshot_utf8(
+                snapshot_bytes["segments.jsonl"], "PDF segments"
+            ),
+            glossary_value=glossary_value,
+            review_value=semantic_value,
+            zone_values=zone_values,
+            layout=layout,
+            qa=qa,
+            visual_review=review,
+        )
         if layout.reserved_output_dir != str(output_dir):
             raise PdfQAFailure(
                 "layout reserved output directory does not match the request"
@@ -312,14 +380,19 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
                 "staged PDF hash does not match current automated, visual, and layout evidence"
             )
         _verify_pdf_qa_artifacts(run_anchor, qa)
-        manifest = write_pdf_manifest(run_dir, report_paths[0])
+        manifest = write_pdf_manifest(
+            run_dir, report_paths[0], evidence=report_evidence
+        )
         write_pdf_review_report(manifest, report_paths[1])
         names = sorted(path.name for path in staged_anchor.current_path().iterdir())
         if names != ["manifest.json", "review-report.md", "translated.pdf"]:
             raise PdfQAFailure(
                 "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
             )
-        assembly._verify_anchored_evidence(run_anchor, opened)
+        _verify_report_evidence_snapshot(run_anchor, opened, snapshot_hashes)
+        _verify_report_evidence_snapshot(zone_anchor, zone_opened, zone_hashes)
+        if sorted(path.name for path in zone_anchor.current_path().iterdir()) != zone_names:
+            raise PdfQAFailure("PDF zone evidence entries changed during finalization")
         assembly._verify_anchored_evidence(
             staged_anchor, {"translated.pdf": staged_pdf}
         )
@@ -329,16 +402,14 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             run_dir / "staged-output" / "translated.pdf",
         )
         _fsync_final_files(staged_anchor.current_path())
-        _ensure_output_parent(output_dir)
+        output_parent_anchor = _ensure_output_parent(output_dir)
         _validate_locations(run_anchor, output_dir)
-        assembly._close_opened_file(staged_pdf)
-        staged_pdf = None
-        staged_anchor.close()
-        staged_anchor = None
-        try:
-            os.replace(run_dir / "staged-output", output_dir)
-        except OSError as error:
-            raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+        _publish_final_directory_no_clobber(
+            run_anchor,
+            staged_anchor,
+            output_parent_anchor,
+            output_dir.name,
+        )
         completed = True
         return output_dir
     except PdfQAFailure:
@@ -357,8 +428,14 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         assembly._close_opened_file(staged_pdf)
         for item in opened.values():
             assembly._close_opened_file(item)
+        for item in zone_opened.values():
+            assembly._close_opened_file(item)
+        if zone_anchor is not None:
+            zone_anchor.close()
         if staged_anchor is not None:
             staged_anchor.close()
+        if output_parent_anchor is not None:
+            output_parent_anchor.close()
         if run_anchor is not None:
             run_anchor.close()
 
@@ -441,6 +518,34 @@ def _strict_json_text(text: str, label: str) -> object:
         raise PdfQAFailure(f"cannot read {label}: {error}") from error
 
 
+def _snapshot_utf8(payload: bytes, label: str) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError as error:
+        raise PdfQAFailure(f"cannot decode {label}: {error}") from error
+
+
+def _strict_json_mapping(payload: bytes, label: str) -> Mapping[str, Any]:
+    value = _strict_json_text(_snapshot_utf8(payload, label), label)
+    if not isinstance(value, Mapping):
+        raise PdfQAFailure(f"{label} must be a JSON object")
+    return value
+
+
+def _verify_report_evidence_snapshot(
+    anchor: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    assembly._verify_anchored_evidence(anchor, opened)
+    for name, item in opened.items():
+        payload = assembly._read_opened_bytes(
+            item, anchor.path / name, f"PDF report evidence {name}"
+        )
+        if hashlib.sha256(payload).hexdigest() != expected_hashes[name]:
+            raise PdfQAFailure(f"PDF report evidence content changed: {name}")
+
+
 def _verify_pdf_qa_artifacts(
     run_anchor: assembly._DirectoryAnchor, qa: PdfQAResult
 ) -> None:
@@ -472,7 +577,7 @@ def _verify_pdf_qa_artifacts(
         pages.close()
 
 
-def _ensure_output_parent(output_dir: Path) -> None:
+def _ensure_output_parent(output_dir: Path) -> assembly._DirectoryAnchor:
     try:
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         assembly._reject_linked_ancestors(output_dir)
@@ -483,6 +588,137 @@ def _ensure_output_parent(output_dir: Path) -> None:
         raise PdfQAFailure(
             f"final PDF output parent is not a safe directory: {output_dir.parent}"
         )
+    parent: assembly._DirectoryAnchor | None = None
+    try:
+        parent = assembly._open_directory_anchor(
+            output_dir.parent, "final PDF output parent"
+        )
+        assembly._require_anchored_name_absent(parent, output_dir.name)
+        return parent
+    except PdfAssemblyError as error:
+        if parent is not None:
+            parent.close()
+        raise PdfQAFailure(str(error)) from error
+
+
+def _publish_final_directory_no_clobber(
+    source_parent: assembly._DirectoryAnchor,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+) -> None:
+    destination = destination_parent.path / destination_name
+    try:
+        _require_anchored_directory_identity(
+            source_parent,
+            "staged-output",
+            source.identity,
+            "final PDF publication source",
+        )
+        destination_parent.verify_visible()
+        if (
+            source_parent.descriptor is not None
+            and destination_parent.descriptor is not None
+        ):
+            _posix_rename_directory_no_replace(
+                source_parent.descriptor,
+                "staged-output",
+                destination_parent.descriptor,
+                destination_name,
+            )
+        elif assembly._IS_WINDOWS:
+            source_handle = assembly._windows_nt_create_relative(
+                assembly._windows_anchor_handle(source_parent),
+                "staged-output",
+                desired_access=0x00010000 | 0x00000080 | 0x00100000,
+                create_disposition=1,
+                create_options=0x00000001 | 0x00000020 | 0x00200000,
+                file_attributes=0,
+            )
+            try:
+                if (
+                    assembly._windows_file_identity(
+                        source_handle, require_regular=False
+                    )
+                    != source.identity
+                ):
+                    raise PdfQAFailure(
+                        "final PDF publication source changed identity"
+                    )
+                assembly._windows_rename_open_file(
+                    source_handle,
+                    assembly._windows_anchor_handle(destination_parent),
+                    destination_name,
+                )
+            finally:
+                assembly.pdf_acquire_module._close_windows_handle(source_handle)
+        else:
+            raise PdfQAFailure(
+                f"safe atomic no-clobber PDF publication is unavailable: {destination}"
+            )
+        _require_anchored_directory_identity(
+            destination_parent,
+            destination_name,
+            source.identity,
+            "published final PDF output",
+        )
+        destination_parent.verify_visible()
+    except FileExistsError as error:
+        raise PdfQAFailure(f"reserved final output already exists: {destination}") from error
+    except PdfQAFailure:
+        raise
+    except (AttributeError, NotImplementedError, OSError, PdfAssemblyError) as error:
+        if getattr(error, "winerror", None) in {80, 183}:
+            raise PdfQAFailure(
+                f"reserved final output already exists: {destination}"
+            ) from error
+        raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+
+
+def _posix_rename_directory_no_replace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        operation = getattr(library, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        operation = getattr(library, "renameat2", None)
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:
+        operation = None
+        flags = 0
+    if operation is None:
+        raise NotImplementedError(
+            f"atomic no-replace directory rename is unavailable on {sys.platform}"
+        )
+    operation.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    operation.restype = ctypes.c_int
+    result = operation(
+        source_fd,
+        os.fsencode(source_name),
+        destination_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+    raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
 def _fsync_final_files(staged_output: Path) -> None:

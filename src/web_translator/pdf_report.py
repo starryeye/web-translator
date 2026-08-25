@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,9 +18,15 @@ from langdetect import DetectorFactory, PROFILES_DIRECTORY
 from langdetect.lang_detect_exception import LangDetectException
 
 from web_translator import __version__
-from web_translator.models import Segment, SegmentContractError, read_segments
+from web_translator.models import Segment, SegmentContractError, read_segments_stream
 from web_translator.pdf_flowables import PdfAssemblyError, PdfAssemblyLayout
-from web_translator.pdf_models import PdfContractError, PdfDocument, PdfSourceRecord
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfContractError,
+    PdfDocument,
+    PdfLayoutReview,
+    PdfSourceRecord,
+)
 from web_translator.pdf_qa import (
     PdfQAFailure,
     PdfQAResult,
@@ -38,22 +47,125 @@ _TERMINOLOGY_POLICY_ID = "english-technical-first-use-ko-gloss"
 _TERMINOLOGY_POLICY_VERSION = "1.0"
 
 
-def build_pdf_manifest(run_dir: Path) -> dict[str, object]:
+@dataclass(frozen=True, slots=True)
+class PdfReportEvidence:
+    """Validated immutable inputs used by both final report writers."""
+
+    source: PdfSourceRecord
+    document: PdfDocument
+    segments: tuple[Segment, ...]
+    glossary: dict[str, str]
+    semantic_review: dict[str, object]
+    layout: PdfAssemblyLayout
+    qa: PdfQAResult
+    visual_review: PdfLayoutReview
+
+
+def build_pdf_report_evidence(
+    *,
+    source_pdf: bytes,
+    source_value: Mapping[str, Any],
+    document_value: Mapping[str, Any],
+    segments_text: str,
+    glossary_value: Mapping[str, Any],
+    review_value: Mapping[str, Any],
+    zone_values: Mapping[str, Mapping[str, Any]],
+    layout: PdfAssemblyLayout,
+    qa: PdfQAResult,
+    visual_review: PdfLayoutReview,
+) -> PdfReportEvidence:
+    """Parse and cross-validate one already captured report-evidence snapshot."""
+    try:
+        source = PdfSourceRecord.from_dict(source_value)
+        document = PdfDocument.from_dict(document_value)
+    except PdfContractError as error:
+        raise PdfQAFailure(f"invalid PDF report evidence: {error}") from error
+    try:
+        segments = tuple(read_segments_stream(io.StringIO(segments_text)))
+    except (SegmentContractError, ValueError) as error:
+        raise PdfQAFailure(f"invalid PDF segments for report: {error}") from error
+    glossary = _string_mapping_value(glossary_value, "PDF glossary")
+    zone_targets, zone_attempts = _zone_snapshot(zone_values)
+    semantic_review = _semantic_review_from_value(
+        review_value, set(zone_values), zone_attempts
+    )
+    source_hash = hashlib.sha256(source_pdf).hexdigest()
+    if (
+        source.sha256 != source_hash
+        or document.source_sha256 != source_hash
+        or source.byte_length != len(source_pdf)
+    ):
+        raise PdfQAFailure(
+            "PDF source SHA and byte length must agree across source, document, and bytes"
+        )
+    target_segments = [segment for segment in segments if segment.target]
+    target_ids = [segment.id for segment in target_segments]
+    assigned_ids = [
+        segment_id
+        for zone_id in sorted(zone_targets)
+        for segment_id in zone_targets[zone_id]
+    ]
+    if assigned_ids != target_ids or len(assigned_ids) != len(set(assigned_ids)):
+        raise PdfQAFailure("PDF zones must exactly partition target segments in order")
+    blocks_by_segment: dict[str, PdfBlock] = {}
+    for block in document.blocks:
+        if block.segment_id is None:
+            continue
+        if block.segment_id in blocks_by_segment:
+            raise PdfQAFailure("PDF document contains duplicate segment mappings")
+        blocks_by_segment[block.segment_id] = block
+    for segment in target_segments:
+        block = blocks_by_segment.get(segment.id)
+        if block is None or block.id != segment.locator:
+            raise PdfQAFailure(
+                "PDF document and segment manifest target mappings disagree"
+            )
+    metrics = qa.metrics
+    if metrics["translated_block_count"] != len(target_segments):
+        raise PdfQAFailure(
+            "automated QA translated block count disagrees with target segments"
+        )
+    figure_count = sum(block.kind == "figure" for block in document.blocks)
+    if metrics["figure_count"] != figure_count:
+        raise PdfQAFailure(
+            "automated QA figure count disagrees with PDF document"
+        )
+    visible_ids = {
+        block.id
+        for block in document.blocks
+        if block.kind not in {"header", "footer", "page-number"}
+    }
+    flowable_ids = {item.block_id for item in layout.flowables}
+    if not visible_ids.issubset(flowable_ids):
+        raise PdfQAFailure("PDF layout does not cover every reportable document block")
+    if any(item.page_number > metrics["output_page_count"] for item in layout.flowables):
+        raise PdfQAFailure("PDF layout page evidence exceeds automated QA page count")
+    return PdfReportEvidence(
+        source=source,
+        document=document,
+        segments=segments,
+        glossary=glossary,
+        semantic_review=semantic_review,
+        layout=layout,
+        qa=qa,
+        visual_review=visual_review,
+    )
+
+
+def build_pdf_manifest(
+    run_dir: Path, *, evidence: PdfReportEvidence | None = None
+) -> dict[str, object]:
     """Build one stable, PDF-specific manifest from reviewed run evidence."""
     run_dir = Path(run_dir)
-    qa = _read_pdf_qa(run_dir / "pdf-qa.json")
-    visual_review = read_pdf_layout_review(
-        run_dir / "pdf-layout-review.json", run_dir / "pdf-qa.json"
-    )
-    source = _source_record(run_dir / "source.json")
-    document = _document(run_dir / "document.json")
-    layout = _layout(run_dir / "layout.json")
-    try:
-        segments = read_segments(run_dir / "segments.jsonl")
-    except (OSError, UnicodeError, SegmentContractError) as error:
-        raise PdfQAFailure(f"cannot read PDF segments for report: {error}") from error
-    glossary = _string_mapping(run_dir / "glossary.json", "PDF glossary")
-    semantic_review = _semantic_review(run_dir)
+    evidence = evidence or _read_pdf_report_evidence(run_dir)
+    qa = evidence.qa
+    visual_review = evidence.visual_review
+    source = evidence.source
+    document = evidence.document
+    layout = evidence.layout
+    segments = evidence.segments
+    glossary = evidence.glossary
+    semantic_review = evidence.semantic_review
     metrics = dict(qa.metrics)
     block_counts = dict(sorted(Counter(block.kind for block in document.blocks).items()))
     target_segments = [segment for segment in segments if segment.target]
@@ -102,9 +214,14 @@ def build_pdf_manifest(run_dir: Path) -> dict[str, object]:
     }
 
 
-def write_pdf_manifest(run_dir: Path, path: Path) -> dict[str, object]:
+def write_pdf_manifest(
+    run_dir: Path,
+    path: Path,
+    *,
+    evidence: PdfReportEvidence | None = None,
+) -> dict[str, object]:
     """Write canonical PDF manifest JSON and return its payload."""
-    payload = build_pdf_manifest(run_dir)
+    payload = build_pdf_manifest(run_dir, evidence=evidence)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     _atomic_write(Path(path), serialized)
     return payload
@@ -225,20 +342,6 @@ def _read_pdf_qa(path: Path) -> PdfQAResult:
         raise PdfQAFailure(f"invalid automated PDF QA: {error}") from error
 
 
-def _source_record(path: Path) -> PdfSourceRecord:
-    try:
-        return PdfSourceRecord.from_dict(_read_json(path, "PDF source record"))
-    except PdfContractError as error:
-        raise PdfQAFailure(f"invalid PDF source record: {error}") from error
-
-
-def _document(path: Path) -> PdfDocument:
-    try:
-        return PdfDocument.from_dict(_read_json(path, "PDF document"))
-    except PdfContractError as error:
-        raise PdfQAFailure(f"invalid PDF document: {error}") from error
-
-
 def _layout(path: Path) -> PdfAssemblyLayout:
     try:
         return PdfAssemblyLayout.from_dict(_read_json(path, "PDF layout"))
@@ -246,18 +349,90 @@ def _layout(path: Path) -> PdfAssemblyLayout:
         raise PdfQAFailure(f"invalid PDF layout: {error}") from error
 
 
-def _semantic_review(run_dir: Path) -> dict[str, object]:
-    review = _read_json(run_dir / "review.json", "semantic review")
+def _read_pdf_report_evidence(run_dir: Path) -> PdfReportEvidence:
+    qa = _read_pdf_qa(run_dir / "pdf-qa.json")
+    visual_review = read_pdf_layout_review(
+        run_dir / "pdf-layout-review.json", run_dir / "pdf-qa.json"
+    )
+    try:
+        source_pdf = (run_dir / "source.pdf").read_bytes()
+        segments_text = (run_dir / "segments.jsonl").read_text(encoding="utf-8")
+        zone_entries = sorted((run_dir / "zones").iterdir(), key=lambda path: path.name)
+    except (OSError, UnicodeError) as error:
+        raise PdfQAFailure(f"cannot read PDF report evidence: {error}") from error
+    zone_values: dict[str, Mapping[str, Any]] = {}
+    for path in zone_entries:
+        if _ZONE_FILE.fullmatch(path.name) is None:
+            raise PdfQAFailure(f"unexpected PDF zone evidence: {path.name}")
+        zone_values[path.stem] = _read_json(path, "PDF zone")
+    return build_pdf_report_evidence(
+        source_pdf=source_pdf,
+        source_value=_read_json(run_dir / "source.json", "PDF source record"),
+        document_value=_read_json(run_dir / "document.json", "PDF document"),
+        segments_text=segments_text,
+        glossary_value=_read_json(run_dir / "glossary.json", "PDF glossary"),
+        review_value=_read_json(run_dir / "review.json", "semantic review"),
+        zone_values=zone_values,
+        layout=_layout(run_dir / "layout.json"),
+        qa=qa,
+        visual_review=visual_review,
+    )
+
+
+def _zone_snapshot(
+    zone_values: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, list[str]], dict[str, int]]:
+    expected_names = [
+        f"zone-{number:03d}" for number in range(1, len(zone_values) + 1)
+    ]
+    if list(zone_values) != expected_names:
+        raise PdfQAFailure("PDF zone names must be exact and sequential")
+    targets: dict[str, list[str]] = {}
+    attempts: dict[str, int] = {}
+    fields = {
+        "attempt",
+        "context_after_ids",
+        "context_before_ids",
+        "expected_tokens",
+        "heading_path",
+        "id",
+        "target_ids",
+    }
+    for zone_id, value in zone_values.items():
+        if set(value) != fields or value.get("id") != zone_id:
+            raise PdfQAFailure(f"PDF zone fields or embedded ID are invalid: {zone_id}")
+        target_ids = _string_list_value(value.get("target_ids"), f"{zone_id}.target_ids")
+        if not target_ids or len(target_ids) != len(set(target_ids)):
+            raise PdfQAFailure(f"PDF zone target IDs must be nonempty and unique: {zone_id}")
+        _string_list_value(value.get("heading_path"), f"{zone_id}.heading_path")
+        before = _string_list_value(
+            value.get("context_before_ids"), f"{zone_id}.context_before_ids"
+        )
+        after = _string_list_value(
+            value.get("context_after_ids"), f"{zone_id}.context_after_ids"
+        )
+        if set(target_ids) & set(before + after):
+            raise PdfQAFailure(f"PDF zone context overlaps targets: {zone_id}")
+        attempt = value.get("attempt")
+        if type(attempt) is not int or not 0 <= attempt <= 2:
+            raise PdfQAFailure(f"PDF zone attempt is invalid: {zone_id}")
+        expected_tokens = value.get("expected_tokens")
+        if not isinstance(expected_tokens, Mapping) or set(expected_tokens) != set(target_ids):
+            raise PdfQAFailure(f"PDF zone token expectations are incomplete: {zone_id}")
+        for segment_id, tokens in expected_tokens.items():
+            _string_list_value(tokens, f"{zone_id}.expected_tokens[{segment_id!r}]")
+        targets[zone_id] = target_ids
+        attempts[zone_id] = attempt
+    return targets, attempts
+
+
+def _semantic_review_from_value(
+    review: Mapping[str, Any],
+    zone_ids: set[str],
+    zone_attempts: Mapping[str, int],
+) -> dict[str, object]:
     if set(review) != {"retries", "section_findings", "unresolved_required"}:
         raise PdfQAFailure("semantic review fields are not exact")
-    zone_dir = run_dir / "zones"
-    try:
-        zone_names = sorted(path.name for path in zone_dir.iterdir())
-    except OSError as error:
-        raise PdfQAFailure(f"cannot read PDF zones for report: {error}") from error
-    if not zone_names or any(_ZONE_FILE.fullmatch(name) is None for name in zone_names):
-        raise PdfQAFailure("PDF zones must contain only zone-NNN.json files")
-    zone_ids = {Path(name).stem for name in zone_names}
     retries = review.get("retries")
     findings = review.get("section_findings")
     unresolved = review.get("unresolved_required")
@@ -268,6 +443,8 @@ def _semantic_review(run_dir: Path) -> dict[str, object]:
         for zone_id, count in retries.items()
     ):
         raise PdfQAFailure("semantic review retries do not exactly cover PDF zones")
+    if any(retries[zone_id] != zone_attempts[zone_id] for zone_id in zone_ids):
+        raise PdfQAFailure("semantic review retries disagree with PDF zone attempts")
     if not isinstance(findings, Mapping) or set(findings) != zone_ids:
         raise PdfQAFailure("semantic review findings do not exactly cover PDF zones")
     canonical_findings: dict[str, list[dict[str, str]]] = {}
@@ -324,11 +501,16 @@ def _semantic_review(run_dir: Path) -> dict[str, object]:
     }
 
 
-def _string_mapping(path: Path, label: str) -> dict[str, str]:
-    value = _read_json(path, label)
+def _string_mapping_value(value: Mapping[str, Any], label: str) -> dict[str, str]:
     if any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
         raise PdfQAFailure(f"{label} must map strings to strings")
     return dict(value)  # type: ignore[arg-type]
+
+
+def _string_list_value(value: object, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise PdfQAFailure(f"{label} must be a string array")
+    return list(value)
 
 
 def _read_json(path: Path, label: str) -> Mapping[str, Any]:
