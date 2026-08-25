@@ -9,13 +9,27 @@ from web_translator.cli import main
 ROOT = Path(__file__).parents[1]
 
 
-def test_manifest_discovers_web_translator_skill() -> None:
+def test_manifest_discovers_both_translator_skills() -> None:
     manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text("utf-8"))
     assert manifest["name"] == "web-translator"
     assert manifest["version"] == __version__
     assert manifest["skills"] == "./skills/"
     assert manifest["interface"]["displayName"] == "Web Translator"
     assert (ROOT / "skills/web-translator").is_dir()
+    assert (ROOT / "skills/pdf-translator").is_dir()
+
+    searchable_metadata = " ".join(
+        (
+            manifest["description"],
+            manifest["interface"]["shortDescription"],
+            manifest["interface"]["longDescription"],
+            *manifest["interface"]["defaultPrompt"],
+        )
+    ).lower()
+    assert "html" in searchable_metadata
+    assert "pdf" in searchable_metadata
+    assert "public" in searchable_metadata
+    assert "local" in searchable_metadata
 
 
 def test_cli_help_returns_success(capsys) -> None:

@@ -1,7 +1,7 @@
 {
   "name": "web-translator",
   "version": "0.2.0",
-  "description": "Translate public static web pages into reviewed offline Korean HTML bundles.",
+  "description": "Translate one public static HTML page or one local or public text-selectable PDF into reviewed Korean output.",
   "author": {
     "name": "starryeye"
   },
@@ -9,15 +9,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Web Translator",
-    "shortDescription": "Translate a public web page into reviewed Korean HTML.",
-    "longDescription": "Preserves a public page's structure and assets while Codex agents translate it contextually, review it, and create an offline bundle.",
+    "shortDescription": "Translate public HTML or local/public PDFs into reviewed Korean output.",
+    "longDescription": "Provides separate workflows for a public static HTML page and a local or public text-selectable PDF while sharing contextual translation and master-review contracts.",
     "developerName": "starryeye",
     "category": "Productivity",
     "capabilities": [
       "Write"
     ],
     "defaultPrompt": [
-      "Translate this public web page into an offline Korean HTML bundle."
+      "Translate this public HTML page into an offline Korean bundle, or translate this local or public text-selectable PDF into a reviewed Korean PDF."
     ]
   }
 }

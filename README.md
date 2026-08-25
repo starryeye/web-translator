@@ -1,9 +1,16 @@
 # web-translator
 
-`web-translator` is a cross-platform Codex plugin for Windows and macOS that translates one public static HTML
-page into natural Korean while preserving the captured DOM, links, styles, and offline
-assets. Translator agents work in isolated semantic zones; a master agent reviews every
-zone before deterministic assembly and QA.
+`web-translator` is a cross-platform Codex plugin for Windows and macOS with two clearly
+selectable workflows:
+
+- `web-translator` translates one supported public static HTML URL into an offline Korean
+  bundle while preserving its DOM, links, styles, and captured assets.
+- `pdf-translator` translates one local text-selectable PDF, attached text-selectable PDF,
+  or public HTTP(S) PDF URL into a reviewed Korean PDF.
+
+Both workflows use the same Python package, immutable semantic zones, translation
+contract, glossary, validation, and master-review rubric. Format-specific commands handle
+HTML or PDF acquisition, extraction, assembly, and QA.
 
 ## Setup
 
@@ -13,6 +20,8 @@ Use Python 3.11 or newer. On Windows PowerShell:
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[test]"
 .\.venv\Scripts\python.exe -m playwright install chromium
+# Install Poppler, then open a new PowerShell so pdfinfo.exe and pdftoppm.exe are on PATH.
+winget install -e --id oschwartz10612.Poppler
 ```
 
 On macOS with a POSIX shell:
@@ -21,9 +30,13 @@ On macOS with a POSIX shell:
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -e ".[test]"
 ./.venv/bin/python -m playwright install chromium
+brew install poppler
 ```
 
-The final command downloads the browser used for layout, offline, and screenshot QA.
+Chromium supports HTML layout, offline, and screenshot QA. Poppler provides `pdfinfo` and
+`pdftoppm` for PDF inspection and rendering. If the Windows package manager is unavailable,
+install a trusted Poppler distribution and add its `Library\bin` directory to `PATH`.
+Confirm both executables are available before starting a PDF run.
 
 ## Versioning
 
@@ -44,6 +57,8 @@ Use `patch` for compatible fixes, `minor` for backward-compatible features, and
 snapshot; Codex displays the vendored `.codex-plugin/plugin.json` version.
 
 ## Use from Codex
+
+### Public HTML
 
 Ask Codex to translate exactly one public URL, for example:
 
@@ -66,6 +81,40 @@ translated-pages/<host>-<path>-<UTC timestamp>/
 
 The completion response links to `index.html` and `review-report.md` with absolute local
 paths and reports optional asset warnings.
+
+### Local, attached, or public PDF
+
+Ask Codex to translate exactly one supported PDF. Local paths containing spaces and
+non-ASCII characters are passed as one native shell argument:
+
+```text
+Translate this local text-selectable PDF into Korean:
+/Users/me/자료 폴더/분기 보고서.pdf
+```
+
+```text
+Translate this public HTTP(S) PDF URL into Korean:
+https://example.com/reports/quarterly-report.pdf
+```
+
+An attachment is supported when Codex exposes it as a readable local path. The PDF skill
+creates a unique private run directory, acquires and extracts the source, uses the shared
+zone translation and semantic review, assembles a staged PDF with embedded Noto Sans KR
+Regular and Bold fonts, prepares automated/rendered QA, and requires master inspection of
+every numbered contact sheet. Font licensing and source provenance are stored beside the
+package fonts in `src/web_translator/font_assets/OFL.txt` and `PROVENANCE.json`.
+
+Only `pdf-qa finalize` publishes a successful output:
+
+```text
+translated-pdfs/<source>-<UTC timestamp>/
+|-- translated.pdf
+|-- manifest.json
+`-- review-report.md
+```
+
+The completion response links to all three files using absolute local paths. Staged or
+partially reviewed PDFs are never presented as completed output.
 
 ### Performance-oriented orchestration
 
@@ -107,6 +156,27 @@ The complete stage sequence is:
 <PYTHON> -m web_translator qa --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 ```
 
+For a local or public PDF, bind the complete source path or URL to one shell variable and
+run the PDF stages in order:
+
+```text
+<PYTHON> -m web_translator pdf-acquire <FILE_OR_URL> --run-dir <WORK_DIR>
+<PYTHON> -m web_translator pdf-extract --run-dir <WORK_DIR>
+<PYTHON> -m web_translator plan-zones --run-dir <WORK_DIR> --max-chars 12000 --target-zones 3
+<PYTHON> -m web_translator prepare-assignments --run-dir <WORK_DIR>
+<PYTHON> -m web_translator validate-translations --run-dir <WORK_DIR> --zone-id <ZONE_ID>
+<PYTHON> -m web_translator validate-translations --run-dir <WORK_DIR>
+<PYTHON> -m web_translator pdf-assemble --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
+<PYTHON> -m web_translator pdf-qa prepare --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
+<MASTER> inspect every contact sheet and write strict pdf-layout-review.json
+<PYTHON> -m web_translator pdf-qa finalize --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
+```
+
+`pdf-qa prepare` writes automated evidence and numbered contact sheets under the private
+run directory. The master review records exact page/contact-sheet coverage and all eight
+visual dimensions before `pdf-qa finalize` checks the evidence and atomically publishes
+the three final artifacts.
+
 Each command exits nonzero on a required failure. Existing output directories are never
 overwritten.
 
@@ -120,6 +190,7 @@ installed skill/plugin validator directories for your Codex installation:
 <PYTHON> -m pytest -q
 <PYTHON> -m pytest tests/test_skill_contract.py -q
 <PYTHON> <SKILL_CREATOR_DIR>/scripts/quick_validate.py skills/web-translator
+<PYTHON> <SKILL_CREATOR_DIR>/scripts/quick_validate.py skills/pdf-translator
 <PYTHON> <PLUGIN_CREATOR_DIR>/scripts/validate_plugin.py .
 ```
 
@@ -134,8 +205,15 @@ be treated as a deterministic regression in the default suite.
 
 ## Limitations
 
-The MVP accepts one unauthenticated public HTTP(S) HTML page. It does not support private
-or authenticated pages, CAPTCHA flows, JavaScript-only applications, recursive site
-translation, PDF input/output, publishing, or guaranteed pixel-identical line wrapping.
+The HTML workflow accepts one unauthenticated public HTTP(S) static page. It does not
+support private or authenticated pages, CAPTCHA flows, JavaScript-only applications,
+recursive site translation, publishing, or guaranteed pixel-identical line wrapping.
 Missing optional images or fonts may remain origin fallbacks and are reported as warnings;
 missing critical HTML or CSS fails the run.
+
+The PDF workflow accepts one readable local/attached PDF or public HTTP(S) PDF, up to
+50 MiB and 100 pages, only when its required text is selectable. It rejects scanned,
+encrypted, malformed, oversized, over-page-limit, non-PDF, private-network, authenticated,
+or structurally ambiguous inputs. It does not OCR scans or preserve source line wrapping
+pixel-for-pixel. Missing required text, tables, figures, captions, embedded fonts, pages,
+or semantic/visual review evidence is a failure rather than a warning.
