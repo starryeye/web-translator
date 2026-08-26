@@ -1,0 +1,40 @@
+{
+  "retries": {
+    "zone-001": 0
+  },
+  "section_findings": {
+    "zone-001": [
+      {
+        "dimension": "semantic_fidelity",
+        "evidence": "Fixture review passed semantic_fidelity.",
+        "verdict": "pass"
+      },
+      {
+        "dimension": "qualification_preservation",
+        "evidence": "Fixture review passed qualification_preservation.",
+        "verdict": "pass"
+      },
+      {
+        "dimension": "naturalness",
+        "evidence": "Fixture review passed naturalness.",
+        "verdict": "pass"
+      },
+      {
+        "dimension": "terminology",
+        "evidence": "Fixture review passed terminology.",
+        "verdict": "pass"
+      },
+      {
+        "dimension": "boundary_consistency",
+        "evidence": "Fixture review passed boundary_consistency.",
+        "verdict": "pass"
+      },
+      {
+        "dimension": "protected_content",
+        "evidence": "Fixture review passed protected_content.",
+        "verdict": "pass"
+      }
+    ]
+  },
+  "unresolved_required": []
+}

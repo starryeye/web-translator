@@ -2,14 +2,139 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import pytest
+from pypdf import PdfReader
 
 import web_translator.pdf_qa as pdf_qa_module
 import web_translator.pdf_report as pdf_report_module
+from web_translator.cli import main
+from tests import pdf_fixtures
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
 from web_translator.pdf_report import build_pdf_manifest
 from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_pdf_run
+
+
+PDF_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "pdf"
+
+
+# Production mutation caught: nondeterministic or incomplete committed acceptance inputs.
+def test_committed_pdf_acceptance_fixtures_regenerate_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    generator = getattr(pdf_fixtures, "generate_acceptance_fixtures", None)
+    assert callable(generator), "acceptance fixture generator is missing"
+
+    regenerated = tmp_path / "pdf"
+    generator(regenerated)
+
+    expected_directories = {
+        "figures-captions-v1",
+        "rejections-v1",
+        "table-report-v1",
+        "technical-document-v1",
+        "two-column-footnotes-v1",
+    }
+    assert {path.name for path in regenerated.iterdir() if path.is_dir()} == (
+        expected_directories
+    )
+    committed_files = sorted(
+        path.relative_to(PDF_FIXTURE_ROOT)
+        for path in PDF_FIXTURE_ROOT.rglob("*")
+        if path.is_file()
+    )
+    regenerated_files = sorted(
+        path.relative_to(regenerated)
+        for path in regenerated.rglob("*")
+        if path.is_file()
+    )
+    assert regenerated_files == committed_files
+    assert all(
+        (regenerated / relative).read_bytes()
+        == (PDF_FIXTURE_ROOT / relative).read_bytes()
+        for relative in committed_files
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "source_relative"),
+    [
+        (name, Path("source.pdf")) for name in pdf_fixtures.PDF_ACCEPTANCE_FIXTURES
+    ]
+    + [
+        (
+            "technical-document-v1",
+            Path("한국어 경로 with spaces") / "기술 문서 원본.pdf",
+        )
+    ],
+)
+def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
+    tmp_path: Path,
+    fixture_name: str,
+    source_relative: Path,
+) -> None:
+    """Every committed accepted source reaches reviewed public PDF output."""
+    fixture_dir = PDF_FIXTURE_ROOT / fixture_name
+    expected = json.loads((fixture_dir / "expected.json").read_text(encoding="utf-8"))
+    run_dir = tmp_path / "작업 공간" / fixture_name / "run"
+    output_dir = tmp_path / "작업 공간" / fixture_name / "final"
+
+    assert main(["pdf-acquire", str(fixture_dir / source_relative), "--run-dir", str(run_dir)]) == 0
+    assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 0
+    document = json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    assert document["page_count"] == expected["page_count"]
+    assert sum(block["kind"] == "table-cell" for block in document["blocks"]) >= expected["table_count"]
+    assert sum(block["kind"] == "figure" for block in document["blocks"]) == expected["figure_count"]
+
+    assert main(["plan-zones", "--run-dir", str(run_dir)]) == 0
+    shutil.copy2(fixture_dir / "glossary.json", run_dir / "glossary.json")
+    shutil.copy2(fixture_dir / "document-summary.txt", run_dir / "document-summary.txt")
+    assert main(["prepare-assignments", "--run-dir", str(run_dir)]) == 0
+    shutil.copytree(fixture_dir / "translations", run_dir / "translations")
+    shutil.copy2(fixture_dir / "review.json", run_dir / "review.json")
+    assert main(["validate-translations", "--run-dir", str(run_dir)]) == 0
+    assert main(["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
+    assert main(["pdf-qa", "prepare", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
+
+    qa = json.loads((run_dir / "pdf-qa.json").read_text(encoding="utf-8"))
+    visual_review = json.loads((fixture_dir / "visual-review.json").read_text(encoding="utf-8"))
+    visual_review["staged_pdf_sha256"] = qa["staged_pdf_sha256"]
+    visual_review["pages_reviewed"] = list(range(1, len(qa["rendered_page_hashes"]) + 1))
+    visual_review["contact_sheets_reviewed"] = qa["contact_sheet_pages"]
+    (run_dir / "pdf-layout-review.json").write_text(
+        json.dumps(visual_review, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert main(["pdf-qa", "finalize", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
+
+    assert sorted(path.name for path in output_dir.iterdir()) == expected["final_artifacts"]
+    assert not (run_dir / "staged-output").exists()
+    translated_text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(output_dir / "translated.pdf").pages
+    )
+    assert "작업 흐름" in translated_text
+    assert translated_text.count("workflow(작업 흐름)") == 1
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["inspection"]["page_count"] == expected["page_count"]
+    assert manifest["output"]["figure_count"] == expected["figure_count"]
+    assert manifest["automated_qa"]["contact_sheet_pages"] == qa["contact_sheet_pages"]
+
+
+@pytest.mark.parametrize("filename", ["image-only-scan.pdf", "encrypted.pdf", "malformed.pdf"])
+def test_committed_pdf_rejections_never_publish_final_output(
+    tmp_path: Path, filename: str
+) -> None:
+    fixture_dir = PDF_FIXTURE_ROOT / pdf_fixtures.PDF_REJECTION_FIXTURE
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "final"
+
+    acquire = main(["pdf-acquire", str(fixture_dir / filename), "--run-dir", str(run_dir)])
+    if acquire == 0:
+        assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
+    else:
+        assert acquire == 3
+    assert not output_dir.exists()
 
 
 @pytest.fixture

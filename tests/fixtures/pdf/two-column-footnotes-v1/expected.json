@@ -1,0 +1,13 @@
+{
+  "figure_count": 0,
+  "final_artifacts": [
+    "manifest.json",
+    "review-report.md",
+    "translated.pdf"
+  ],
+  "fixture": "two-column-footnotes-v1",
+  "footnote_count": 1,
+  "page_count": 2,
+  "schema_version": "1.0",
+  "table_count": 0
+}

@@ -1,0 +1,29 @@
+name: PDF cross-platform
+on: [pull_request, push]
+jobs:
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - if: runner.os == 'macOS'
+        run: brew install poppler
+      - if: runner.os == 'Windows'
+        run: choco install poppler -y
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+      - shell: bash
+        run: python -m pip install "$(find dist -name '*.whl' -print -quit)[test]"
+        if: runner.os == 'macOS'
+      - shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist -Filter *.whl | Select-Object -First 1
+          python -m pip install "$($wheel.FullName)[test]"
+        if: runner.os == 'Windows'
+      - run: python -m pytest tests/test_pdf_pipeline.py tests/test_plugin_layout.py -q

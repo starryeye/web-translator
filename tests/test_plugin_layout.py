@@ -17,6 +17,9 @@ def test_manifest_discovers_both_translator_skills() -> None:
     assert manifest["interface"]["displayName"] == "Web Translator"
     assert (ROOT / "skills/web-translator").is_dir()
     assert (ROOT / "skills/pdf-translator").is_dir()
+    assert {
+        path.name for path in (ROOT / "skills").iterdir() if path.is_dir()
+    } == {"web-translator", "pdf-translator"}
 
     searchable_metadata = " ".join(
         (

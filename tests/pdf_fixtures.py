@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from io import BytesIO
+import json
 from pathlib import Path
+import shutil
+import tempfile
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
@@ -13,6 +17,9 @@ from pypdf.generic import (
     NumberObject,
     TextStringObject,
 )
+from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Table, TableStyle
 from reportlab.pdfgen.canvas import Canvas
 
 from web_translator.pdf_models import (
@@ -25,6 +32,7 @@ from web_translator.pdf_models import (
     PdfSourceRecord,
     PdfTableCell,
 )
+from web_translator.pdf_extract import extract_pdf
 
 
 def make_pdf_source_record() -> PdfSourceRecord:
@@ -310,3 +318,393 @@ def make_nonzero_origin_image_pdf(path: Path) -> Path:
     with path.open("wb") as destination:
         writer.write(destination)
     return path
+
+
+PDF_ACCEPTANCE_FIXTURES = (
+    "technical-document-v1",
+    "table-report-v1",
+    "two-column-footnotes-v1",
+    "figures-captions-v1",
+)
+
+PDF_REJECTION_FIXTURE = "rejections-v1"
+
+_SEMANTIC_DIMENSIONS = (
+    "semantic_fidelity",
+    "qualification_preservation",
+    "naturalness",
+    "terminology",
+    "boundary_consistency",
+    "protected_content",
+)
+
+_VISUAL_DIMENSIONS = (
+    "heading_hierarchy",
+    "text_legibility",
+    "table_legibility",
+    "figure_caption_pairing",
+    "footnote_placement",
+    "page_transitions",
+    "clipping_overlap",
+    "glyph_rendering",
+)
+
+
+def generate_acceptance_fixtures(root: Path) -> None:
+    """Generate the complete, reproducible Task 12 PDF acceptance corpus."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=False)
+    makers = {
+        "technical-document-v1": _make_technical_document,
+        "table-report-v1": _make_table_report,
+        "two-column-footnotes-v1": _make_two_column_footnotes,
+        "figures-captions-v1": _make_figures_captions,
+    }
+    for fixture_name, maker in makers.items():
+        fixture_dir = root / fixture_name
+        fixture_dir.mkdir()
+        maker(fixture_dir / "source.pdf")
+        _write_acceptance_sidecars(fixture_dir, fixture_name)
+        _write_known_fixture_translations(fixture_dir)
+
+    technical = root / "technical-document-v1" / "source.pdf"
+    korean_copy = (
+        root
+        / "technical-document-v1"
+        / "한국어 경로 with spaces"
+        / "기술 문서 원본.pdf"
+    )
+    korean_copy.parent.mkdir()
+    shutil.copyfile(technical, korean_copy)
+
+    rejection_dir = root / PDF_REJECTION_FIXTURE
+    rejection_dir.mkdir()
+    _make_image_only_acceptance_pdf(rejection_dir / "image-only-scan.pdf")
+    clear = rejection_dir / ".encrypted-clear.pdf"
+    _make_technical_document(clear, pages=1)
+    writer = PdfWriter()
+    writer.append(PdfReader(clear))
+    writer.encrypt("fixture-password")
+    with (rejection_dir / "encrypted.pdf").open("wb") as destination:
+        writer.write(destination)
+    clear.unlink()
+    (rejection_dir / "malformed.pdf").write_bytes(b"%PDF-1.7\nnot a valid PDF\n")
+    _write_json(
+        rejection_dir / "expected.json",
+        {
+            "encrypted.pdf": {"command": "pdf-extract", "exit_code": 4},
+            "image-only-scan.pdf": {"command": "pdf-extract", "exit_code": 4},
+            "malformed.pdf": {"command": "pdf-extract", "exit_code": 4},
+            "schema_version": "1.0",
+        },
+    )
+
+
+def _deterministic_canvas(path: Path, *, pagesize: tuple[float, float] = (612, 792)) -> Canvas:
+    return Canvas(
+        str(path),
+        pagesize=pagesize,
+        invariant=1,
+        pageCompression=0,
+    )
+
+
+def _draw_lines(
+    canvas: Canvas,
+    lines: list[str],
+    *,
+    x: float,
+    y: float,
+    leading: float = 16.0,
+    font: str = "Helvetica",
+    size: float = 11.0,
+) -> None:
+    canvas.setFont(font, size)
+    for line in lines:
+        canvas.drawString(x, y, line)
+        y -= leading
+
+
+def _make_technical_document(path: Path, *, pages: int = 2) -> None:
+    canvas = _deterministic_canvas(path)
+    page_content = (
+        (
+            "Deterministic Systems Review",
+            [
+                "A deterministic workflow preserves source order, stable identifiers, and review evidence.",
+                "The translation system validates every protected token before assembly begins.",
+                "Reviewers compare semantic fidelity, terminology, and qualification preservation.",
+                "The release artifact contains the translated PDF, manifest, and review report only.",
+            ],
+        ),
+        (
+            "Operational Verification",
+            [
+                "Automated checks confirm selectable Korean text, embedded fonts, and complete page renders.",
+                "Contact sheets cover each output page exactly once and bind review to the staged digest.",
+                "A failed check keeps private staging intact and never publishes a partial final directory.",
+                "This fixture provides stable technical prose for repeatable end-to-end acceptance testing.",
+            ],
+        ),
+    )
+    for index in range(pages):
+        title, lines = page_content[index % len(page_content)]
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.drawString(54, 734, title)
+        _draw_lines(canvas, lines, x=54, y=690, leading=34)
+        canvas.setFont("Helvetica", 9)
+        canvas.drawRightString(558, 36, f"Page {index + 1}")
+        canvas.showPage()
+    canvas.save()
+
+
+def _make_table_report(path: Path) -> None:
+    canvas = _deterministic_canvas(path)
+    for page_number, quarter in enumerate(("First half", "Second half"), start=1):
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.drawString(54, 744, "Translation Quality Table Report")
+        canvas.setFont("Helvetica", 11)
+        canvas.drawString(
+            54,
+            716,
+            f"{quarter} measurements summarize deterministic acceptance outcomes for the release.",
+        )
+        data = [
+            [f"{quarter} metrics", "", ""],
+            ["Measure", "Observed", "Required"],
+            ["Selectable characters", "240", "At least 100"],
+            ["Reviewed pages", str(page_number), str(page_number)],
+            ["Required findings", "0", "0"],
+            ["Published artifacts", "3", "3"],
+        ]
+        table = Table(data, colWidths=(210, 120, 150), rowHeights=34)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("SPAN", (0, 0), (2, 0)),
+                    ("GRID", (0, 1), (-1, -1), 1, colors.black),
+                    ("BOX", (0, 0), (-1, -1), 1, colors.black),
+                    ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#E8EEF7")),
+                    ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+                    ("FONTNAME", (0, 2), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 10),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        table.wrapOn(canvas, 480, 260)
+        table.drawOn(canvas, 54, 456)
+        _draw_lines(
+            canvas,
+            [
+                "Merged header cells retain their logical span and all body rows remain readable.",
+                "The same report structure continues on the next page without losing table evidence.",
+            ],
+            x=54,
+            y=420,
+            leading=24,
+        )
+        canvas.setFont("Helvetica", 9)
+        canvas.drawRightString(558, 36, f"Page {page_number}")
+        canvas.showPage()
+    canvas.save()
+
+
+def _make_two_column_footnotes(path: Path) -> None:
+    canvas = _deterministic_canvas(path)
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(54, 744, "Two-Column Evidence Review")
+    canvas.setFont("Helvetica", 10)
+    for index, x_position in enumerate((54, 330), start=1):
+        canvas.drawString(
+            x_position,
+            700,
+            f"Column {index} first logical sentence.",
+        )
+        canvas.drawString(
+            x_position,
+            680,
+            f"Column {index} second logical sentence.",
+        )
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(54, 744, "Page-Local Footnote Evidence")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(54, 690, "Source order is validated before bounded zone planning begins.")
+    canvas.drawString(54, 648, "Contact-sheet evidence covers every rendered output page exactly once.")
+    canvas.drawString(54, 606, "Semantic review checks every required quality dimension.")
+    canvas.drawString(54, 578, "Validated Korean text remains selectable in the staged PDF.")
+    canvas.drawString(54, 550, "Automated QA records exact output and contact-sheet page counts.")
+    canvas.drawString(54, 522, "Final publication exposes exactly three reviewed artifacts.")
+    canvas.drawString(72, 270, "The deterministic workflow includes a page-local note")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(335, 275, "1")
+    canvas.drawString(72, 40, "1 Footnote evidence remains linked to its marker.")
+    canvas.showPage()
+    canvas.save()
+
+
+def _make_figures_captions(path: Path) -> None:
+    canvas = _deterministic_canvas(path)
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(54, 744, "Figures and Captions")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(
+        54,
+        716,
+        "Raster and vector evidence must remain paired with the correct explanatory caption.",
+    )
+
+    raster = Image.new("RGB", (240, 110), (42, 114, 168))
+    buffer = BytesIO()
+    raster.save(buffer, format="PNG", optimize=False, compress_level=9)
+    buffer.seek(0)
+    canvas.drawImage(ImageReader(buffer), 54, 518, width=220, height=110)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(54, 498, "Figure 1. Raster workflow status panel.")
+
+    canvas.setStrokeColor(colors.HexColor("#1F4E79"))
+    canvas.setFillColor(colors.HexColor("#D9EAF7"))
+    canvas.rect(54, 314, 220, 110, fill=1, stroke=1)
+    canvas.setStrokeColor(colors.HexColor("#C0504D"))
+    canvas.setLineWidth(4)
+    canvas.line(74, 338, 112, 368)
+    canvas.line(112, 368, 154, 352)
+    canvas.line(154, 352, 198, 402)
+    canvas.line(198, 402, 254, 384)
+    canvas.setFillColor(colors.black)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(54, 294, "Figure 2. Vector review coverage trend.")
+    _draw_lines(
+        canvas,
+        [
+            "The raster panel verifies image preservation and the vector plot verifies path rendering.",
+            "Each caption follows its figure directly so extraction retains an unambiguous pair.",
+            "Review checks sharp rendering, readable labels, and the absence of clipping or overlap.",
+        ],
+        x=54,
+        y=250,
+        leading=26,
+        size=10,
+    )
+    canvas.setFont("Helvetica", 9)
+    canvas.drawRightString(558, 36, "Page 1")
+    canvas.showPage()
+    canvas.save()
+
+
+def _make_image_only_acceptance_pdf(path: Path) -> None:
+    canvas = _deterministic_canvas(path)
+    image = Image.new("RGB", (612, 792), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG", optimize=False, compress_level=9)
+    buffer.seek(0)
+    canvas.drawImage(ImageReader(buffer), 0, 0, width=612, height=792)
+    canvas.showPage()
+    canvas.save()
+
+
+def _write_acceptance_sidecars(fixture_dir: Path, fixture_name: str) -> None:
+    expected = {
+        "schema_version": "1.0",
+        "fixture": fixture_name,
+        "page_count": 2 if fixture_name in {
+            "technical-document-v1",
+            "table-report-v1",
+            "two-column-footnotes-v1",
+        } else 1,
+        "table_count": 2 if fixture_name == "table-report-v1" else 0,
+        "figure_count": 2 if fixture_name == "figures-captions-v1" else 0,
+        "footnote_count": 1 if fixture_name == "two-column-footnotes-v1" else 0,
+        "final_artifacts": ["manifest.json", "review-report.md", "translated.pdf"],
+    }
+    _write_json(fixture_dir / "expected.json", expected)
+    _write_json(fixture_dir / "glossary.json", {"workflow": "작업 흐름"})
+    (fixture_dir / "document-summary.txt").write_text(
+        f"{fixture_name} 결정론적 PDF 번역 승인 문서",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _write_json(
+        fixture_dir / "review.json",
+        {
+            "retries": {"zone-001": 0},
+            "section_findings": {
+                "zone-001": [
+                    {
+                        "dimension": dimension,
+                        "verdict": "pass",
+                        "evidence": f"Fixture review passed {dimension}.",
+                    }
+                    for dimension in _SEMANTIC_DIMENSIONS
+                ]
+            },
+            "unresolved_required": [],
+        },
+    )
+    page_count = int(expected["page_count"])
+    _write_json(
+        fixture_dir / "visual-review.json",
+        {
+            "schema_version": "1.0",
+            "staged_pdf_sha256": "0" * 64,
+            "pages_reviewed": list(range(1, page_count + 1)),
+            "contact_sheets_reviewed": {
+                "contact-sheet-001.png": list(range(1, page_count + 1))
+            },
+            "findings": {
+                dimension: {
+                    "verdict": "pass",
+                    "evidence": f"Fixture visual review passed {dimension}.",
+                }
+                for dimension in _VISUAL_DIMENSIONS
+            },
+            "unresolved_required": [],
+        },
+    )
+
+
+def _write_known_fixture_translations(fixture_dir: Path) -> None:
+    """Store reviewed Korean zone results matched to deterministic source IDs."""
+    with tempfile.TemporaryDirectory(prefix="pdf-fixture-") as temporary_name:
+        temporary = Path(temporary_name)
+        extract_pdf(
+            fixture_dir / "source.pdf",
+            temporary / "document.json",
+            temporary / "segments.jsonl",
+            temporary / "media",
+        )
+        records = [
+            json.loads(line)
+            for line in (temporary / "segments.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    translations = [
+        {
+            "segment_id": record["id"],
+            "text": "작업 흐름 workflow"
+            + "".join(token["token"] for token in record["protected"]),
+            "notes": None,
+            "glossary_observations": {},
+        }
+        for record in records
+        if record["target"]
+    ]
+    translations_dir = fixture_dir / "translations"
+    translations_dir.mkdir()
+    (translations_dir / "zone-001.jsonl").write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in translations
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+def _write_json(path: Path, value: object) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
