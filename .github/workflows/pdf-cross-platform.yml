@@ -17,7 +17,7 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install poppler -y
+          choco install poppler --version=22.11.0.20240421 -y
           $popplerRoot = Join-Path $env:ChocolateyInstall "lib\poppler\tools"
           $files = Get-ChildItem -Path $popplerRoot -Recurse -File -ErrorAction SilentlyContinue
           $pdfinfo = $files | Where-Object Name -eq 'pdfinfo.exe' | Select-Object -First 1

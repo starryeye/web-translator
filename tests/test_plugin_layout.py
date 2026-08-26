@@ -55,6 +55,15 @@ def test_font_license_is_marked_binary_to_preserve_pinned_bytes_on_windows() -> 
     ).read_text("utf-8")
 
 
+def test_windows_poppler_install_pins_binary_bearing_chocolatey_package() -> None:
+    workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
+
+    # Chocolatey's latest Poppler package is source-only, so it cannot supply
+    # the pdfinfo.exe and pdftoppm.exe binaries required by the Windows job.
+    assert "choco install poppler --version=22.11.0.20240421 -y" in workflow
+    assert "choco install poppler -y" not in workflow
+
+
 def test_windows_poppler_diagnostic_braces_variable_before_colon() -> None:
     workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
 

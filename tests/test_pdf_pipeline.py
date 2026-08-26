@@ -38,10 +38,7 @@ _PRESERVED_IDENTIFIER = re.compile(
 _PRESERVED_ACRONYM = re.compile(
     r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])"
 )
-_ENGLISH_PROSE_SEQUENCE = re.compile(
-    r"(?<![A-Za-z])[A-Za-z]+(?:-[A-Za-z]+)?"
-    r"(?:[ \t]+[A-Za-z]+(?:-[A-Za-z]+)?)+(?![A-Za-z])"
-)
+_LATIN_ALPHABET = re.compile(r"[A-Za-z]")
 _SEMANTIC_ORACLE = {
     "technical-document-v1": {
         "Deterministic Systems Review": "결정론적 시스템 검토",
@@ -210,8 +207,8 @@ def _assert_committed_fixture_semantics(
             translation_body,
             source_body,
         )
-        assert _ENGLISH_PROSE_SEQUENCE.search(prose_candidate) is None, (
-            f"English prose remains in translation: {translation!r}"
+        assert _LATIN_ALPHABET.search(prose_candidate) is None, (
+            f"Latin alphabet remains in translation: {translation!r}"
         )
         normalized_translations[source] = translation_body
 
@@ -333,7 +330,40 @@ def test_semantic_oracle_rejects_unprotected_uppercase_english_prose() -> None:
         {"segment_id": "seg-000001", "text": translation}
     ]
 
-    with pytest.raises(AssertionError, match="English prose remains"):
+    with pytest.raises(AssertionError, match="Latin alphabet remains"):
+        _assert_committed_fixture_semantics(
+            "mutation",
+            segments,
+            records,
+            {source: translation},
+        )
+
+
+@pytest.mark.parametrize(
+    "translation",
+    [
+        "한국어 설명 SECRET",
+        "한국어 https://evil.example/x",
+    ],
+    ids=["single-unapproved-acronym", "source-absent-url"],
+)
+def test_semantic_oracle_rejects_any_source_absent_latin_span(
+    translation: str,
+) -> None:
+    source = "Ordinary source sentence."
+    segments: list[dict[str, object]] = [
+        {
+            "id": "seg-000001",
+            "source_text": source,
+            "protected": [],
+            "target": True,
+        }
+    ]
+    records: list[dict[str, object]] = [
+        {"segment_id": "seg-000001", "text": translation}
+    ]
+
+    with pytest.raises(AssertionError, match="Latin alphabet remains"):
         _assert_committed_fixture_semantics(
             "mutation",
             segments,
