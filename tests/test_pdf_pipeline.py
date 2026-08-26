@@ -13,10 +13,13 @@ from pypdf import PdfReader
 import web_translator.pdf_qa as pdf_qa_module
 import web_translator.pdf_report as pdf_report_module
 import web_translator.network as network_module
+import web_translator.pdf_media as pdf_media_module
 from web_translator.cli import main
 from tests import pdf_fixtures
 from tests.pdf_fixtures import make_many_pages_pdf, make_oversized_pdf
+from tests.test_pdf_extract import _column_pdf, _ruled_table_pdf
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
+from web_translator.pdf_media import PdfMediaError
 from web_translator.pdf_report import build_pdf_manifest
 from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_pdf_run
 
@@ -250,6 +253,43 @@ def test_cli_limit_rejections_never_publish_final_output(
     result = acquire if stage == "pdf-acquire" else main(["pdf-extract", "--run-dir", str(run_dir)])
     assert result == expected_exit
     assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "builder", [lambda path: _column_pdf(path, columns=3), lambda path: _ruled_table_pdf(path, crossing_border=True)]
+)
+def test_cli_ambiguous_extraction_rejections_never_publish(
+    tmp_path: Path, builder: object
+) -> None:
+    source = builder(tmp_path / "input.pdf")  # type: ignore[operator]
+    run_dir = tmp_path / "run"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
+    assert not (tmp_path / "final").exists()
+
+
+def test_cli_pdf_qa_finalize_rejects_stale_review_and_collision(
+    assembled_pdf_run: PdfQARun, tmp_path: Path
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir, staged_sha256="0" * 64)
+    assert main(["pdf-qa", "finalize", "--run-dir", str(assembled_pdf_run.run_dir), "--output-dir", str(assembled_pdf_run.output_dir)]) == 6
+    assert not assembled_pdf_run.output_dir.exists()
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    assembled_pdf_run.output_dir.mkdir(parents=True)
+    assert main(["pdf-qa", "finalize", "--run-dir", str(assembled_pdf_run.run_dir), "--output-dir", str(assembled_pdf_run.output_dir)]) == 6
+    assert list(assembled_pdf_run.output_dir.iterdir()) == []
+
+
+def test_cli_pdf_extract_rejects_missing_poppler_without_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pdf_media_module, "find_poppler", lambda: (_ for _ in ()).throw(PdfMediaError("missing pdfinfo and pdftoppm")))
+    run_dir = tmp_path / "run"
+    source = PDF_FIXTURE_ROOT / "figures-captions-v1" / "source.pdf"
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
+    assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
+    assert not (tmp_path / "final").exists()
 
 
 @pytest.fixture
