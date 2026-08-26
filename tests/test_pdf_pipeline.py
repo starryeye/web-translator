@@ -119,12 +119,21 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
         page.extract_text() or "" for page in PdfReader(output_dir / "translated.pdf").pages
     )
     assert expected["expected_korean_phrase"] in translated_text
-    assert translated_text.count("workflow(작업 흐름)") == 1
+    assert "workflow(작업 흐름)" not in translated_text
     records = [
         json.loads(line)
         for line in (fixture_dir / "translations" / "zone-001.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert len({record["text"] for record in records}) > 1
+    source_by_id = {
+        json.loads(line)["id"]: json.loads(line)["source_text"]
+        for line in (run_dir / "segments.jsonl").read_text(encoding="utf-8").splitlines()
+    }
+    assert all(
+        record["text"] != source_by_id[record["segment_id"]]
+        for record in records
+        if any(character.isalpha() for character in source_by_id[record["segment_id"]])
+    )
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["inspection"]["page_count"] == expected["page_count"]
     assert manifest["output"]["figure_count"] == expected["figure_count"]

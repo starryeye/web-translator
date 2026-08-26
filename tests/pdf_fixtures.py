@@ -620,7 +620,7 @@ def _write_acceptance_sidecars(fixture_dir: Path, fixture_name: str) -> None:
         "footnote_count": 1 if fixture_name == "two-column-footnotes-v1" else 0,
         "expected_korean_phrase": {
             "technical-document-v1": "결정론적 시스템 검토",
-            "table-report-v1": "번역 품질 표 보고서",
+            "table-report-v1": "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.",
             "two-column-footnotes-v1": "두 열 증거 검토",
             "figures-captions-v1": "그림과 캡션",
         }[fixture_name],
@@ -655,11 +655,9 @@ def _write_acceptance_sidecars(fixture_dir: Path, fixture_name: str) -> None:
         {
             "schema_version": "1.0",
             "staged_pdf_sha256": "0" * 64,
-            "pages_reviewed": [1, 2] if fixture_name == "table-report-v1" else [1],
+            "pages_reviewed": [1],
             "contact_sheets_reviewed": {
-                "contact-sheet-001.png": [1, 2]
-                if fixture_name == "table-report-v1"
-                else [1]
+                "contact-sheet-001.png": [1]
             },
             "findings": {
                 dimension: {
@@ -688,16 +686,10 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
             for line in (temporary / "segments.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-    korean_context = {
-        "technical-document-v1": "결정론적 시스템 검토",
-        "table-report-v1": "번역 품질 표 보고서",
-        "two-column-footnotes-v1": "두 열 증거 검토",
-        "figures-captions-v1": "그림과 캡션",
-    }[fixture_dir.name]
     translations = [
         {
             "segment_id": record["id"],
-            "text": f"{korean_context}: {record['source_text']} workflow"
+            "text": _FIXTURE_KOREAN_TRANSLATIONS[record["source_text"]]
             + "".join(token["token"] for token in record["protected"]),
             "notes": None,
             "glossary_observations": {},
@@ -705,6 +697,8 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
         for record in records
         if record["target"]
     ]
+    if len(translations) != sum(record["target"] for record in records):
+        raise AssertionError("fixture translation mapping must cover every target")
     translations_dir = fixture_dir / "translations"
     translations_dir.mkdir()
     (translations_dir / "zone-001.jsonl").write_text(
@@ -715,6 +709,30 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
+_FIXTURE_KOREAN_TRANSLATIONS = {
+    "Deterministic Systems Review": "결정론적 시스템 검토",
+    "Operational Verification": "운영 검증",
+    "A deterministic workflow preserves source order, stable identifiers, and review evidence.": "결정론적 작업 흐름은 원본 순서, 안정적인 식별자 및 검토 증거를 보존합니다.",
+    "The translation system validates every protected token before assembly begins.": "번역 시스템은 조립을 시작하기 전에 모든 보호 토큰을 검증합니다.",
+    "Reviewers compare semantic fidelity, terminology, and qualification preservation.": "검토자는 의미 충실도, 용어 및 한정 표현 보존을 비교합니다.",
+    "The release artifact contains the translated PDF, manifest, and review report only.": "릴리스 산출물에는 번역된 PDF, 매니페스트 및 검토 보고서만 포함됩니다.",
+    "Automated checks confirm selectable Korean text, embedded fonts, and complete page renders.": "자동 검사는 선택 가능한 한국어 텍스트, 포함된 글꼴 및 완전한 페이지 렌더링을 확인합니다.",
+    "Contact sheets cover each output page exactly once and bind review to the staged digest.": "연락처 시트는 각 출력 페이지를 정확히 한 번 포함하고 검토를 스테이징 다이제스트에 연결합니다.",
+    "A failed check keeps private staging intact and never publishes a partial final directory.": "실패한 검사는 비공개 스테이징을 그대로 유지하고 부분 최종 디렉터리를 게시하지 않습니다.",
+    "This fixture provides stable technical prose for repeatable end-to-end acceptance testing.": "이 픽스처는 반복 가능한 종단 간 승인 테스트를 위한 안정적인 기술 문서를 제공합니다.",
+    "Figures and Captions": "그림과 캡션",
+    "Raster and vector evidence must remain paired with the correct explanatory caption.": "래스터 및 벡터 증거는 올바른 설명 캡션과 연결된 상태를 유지해야 합니다.",
+    "Figure 1. Raster workflow status panel.": "그림 1. 래스터 작업 흐름 상태 패널.",
+    "Figure 2. Vector review coverage trend.": "그림 2. 벡터 검토 범위 추세.",
+    "The raster panel verifies image preservation and the vector plot verifies path rendering. Each caption follows its figure directly so extraction retains an unambiguous pair. Review checks sharp rendering, readable labels, and the absence of clipping or overlap.": "래스터 패널은 이미지 보존을 검증하고 벡터 그래프는 경로 렌더링을 검증합니다. 각 캡션은 해당 그림 바로 뒤에 배치되어 추출 시 모호하지 않은 쌍을 유지합니다. 검토는 선명한 렌더링, 읽기 쉬운 레이블 및 잘림이나 겹침이 없음을 확인합니다.",
+    "Two-Column Evidence Review": "두 열 증거 검토", "Column 1 first logical sentence. Column 1 second logical sentence.": "첫 번째 열의 첫 논리 문장입니다. 첫 번째 열의 두 번째 논리 문장입니다.", "Column 2 first logical sentence. Column 2 second logical sentence.": "두 번째 열의 첫 논리 문장입니다. 두 번째 열의 두 번째 논리 문장입니다.",
+    "Page-Local Footnote Evidence": "페이지 내 각주 증거", "Source order is validated before bounded zone planning begins.": "제한된 영역 계획을 시작하기 전에 원본 순서를 검증합니다.", "Contact-sheet evidence covers every rendered output page exactly once.": "연락처 시트는 렌더링된 각 출력 페이지를 정확히 한 번 포함합니다.", "Semantic review checks every required quality dimension.": "의미 검토는 모든 필수 품질 기준을 확인합니다.", "Validated Korean text remains selectable in the staged PDF.": "검증된 한국어 텍스트는 스테이징 PDF에서 선택 가능한 상태로 유지됩니다.", "Automated QA records exact output and contact-sheet page counts.": "자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록합니다.", "Final publication exposes exactly three reviewed artifacts.": "최종 게시에는 검토된 세 가지 산출물만 공개됩니다.", "The deterministic workflow includes a page-local note 1": "결정론적 작업 흐름에는 페이지 내 주석 1이 포함됩니다.", "1 Footnote evidence remains linked to its marker.": "1 각주 증거는 해당 표식에 연결된 상태로 유지됩니다.",
+    "Semantic review checks every required quality dimension. Validated Korean text remains selectable in the staged PDF. Automated QA records exact output and contact-sheet page counts. Final publication exposes exactly three reviewed artifacts.": "의미 검토는 모든 필수 품질 기준을 확인하며, 검증된 한국어 텍스트는 스테이징 PDF에서 선택 가능하게 유지됩니다. 자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록하고 최종 게시에는 검토된 세 가지 산출물만 공개됩니다.",
+    "First half measurements summarize deterministic acceptance outcomes for the release.": "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.", "Second half measurements summarize deterministic acceptance outcomes for the release.": "하반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.", "First half metrics": "상반기 지표", "Second half metrics": "하반기 지표", "Measure": "측정 항목", "Observed": "관찰값", "Required": "필수값", "Selectable characters": "선택 가능한 문자", "At least 100": "최소 100개", "Reviewed pages": "검토한 페이지", "Required findings": "필수 지적 사항", "Published artifacts": "게시된 산출물", "Merged header cells retain their logical span and all body rows remain readable. The same report structure continues on the next page without losing table evidence.": "병합된 머리글 셀은 논리적 범위를 유지하고 모든 본문 행은 계속 읽을 수 있습니다. 동일한 보고서 구조는 표 증거를 잃지 않고 다음 페이지로 이어집니다.",
+    "0": "0", "1": "1", "2": "2", "3": "3", "240": "240", "Page 1": "1쪽", "Page 2": "2쪽",
+}
 def _write_json(path: Path, value: object) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

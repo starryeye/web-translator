@@ -1,8 +1,7 @@
 {
   "contact_sheets_reviewed": {
     "contact-sheet-001.png": [
-      1,
-      2
+      1
     ]
   },
   "findings": {
@@ -40,8 +39,7 @@
     }
   },
   "pages_reviewed": [
-    1,
-    2
+    1
   ],
   "schema_version": "1.0",
   "staged_pdf_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
