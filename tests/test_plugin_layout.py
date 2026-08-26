@@ -53,3 +53,10 @@ def test_font_license_is_marked_binary_to_preserve_pinned_bytes_on_windows() -> 
     assert "src/web_translator/font_assets/OFL.txt -text" in (
         ROOT / ".gitattributes"
     ).read_text("utf-8")
+
+
+def test_windows_poppler_diagnostic_braces_variable_before_colon() -> None:
+    workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
+
+    assert 'Write-Host "Poppler files under ${popplerRoot}:`n' in workflow
+    assert 'Write-Host "Poppler files under $popplerRoot:`n' not in workflow

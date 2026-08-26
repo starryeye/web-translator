@@ -23,7 +23,7 @@ jobs:
           $pdfinfo = $files | Where-Object Name -eq 'pdfinfo.exe' | Select-Object -First 1
           if ($null -eq $pdfinfo) {
             $listing = $files | ForEach-Object { $_.FullName.Substring($popplerRoot.Length) } | Select-Object -First 100
-            Write-Host "Poppler files under $popplerRoot:`n$($listing -join [Environment]::NewLine)"
+            Write-Host "Poppler files under ${popplerRoot}:`n$($listing -join [Environment]::NewLine)"
             throw "Chocolatey Poppler installation did not provide pdfinfo.exe under $popplerRoot."
           }
           $popplerBin = $pdfinfo.Directory.FullName

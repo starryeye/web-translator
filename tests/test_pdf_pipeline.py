@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 import re
@@ -26,21 +27,319 @@ from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_
 
 PDF_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "pdf"
 _KOREAN_SYLLABLE = re.compile(r"[가-힣]")
+_PROTECTED_TOKEN = re.compile(r"⟦WT:\d{6}⟧")
+_PRESERVED_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_PRESERVED_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"[A-Za-z][A-Za-z0-9-]*(?:[_./:][A-Za-z0-9-]+)+"
+    r"|[A-Za-z][A-Za-z_-]*\d[A-Za-z0-9_-]*"
+    r")(?![A-Za-z0-9_])"
+)
+_PRESERVED_ACRONYM = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])"
+)
+_ENGLISH_PROSE_SEQUENCE = re.compile(
+    r"(?<![A-Za-z])[A-Za-z]+(?:-[A-Za-z]+)?"
+    r"(?:[ \t]+[A-Za-z]+(?:-[A-Za-z]+)?)+(?![A-Za-z])"
+)
 _SEMANTIC_ORACLE = {
-    "technical-document-v1": (
-        "Deterministic Systems Review",
-        "결정론적 시스템 검토",
-    ),
-    "table-report-v1": (
-        "First half measurements summarize deterministic acceptance outcomes for the release.",
-        "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.",
-    ),
-    "two-column-footnotes-v1": (
-        "Two-Column Evidence Review",
-        "두 열 증거 검토",
-    ),
-    "figures-captions-v1": ("Figures and Captions", "그림과 캡션"),
+    "technical-document-v1": {
+        "Deterministic Systems Review": "결정론적 시스템 검토",
+        "A deterministic workflow preserves source order, stable identifiers, and review evidence.": (
+            "결정론적 작업 흐름은 원본 순서, 안정적인 식별자 및 검토 증거를 "
+            "보존합니다."
+        ),
+        "The translation system validates every protected token before assembly begins.": (
+            "번역 시스템은 조립을 시작하기 전에 모든 보호 토큰을 검증합니다."
+        ),
+        "Reviewers compare semantic fidelity, terminology, and qualification preservation.": (
+            "검토자는 의미 충실도, 용어 및 한정 표현 보존을 비교합니다."
+        ),
+        "The release artifact contains the translated PDF, manifest, and review report only.": (
+            "릴리스 산출물에는 번역된 PDF, 매니페스트 및 검토 보고서만 포함됩니다."
+        ),
+        "Page 1": "1쪽",
+        "Operational Verification": "운영 검증",
+        "Automated checks confirm selectable Korean text, embedded fonts, and complete page renders.": (
+            "자동 검사는 선택 가능한 한국어 텍스트, 포함된 글꼴 및 완전한 페이지 렌더링을 "
+            "확인합니다."
+        ),
+        "Contact sheets cover each output page exactly once and bind review to the staged digest.": (
+            "연락처 시트는 각 출력 페이지를 정확히 한 번 포함하고 검토를 스테이징 다이제스트에 "
+            "연결합니다."
+        ),
+        "A failed check keeps private staging intact and never publishes a partial final directory.": (
+            "실패한 검사는 비공개 스테이징을 그대로 유지하고 부분 최종 디렉터리를 게시하지 "
+            "않습니다."
+        ),
+        "This fixture provides stable technical prose for repeatable end-to-end acceptance testing.": (
+            "이 픽스처는 반복 가능한 종단 간 승인 테스트를 위한 안정적인 기술 문서를 제공합니다."
+        ),
+        "Page 2": "2쪽",
+    },
+    "table-report-v1": {
+        "First half measurements summarize deterministic acceptance outcomes for the release.": (
+            "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다."
+        ),
+        "First half metrics": "상반기 지표",
+        "Measure": "측정 항목",
+        "Observed": "관찰값",
+        "Required": "필수값",
+        "Selectable characters": "선택 가능한 문자",
+        "At least 100": "최소 100개",
+        "Reviewed pages": "검토한 페이지",
+        "Required findings": "필수 지적 사항",
+        "Published artifacts": "게시된 산출물",
+        "Merged header cells retain their logical span and all body rows remain readable. The same report structure continues on the next page without losing table evidence.": (
+            "병합된 머리글 셀은 논리적 범위를 유지하고 모든 본문 행은 계속 읽을 수 있습니다. "
+            "동일한 보고서 구조는 표 증거를 잃지 않고 다음 페이지로 이어집니다."
+        ),
+        "Page 1": "1쪽",
+        "Second half measurements summarize deterministic acceptance outcomes for the release.": (
+            "하반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다."
+        ),
+        "Second half metrics": "하반기 지표",
+        "Page 2": "2쪽",
+    },
+    "two-column-footnotes-v1": {
+        "Two-Column Evidence Review": "두 열 증거 검토",
+        "Column 1 first logical sentence. Column 1 second logical sentence.": (
+            "첫 번째 열의 첫 논리 문장입니다. 첫 번째 열의 두 번째 논리 문장입니다."
+        ),
+        "Column 2 first logical sentence. Column 2 second logical sentence.": (
+            "두 번째 열의 첫 논리 문장입니다. 두 번째 열의 두 번째 논리 문장입니다."
+        ),
+        "Page-Local Footnote Evidence": "페이지 내 각주 증거",
+        "Source order is validated before bounded zone planning begins.": (
+            "제한된 영역 계획을 시작하기 전에 원본 순서를 검증합니다."
+        ),
+        "Contact-sheet evidence covers every rendered output page exactly once.": (
+            "연락처 시트는 렌더링된 각 출력 페이지를 정확히 한 번 포함합니다."
+        ),
+        "Semantic review checks every required quality dimension. Validated Korean text remains selectable in the staged PDF. Automated QA records exact output and contact-sheet page counts. Final publication exposes exactly three reviewed artifacts.": (
+            "의미 검토는 모든 필수 품질 기준을 확인하며, 검증된 한국어 텍스트는 스테이징 PDF에서 선택 "
+            "가능하게 유지됩니다. 자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록하고 최종 "
+            "게시에는 검토된 세 가지 산출물만 공개됩니다."
+        ),
+        "The deterministic workflow includes a page-local note 1": (
+            "결정론적 작업 흐름에는 페이지 내 주석 1이 포함됩니다."
+        ),
+        "1 Footnote evidence remains linked to its marker.": (
+            "1 각주 증거는 해당 표식에 연결된 상태로 유지됩니다."
+        ),
+    },
+    "figures-captions-v1": {
+        "Figures and Captions": "그림과 캡션",
+        "Raster and vector evidence must remain paired with the correct explanatory caption.": (
+            "래스터 및 벡터 증거는 올바른 설명 캡션과 연결된 상태를 유지해야 합니다."
+        ),
+        "Figure 1. Raster workflow status panel.": (
+            "그림 1. 래스터 작업 흐름 상태 패널."
+        ),
+        "Figure 2. Vector review coverage trend.": "그림 2. 벡터 검토 범위 추세.",
+        "The raster panel verifies image preservation and the vector plot verifies path rendering. Each caption follows its figure directly so extraction retains an unambiguous pair. Review checks sharp rendering, readable labels, and the absence of clipping or overlap.": (
+            "래스터 패널은 이미지 보존을 검증하고 벡터 그래프는 경로 렌더링을 검증합니다. 각 캡션은 "
+            "해당 그림 바로 뒤에 배치되어 추출 시 모호하지 않은 쌍을 유지합니다. 검토는 선명한 렌더링, "
+            "읽기 쉬운 레이블 및 잘림이나 겹침이 없음을 확인합니다."
+        ),
+        "Page 1": "1쪽",
+    },
 }
+
+
+def _without_protected_tokens(text: str, protected_tokens: list[str]) -> str:
+    for token in protected_tokens:
+        text = text.replace(token, "")
+    return " ".join(text.split())
+
+
+def _without_allowed_preserved_latin(text: str, source_text: str) -> str:
+    for pattern in (_PRESERVED_URL, _PRESERVED_IDENTIFIER, _PRESERVED_ACRONYM):
+        allowed = {match.group(0) for match in pattern.finditer(source_text)}
+        text = pattern.sub(
+            lambda match: " " if match.group(0) in allowed else match.group(0),
+            text,
+        )
+    return text
+
+
+def _assert_committed_fixture_semantics(
+    fixture_name: str,
+    segments: list[dict[str, object]],
+    records: list[dict[str, object]],
+    expected_pairs: dict[str, str] | None = None,
+) -> None:
+    target_by_id = {
+        str(segment["id"]): segment
+        for segment in segments
+        if segment["target"]
+    }
+    translation_by_id = {
+        str(record["segment_id"]): str(record["text"])
+        for record in records
+    }
+    assert set(translation_by_id) == set(target_by_id)
+
+    oracle = expected_pairs if expected_pairs is not None else _SEMANTIC_ORACLE[fixture_name]
+    actual_pairs: dict[str, str] = {}
+    normalized_translations: dict[str, str] = {}
+    for segment_id, segment in target_by_id.items():
+        source = str(segment["source_text"])
+        translation = translation_by_id[segment_id]
+        protected = segment["protected"]
+        assert isinstance(protected, list)
+        protected_tokens = [str(token["token"]) for token in protected]
+        expected_token_counts = Counter(protected_tokens)
+        assert Counter(_PROTECTED_TOKEN.findall(source)) == expected_token_counts
+        assert Counter(_PROTECTED_TOKEN.findall(translation)) == expected_token_counts
+
+        if not any(character.isalpha() for character in source):
+            continue
+        previous = actual_pairs.setdefault(source, translation)
+        assert previous == translation, f"repeated source changed translation: {source!r}"
+
+        source_body = _without_protected_tokens(source, protected_tokens)
+        translation_body = _without_protected_tokens(translation, protected_tokens)
+        assert _KOREAN_SYLLABLE.search(translation_body), (
+            f"alphabetic source lacks Korean translation: {source!r}"
+        )
+        assert source_body.casefold() not in translation_body.casefold(), (
+            f"normalized source body remains in translation: {source!r}"
+        )
+        prose_candidate = _without_allowed_preserved_latin(
+            translation_body,
+            source_body,
+        )
+        assert _ENGLISH_PROSE_SEQUENCE.search(prose_candidate) is None, (
+            f"English prose remains in translation: {translation!r}"
+        )
+        normalized_translations[source] = translation_body
+
+    assert actual_pairs == oracle, "literal semantic oracle mismatch"
+    assert len(set(normalized_translations.values())) == len(normalized_translations), (
+        "distinct source meanings collapsed to a generic translated body"
+    )
+
+
+# Production mutations caught: a Korean label wrapped around protected-token-split
+# English source prose, or different generic Korean labels substituted for distinct
+# source meanings.
+@pytest.mark.parametrize(
+    ("second_source", "second_translation", "second_expected", "protected"),
+    [
+        (
+            "The source body uses ⟦WT:000001⟧ and protected content.",
+            "한국어 레이블: The source body uses and protected content. "
+            "⟦WT:000001⟧",
+            "원문 본문은 보호 토큰을 사용합니다. ⟦WT:000001⟧",
+            [
+                {
+                    "token": "⟦WT:000001⟧",
+                    "kind": "url",
+                    "value": "https://fixture.example/report",
+                }
+            ],
+        ),
+        (
+            "The translation system validates every protected token before assembly begins.",
+            "두 번째 일반 번역",
+            "번역 시스템은 조립을 시작하기 전에 모든 보호 토큰을 검증합니다.",
+            [],
+        ),
+    ],
+)
+def test_semantic_oracle_rejects_passthrough_and_generic_translation_mutations(
+    second_source: str,
+    second_translation: str,
+    second_expected: str,
+    protected: list[dict[str, str]],
+) -> None:
+    anchor_source = "Deterministic Systems Review"
+    anchor_translation = "결정론적 시스템 검토"
+    segments: list[dict[str, object]] = [
+        {
+            "id": "seg-000001",
+            "source_text": anchor_source,
+            "protected": [],
+            "target": True,
+        },
+        {
+            "id": "seg-000002",
+            "source_text": second_source,
+            "protected": protected,
+            "target": True,
+        },
+    ]
+    records: list[dict[str, object]] = [
+        {"segment_id": "seg-000001", "text": anchor_translation},
+        {"segment_id": "seg-000002", "text": second_translation},
+    ]
+
+    with pytest.raises(AssertionError):
+        _assert_committed_fixture_semantics(
+            "mutation",
+            segments,
+            records,
+            {
+                anchor_source: anchor_translation,
+                second_source: second_expected,
+            },
+        )
+
+
+def test_semantic_oracle_allows_exact_protected_url_acronym_and_identifier() -> None:
+    token = "⟦WT:000001⟧"
+    url = "https://docs.example/pdf"
+    source = f"Use PDF from {token} with {url} for build_id-7."
+    translation = f"한국어 설명 PDF {url} build_id-7 {token}"
+    segments: list[dict[str, object]] = [
+        {
+            "id": "seg-000001",
+            "source_text": source,
+            "protected": [
+                {
+                    "token": token,
+                    "kind": "url",
+                    "value": "https://fixture.example/report",
+                }
+            ],
+            "target": True,
+        }
+    ]
+    records: list[dict[str, object]] = [
+        {"segment_id": "seg-000001", "text": translation}
+    ]
+
+    _assert_committed_fixture_semantics(
+        "mutation",
+        segments,
+        records,
+        {source: translation},
+    )
+
+
+def test_semantic_oracle_rejects_unprotected_uppercase_english_prose() -> None:
+    source = "Ordinary source sentence."
+    translation = "한국어 레이블 THIS IS PASSTHROUGH"
+    segments: list[dict[str, object]] = [
+        {
+            "id": "seg-000001",
+            "source_text": source,
+            "protected": [],
+            "target": True,
+        }
+    ]
+    records: list[dict[str, object]] = [
+        {"segment_id": "seg-000001", "text": translation}
+    ]
+
+    with pytest.raises(AssertionError, match="English prose remains"):
+        _assert_committed_fixture_semantics(
+            "mutation",
+            segments,
+            records,
+            {source: translation},
+        )
 
 
 # Production mutation caught: nondeterministic or incomplete committed acceptance inputs.
@@ -149,39 +448,13 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
         for line in (fixture_dir / "translations" / "zone-001.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert len({record["text"] for record in records}) > 1
-    source_by_id = {
-        json.loads(line)["id"]: json.loads(line)["source_text"]
-        for line in (run_dir / "segments.jsonl").read_text(encoding="utf-8").splitlines()
-    }
-    translation_by_id = {record["segment_id"]: record["text"] for record in records}
-    oracle_source, oracle_korean = _SEMANTIC_ORACLE[fixture_name]
-    oracle_id = next(
-        segment_id
-        for segment_id, source_text in source_by_id.items()
-        if source_text == oracle_source
-    )
-    assert translation_by_id[oracle_id] == oracle_korean
-    assert all(
-        record["text"] != source_by_id[record["segment_id"]]
-        for record in records
-        if any(character.isalpha() for character in source_by_id[record["segment_id"]])
-    )
-    alphabetic = {
-        segment_id: source_text
-        for segment_id, source_text in source_by_id.items()
-        if any(character.isalpha() for character in source_text)
-    }
-    assert all(_KOREAN_SYLLABLE.search(translation_by_id[segment_id]) for segment_id in alphabetic)
-    assert all(source_text not in translation_by_id[segment_id] for segment_id, source_text in alphabetic.items())
-    by_source = {
-        source_text: translation_by_id[segment_id]
-        for segment_id, source_text in alphabetic.items()
-    }
-    assert len(set(by_source.values())) == len(by_source)
-    for line in (run_dir / "segments.jsonl").read_text(encoding="utf-8").splitlines():
-        segment = json.loads(line)
-        if segment["target"]:
-            assert all(token["token"] in translation_by_id[segment["id"]] for token in segment["protected"])
+    segments = [
+        json.loads(line)
+        for line in (run_dir / "segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    _assert_committed_fixture_semantics(fixture_name, segments, records)
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["inspection"]["page_count"] == expected["page_count"]
     assert manifest["output"]["figure_count"] == expected["figure_count"]
