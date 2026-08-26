@@ -19,10 +19,16 @@ jobs:
         run: |
           choco install poppler -y
           $popplerRoot = Join-Path $env:ChocolateyInstall "lib\poppler\tools"
-          $pdfinfo = Get-ChildItem $popplerRoot -Filter pdfinfo.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $pdfinfo) { throw "Chocolatey Poppler installation did not provide pdfinfo.exe under $popplerRoot." }
+          $files = Get-ChildItem -Path $popplerRoot -Recurse -File -ErrorAction SilentlyContinue
+          $pdfinfo = $files | Where-Object Name -eq 'pdfinfo.exe' | Select-Object -First 1
+          if ($null -eq $pdfinfo) {
+            $listing = $files | ForEach-Object { $_.FullName.Substring($popplerRoot.Length) } | Select-Object -First 100
+            Write-Host "Poppler files under $popplerRoot:`n$($listing -join [Environment]::NewLine)"
+            throw "Chocolatey Poppler installation did not provide pdfinfo.exe under $popplerRoot."
+          }
           $popplerBin = $pdfinfo.Directory.FullName
-          if (-not (Test-Path (Join-Path $popplerBin "pdftoppm.exe"))) { throw "Chocolatey Poppler installation did not provide pdftoppm.exe beside pdfinfo.exe." }
+          $pdftoppm = $files | Where-Object { $_.Name -eq 'pdftoppm.exe' -and $_.Directory.FullName -eq $popplerBin } | Select-Object -First 1
+          if ($null -eq $pdftoppm) { throw "Chocolatey Poppler installation did not provide pdftoppm.exe beside pdfinfo.exe." }
           $popplerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: python -m pip install --upgrade pip build
       - run: python -m build
