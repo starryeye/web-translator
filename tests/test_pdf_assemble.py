@@ -1606,6 +1606,135 @@ def test_windows_file_rename_info_uses_relative_no_replace_contract(
     assert payload[name_offset:] == encoded
 
 
+def test_windows_rename_open_file_uses_native_relative_information_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching back to the Win32 class-3 wrapper breaks held-root renames."""
+    import ctypes
+
+    calls: list[tuple[int, int, bytes]] = []
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    def native_rename(
+        source_handle: object,
+        _status_block: object,
+        payload: object,
+        payload_size: object,
+        information_class: object,
+    ) -> int:
+        size = int(payload_size)
+        calls.append(
+            (
+                int(source_handle),
+                int(information_class),
+                ctypes.string_at(payload, size),
+            )
+        )
+        return 0
+
+    class FakeNtdll:
+        NtSetInformationFile = FakeCall(native_rename)
+
+    def load_library(name: str, **_kwargs: object) -> FakeNtdll:
+        assert name == "ntdll"
+        return FakeNtdll()
+
+    monkeypatch.setattr(ctypes, "WinDLL", load_library, raising=False)
+
+    pdf_assemble_module._windows_rename_open_file(501, 702, "translated.pdf")
+
+    assert len(calls) == 1
+    source_handle, information_class, payload = calls[0]
+    assert source_handle == 501
+    assert information_class == 10
+    assert struct.unpack_from("<Q", payload, 8) == (702,)
+    assert payload[20:] == "translated.pdf".encode("utf-16-le")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the real Windows NT filesystem ABI")
+def test_windows_native_relative_rename_moves_to_held_destination(
+    tmp_path: Path,
+) -> None:
+    """The real Windows syscall must accept a held destination root handle."""
+    source_directory = tmp_path / "source 경로"
+    destination_directory = tmp_path / "destination 경로"
+    source_directory.mkdir()
+    destination_directory.mkdir()
+    (source_directory / "staged.pdf").write_bytes(b"owned translated PDF")
+    source_anchor = pdf_assemble_module._open_directory_anchor(source_directory, "source")
+    destination_anchor = pdf_assemble_module._open_directory_anchor(
+        destination_directory,
+        "destination",
+    )
+    source_handle: int | None = None
+    try:
+        source_handle = pdf_assemble_module._windows_open_relative_file(
+            pdf_assemble_module._windows_anchor_handle(source_anchor),
+            "staged.pdf",
+        )
+        pdf_assemble_module._windows_rename_open_file(
+            source_handle,
+            pdf_assemble_module._windows_anchor_handle(destination_anchor),
+            "번역 결과.pdf",
+        )
+    finally:
+        if source_handle is not None:
+            pdf_assemble_module.pdf_acquire_module._close_windows_handle(source_handle)
+        source_anchor.close()
+        destination_anchor.close()
+
+    assert not (source_directory / "staged.pdf").exists()
+    assert (destination_directory / "번역 결과.pdf").read_bytes() == b"owned translated PDF"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the real Windows NT filesystem ABI")
+def test_windows_native_relative_rename_never_clobbers_existing_destination(
+    tmp_path: Path,
+) -> None:
+    """A native relative rename must preserve a raced destination byte-for-byte."""
+    source_directory = tmp_path / "source"
+    destination_directory = tmp_path / "destination"
+    source_directory.mkdir()
+    destination_directory.mkdir()
+    source = source_directory / "staged.pdf"
+    destination = destination_directory / "translated.pdf"
+    source.write_bytes(b"owned translated PDF")
+    destination.write_bytes(b"foreign racer")
+    source_anchor = pdf_assemble_module._open_directory_anchor(source_directory, "source")
+    destination_anchor = pdf_assemble_module._open_directory_anchor(
+        destination_directory,
+        "destination",
+    )
+    source_handle: int | None = None
+    try:
+        source_handle = pdf_assemble_module._windows_open_relative_file(
+            pdf_assemble_module._windows_anchor_handle(source_anchor),
+            source.name,
+        )
+        with pytest.raises(FileExistsError):
+            pdf_assemble_module._windows_rename_open_file(
+                source_handle,
+                pdf_assemble_module._windows_anchor_handle(destination_anchor),
+                destination.name,
+            )
+    finally:
+        if source_handle is not None:
+            pdf_assemble_module.pdf_acquire_module._close_windows_handle(source_handle)
+        source_anchor.close()
+        destination_anchor.close()
+
+    assert source.read_bytes() == b"owned translated PDF"
+    assert destination.read_bytes() == b"foreign racer"
+
+
 @pytest.mark.parametrize(
     ("operation", "expected"),
     [

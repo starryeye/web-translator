@@ -17,18 +17,25 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install poppler --version=22.11.0.20240421 -y
-          $popplerRoot = Join-Path $env:ChocolateyInstall "lib\poppler\tools"
-          $files = Get-ChildItem -Path $popplerRoot -Recurse -File -ErrorAction SilentlyContinue
-          $pdfinfo = $files | Where-Object Name -eq 'pdfinfo.exe' | Select-Object -First 1
-          if ($null -eq $pdfinfo) {
-            $listing = $files | ForEach-Object { $_.FullName.Substring($popplerRoot.Length) } | Select-Object -First 100
-            Write-Host "Poppler files under ${popplerRoot}:`n$($listing -join [Environment]::NewLine)"
-            throw "Chocolatey Poppler installation did not provide pdfinfo.exe under $popplerRoot."
+          $popplerUrl = "https://github.com/oschwartz10612/poppler-windows/releases/download/v26.02.0-0/Release-26.02.0-0.zip"
+          $expectedHash = "993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5"
+          $archive = Join-Path $env:RUNNER_TEMP "Release-26.02.0-0.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "Release-26.02.0-0"
+          Invoke-WebRequest -Uri $popplerUrl -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Poppler archive SHA256 mismatch: expected $expectedHash, got $actualHash."
           }
-          $popplerBin = $pdfinfo.Directory.FullName
-          $pdftoppm = $files | Where-Object { $_.Name -eq 'pdftoppm.exe' -and $_.Directory.FullName -eq $popplerBin } | Select-Object -First 1
-          if ($null -eq $pdftoppm) { throw "Chocolatey Poppler installation did not provide pdftoppm.exe beside pdfinfo.exe." }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+          $popplerBin = Join-Path $extractRoot "poppler-26.02.0\Library\bin"
+          $pdfinfo = Join-Path $popplerBin "pdfinfo.exe"
+          $pdftoppm = Join-Path $popplerBin "pdftoppm.exe"
+          if (-not (Test-Path -LiteralPath $pdfinfo -PathType Leaf)) { throw "Pinned Poppler archive did not provide pdfinfo.exe." }
+          if (-not (Test-Path -LiteralPath $pdftoppm -PathType Leaf)) { throw "Pinned Poppler archive did not provide pdftoppm.exe." }
+          & $pdfinfo -v
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pdfinfo.exe failed its runtime dependency check with exit code $LASTEXITCODE." }
+          & $pdftoppm -v
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pdftoppm.exe failed its runtime dependency check with exit code $LASTEXITCODE." }
           $popplerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: python -m pip install --upgrade pip build
       - run: python -m build
@@ -40,4 +47,7 @@ jobs:
           $wheel = Get-ChildItem dist -Filter *.whl | Select-Object -First 1
           python -m pip install "$($wheel.FullName)[test]"
         if: runner.os == 'Windows'
-      - run: python -m pytest tests/test_pdf_pipeline.py tests/test_plugin_layout.py -q
+      - run: >-
+          python -m pytest tests/test_pdf_pipeline.py tests/test_plugin_layout.py
+          tests/test_pdf_assemble.py::test_windows_native_relative_rename_moves_to_held_destination
+          tests/test_pdf_assemble.py::test_windows_native_relative_rename_never_clobbers_existing_destination -q

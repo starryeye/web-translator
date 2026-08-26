@@ -2823,17 +2823,41 @@ def _windows_rename_open_file(
         )
         buffer_size = len(payload)
         buffer = ctypes.create_string_buffer(payload, buffer_size)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        set_information = kernel32.SetFileInformationByHandle
+        # Use the native information class that consumes a held RootDirectory
+        # handle.  The Win32 class-3 wrapper rejects this relative form with
+        # ERROR_INVALID_PARAMETER on current Windows runners even though the
+        # underlying FileRenameInformation contract supports it.
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("status_or_pointer", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            )
+
+        status_block = IoStatusBlock()
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        set_information = ntdll.NtSetInformationFile
         set_information.argtypes = (
             wintypes.HANDLE,
-            ctypes.c_int,
+            ctypes.POINTER(IoStatusBlock),
             wintypes.LPVOID,
-            wintypes.DWORD,
+            ctypes.c_uint32,
+            ctypes.c_int32,
         )
-        set_information.restype = wintypes.BOOL
-        if not set_information(source_handle, 3, buffer, buffer_size):
-            raise ctypes.WinError(ctypes.get_last_error())
+        set_information.restype = ctypes.c_int32
+        status = int(
+            set_information(
+                source_handle,
+                ctypes.byref(status_block),
+                buffer,
+                buffer_size,
+                10,
+            )
+        )
+        if status < 0:
+            to_dos_error = ntdll.RtlNtStatusToDosError
+            to_dos_error.argtypes = (ctypes.c_int32,)
+            to_dos_error.restype = wintypes.ULONG
+            raise ctypes.WinError(int(to_dos_error(status)))
     except OSError as error:
         if getattr(error, "winerror", None) in {80, 183}:
             raise FileExistsError(

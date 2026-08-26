@@ -1,6 +1,10 @@
 import json
 from importlib.resources import files
+import os
 from pathlib import Path
+import subprocess
+
+import pytest
 
 from web_translator import __version__
 from web_translator.cli import main
@@ -55,17 +59,42 @@ def test_font_license_is_marked_binary_to_preserve_pinned_bytes_on_windows() -> 
     ).read_text("utf-8")
 
 
-def test_windows_poppler_install_pins_binary_bearing_chocolatey_package() -> None:
+def test_windows_poppler_install_pins_dependency_complete_archive() -> None:
     workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
 
-    # Chocolatey's latest Poppler package is source-only, so it cannot supply
-    # the pdfinfo.exe and pdftoppm.exe binaries required by the Windows job.
-    assert "choco install poppler --version=22.11.0.20240421 -y" in workflow
+    # This release packages its conda-forge runtime dependencies beside Poppler.
+    assert (
+        "https://github.com/oschwartz10612/poppler-windows/releases/download/"
+        "v26.02.0-0/Release-26.02.0-0.zip"
+    ) in workflow
+    assert "993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5" in workflow
+    assert "Get-FileHash" in workflow
+    assert "Expand-Archive" in workflow
+    assert "choco install poppler --version=22.11.0.20240421 -y" not in workflow
     assert "choco install poppler -y" not in workflow
 
 
-def test_windows_poppler_diagnostic_braces_variable_before_colon() -> None:
+def test_windows_poppler_install_gates_both_executables_before_path_export() -> None:
     workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
 
-    assert 'Write-Host "Poppler files under ${popplerRoot}:`n' in workflow
-    assert 'Write-Host "Poppler files under $popplerRoot:`n' not in workflow
+    pdfinfo_gate = workflow.index("& $pdfinfo -v")
+    pdftoppm_gate = workflow.index("& $pdftoppm -v")
+    path_export = workflow.index("$env:GITHUB_PATH")
+
+    assert pdfinfo_gate < pdftoppm_gate < path_export
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Poppler executables")
+@pytest.mark.parametrize("command", ["pdfinfo", "pdftoppm"])
+def test_windows_poppler_commands_load_with_all_runtime_dependencies(command: str) -> None:
+    """Executable discovery alone must not pass when a dependent DLL is absent."""
+    completed = subprocess.run(
+        [command, "-v"],
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
