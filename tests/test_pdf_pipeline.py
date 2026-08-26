@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
 
 import pytest
@@ -17,6 +18,22 @@ from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_
 
 
 PDF_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "pdf"
+_KOREAN_SYLLABLE = re.compile(r"[가-힣]")
+_SEMANTIC_ORACLE = {
+    "technical-document-v1": (
+        "Deterministic Systems Review",
+        "결정론적 시스템 검토",
+    ),
+    "table-report-v1": (
+        "First half measurements summarize deterministic acceptance outcomes for the release.",
+        "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.",
+    ),
+    "two-column-footnotes-v1": (
+        "Two-Column Evidence Review",
+        "두 열 증거 검토",
+    ),
+    "figures-captions-v1": ("Figures and Captions", "그림과 캡션"),
+}
 
 
 # Production mutation caught: nondeterministic or incomplete committed acceptance inputs.
@@ -129,11 +146,35 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
         json.loads(line)["id"]: json.loads(line)["source_text"]
         for line in (run_dir / "segments.jsonl").read_text(encoding="utf-8").splitlines()
     }
+    translation_by_id = {record["segment_id"]: record["text"] for record in records}
+    oracle_source, oracle_korean = _SEMANTIC_ORACLE[fixture_name]
+    oracle_id = next(
+        segment_id
+        for segment_id, source_text in source_by_id.items()
+        if source_text == oracle_source
+    )
+    assert translation_by_id[oracle_id] == oracle_korean
     assert all(
         record["text"] != source_by_id[record["segment_id"]]
         for record in records
         if any(character.isalpha() for character in source_by_id[record["segment_id"]])
     )
+    alphabetic = {
+        segment_id: source_text
+        for segment_id, source_text in source_by_id.items()
+        if any(character.isalpha() for character in source_text)
+    }
+    assert all(_KOREAN_SYLLABLE.search(translation_by_id[segment_id]) for segment_id in alphabetic)
+    assert all(source_text not in translation_by_id[segment_id] for segment_id, source_text in alphabetic.items())
+    by_source = {
+        source_text: translation_by_id[segment_id]
+        for segment_id, source_text in alphabetic.items()
+    }
+    assert len(set(by_source.values())) == len(by_source)
+    for line in (run_dir / "segments.jsonl").read_text(encoding="utf-8").splitlines():
+        segment = json.loads(line)
+        if segment["target"]:
+            assert all(token["token"] in translation_by_id[segment["id"]] for token in segment["protected"])
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["inspection"]["page_count"] == expected["page_count"]
     assert manifest["output"]["figure_count"] == expected["figure_count"]
