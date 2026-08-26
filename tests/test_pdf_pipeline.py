@@ -4,14 +4,18 @@ import json
 from pathlib import Path
 import re
 import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from pypdf import PdfReader
 
 import web_translator.pdf_qa as pdf_qa_module
 import web_translator.pdf_report as pdf_report_module
+import web_translator.network as network_module
 from web_translator.cli import main
 from tests import pdf_fixtures
+from tests.pdf_fixtures import make_many_pages_pdf, make_oversized_pdf
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
 from web_translator.pdf_report import build_pdf_manifest
 from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_pdf_run
@@ -194,6 +198,57 @@ def test_committed_pdf_rejections_never_publish_final_output(
         assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
     else:
         assert acquire == 3
+    assert not output_dir.exists()
+
+
+def test_http_pdf_acquire_and_extract_uses_real_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = (PDF_FIXTURE_ROOT / "technical-document-v1" / "source.pdf").read_bytes()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(source)))
+            self.end_headers()
+            self.wfile.write(source)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(network_module, "_resolve_public_addresses", lambda host, port: ["127.0.0.1"])
+    run_dir = tmp_path / "http-run"
+    url = f"http://fixture.example:{server.server_port}/source.pdf"
+    try:
+        assert main(["pdf-acquire", url, "--run-dir", str(run_dir)]) == 0
+        assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    record = json.loads((run_dir / "source.json").read_text(encoding="utf-8"))
+    assert record["input_kind"] == "public"
+    assert record["final_source"] == url
+    assert record["sha256"] == __import__("hashlib").sha256(source).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("builder", "stage", "expected_exit"),
+    [(make_oversized_pdf, "pdf-acquire", 3), (make_many_pages_pdf, "pdf-extract", 4)],
+)
+def test_cli_limit_rejections_never_publish_final_output(
+    tmp_path: Path, builder: object, stage: str, expected_exit: int
+) -> None:
+    source = builder(tmp_path / "input.pdf")  # type: ignore[operator]
+    run_dir = tmp_path / "run"
+    output_dir = tmp_path / "final"
+    acquire = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
+    result = acquire if stage == "pdf-acquire" else main(["pdf-extract", "--run-dir", str(run_dir)])
+    assert result == expected_exit
     assert not output_dir.exists()
 
 
