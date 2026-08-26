@@ -17,16 +17,9 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $popplerUrl = "https://github.com/oschwartz10612/poppler-windows/releases/download/v26.02.0-0/Release-26.02.0-0.zip"
-          $expectedHash = "993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5"
-          $archive = Join-Path $env:RUNNER_TEMP "Release-26.02.0-0.zip"
           $extractRoot = Join-Path $env:RUNNER_TEMP "Release-26.02.0-0"
-          Invoke-WebRequest -Uri $popplerUrl -OutFile $archive
-          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualHash -ne $expectedHash) {
-            throw "Poppler archive SHA256 mismatch: expected $expectedHash, got $actualHash."
-          }
-          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+          python scripts/install_pinned_poppler.py --destination-root $extractRoot
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Poppler bootstrap failed with exit code $LASTEXITCODE." }
           $popplerBin = Join-Path $extractRoot "poppler-26.02.0\Library\bin"
           $pdfinfo = Join-Path $popplerBin "pdfinfo.exe"
           $pdftoppm = Join-Path $popplerBin "pdftoppm.exe"
@@ -49,5 +42,8 @@ jobs:
         if: runner.os == 'Windows'
       - run: >-
           python -m pytest tests/test_pdf_pipeline.py tests/test_plugin_layout.py
+          tests/test_poppler_bootstrap.py
           tests/test_pdf_assemble.py::test_windows_native_relative_rename_moves_to_held_destination
-          tests/test_pdf_assemble.py::test_windows_native_relative_rename_never_clobbers_existing_destination -q
+          tests/test_pdf_assemble.py::test_windows_native_relative_rename_never_clobbers_existing_destination
+          tests/test_pdf_qa.py::test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles
+          tests/test_pdf_qa.py::test_windows_nonempty_qa_directory_publication_never_clobbers_destination -q

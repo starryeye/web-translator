@@ -62,14 +62,10 @@ def test_font_license_is_marked_binary_to_preserve_pinned_bytes_on_windows() -> 
 def test_windows_poppler_install_pins_dependency_complete_archive() -> None:
     workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
 
-    # This release packages its conda-forge runtime dependencies beside Poppler.
-    assert (
-        "https://github.com/oschwartz10612/poppler-windows/releases/download/"
-        "v26.02.0-0/Release-26.02.0-0.zip"
-    ) in workflow
-    assert "993e4a94376ed712fafc7058d724ea0b943d118bbd2305cd9ed55174eb85cda5" in workflow
-    assert "Get-FileHash" in workflow
-    assert "Expand-Archive" in workflow
+    assert "python scripts/install_pinned_poppler.py --destination-root $extractRoot" in workflow
+    assert "Invoke-WebRequest" not in workflow
+    assert "Expand-Archive" not in workflow
+    assert "Get-FileHash" not in workflow
     assert "choco install poppler --version=22.11.0.20240421 -y" not in workflow
     assert "choco install poppler -y" not in workflow
 
@@ -82,6 +78,16 @@ def test_windows_poppler_install_gates_both_executables_before_path_export() -> 
     path_export = workflow.index("$env:GITHUB_PATH")
 
     assert pdfinfo_gate < pdftoppm_gate < path_export
+
+
+def test_windows_workflow_runs_live_nonempty_directory_publication_contracts() -> None:
+    workflow = (ROOT / ".github/workflows/pdf-cross-platform.yml").read_text("utf-8")
+
+    for node in (
+        "tests/test_pdf_qa.py::test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles",
+        "tests/test_pdf_qa.py::test_windows_nonempty_qa_directory_publication_never_clobbers_destination",
+    ):
+        assert node in workflow
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Poppler executables")

@@ -44,6 +44,7 @@ _TOKEN = re.compile(r"⟦WT:\d{6}⟧")
 _PAGE_NAME = re.compile(r"page-(\d{3})\.png\Z")
 _RAW_PAGE_NAME = re.compile(r"page-\d+\.png\Z")
 _CONTACT_NAME = re.compile(r"contact-sheet-(\d{3})\.png\Z")
+_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS = os.name == "nt"
 _REVIEW_DIMENSIONS = {
     "semantic_fidelity",
     "qualification_preservation",
@@ -1048,12 +1049,17 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             run_dir / "staged-output" / "translated.pdf",
         )
         qa_pages_publication_attempted = True
-        _publish_new_directory(
+        _publish_qa_artifact_directory(
             staging_anchor,
             "qa-pages",
             qa_pages_anchor,
             run_anchor,
             "qa-pages",
+            qa_artifacts,
+            {**page_hashes, **contact_hashes},
+            release_descendant_handles=(
+                _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS
+            ),
         )
         published_json = assembly._publish_new_file(
             staging_anchor, "pdf-qa.json", run_anchor, "pdf-qa.json"
@@ -1070,6 +1076,12 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         raise PdfQAFailure(f"cannot prepare PDF QA evidence: {error}") from error
     finally:
         if run_anchor is not None and not completed:
+            # A Windows directory cannot be moved while any descendant handle
+            # remains open.  The post-publication snapshot deliberately keeps
+            # those handles open until the JSON record publishes; release them
+            # before exact held-directory rollback/quarantine on failure.
+            for artifact in qa_artifacts.values():
+                assembly._close_opened_file(artifact)
             assembly._remove_owned_file(
                 run_anchor,
                 "pdf-qa.json",
@@ -2139,6 +2151,137 @@ def _publish_new_directory(
         raise PdfQAFailure(f"PDF QA destination already exists: {destination_name}") from error
     except (NotImplementedError, OSError) as error:
         raise PdfQAFailure(f"cannot publish PDF QA directory: {error}") from error
+
+
+def _publish_qa_artifact_directory(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+    artifacts: dict[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+    *,
+    release_descendant_handles: bool,
+) -> None:
+    """Publish rendered QA evidence without trusting the Windows close window."""
+    if not release_descendant_handles:
+        _publish_new_directory(
+            source_parent,
+            source_name,
+            source,
+            destination_parent,
+            destination_name,
+        )
+        return
+
+    expected_names = sorted(expected_hashes)
+    if sorted(artifacts) != expected_names:
+        raise PdfQAFailure(
+            "rendered PDF QA artifacts do not exactly match the publication snapshot"
+        )
+    expected_identities = {
+        name: artifacts[name].identity for name in expected_names
+    }
+    _verify_qa_artifact_snapshot(
+        source,
+        artifacts,
+        expected_identities,
+        expected_hashes,
+    )
+    for item in artifacts.values():
+        assembly._close_opened_file(item)
+    _publish_new_directory(
+        source_parent,
+        source_name,
+        source,
+        destination_parent,
+        destination_name,
+    )
+
+    published: assembly._DirectoryAnchor | None = None
+    reopened: dict[str, assembly._OpenedFile] = {}
+    try:
+        published = assembly._open_existing_child_directory(
+            destination_parent,
+            destination_name,
+            "published PDF QA pages",
+        )
+        if published.identity != source.identity:
+            raise PdfQAFailure(
+                "rendered PDF QA artifacts changed directory identity during publication"
+            )
+        for name in expected_names:
+            reopened[name] = assembly._open_anchored_input_file(
+                published,
+                name,
+                "published rendered PDF QA artifact",
+            )
+        _verify_qa_artifact_snapshot(
+            published,
+            reopened,
+            expected_identities,
+            expected_hashes,
+        )
+    except PdfQAFailure:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise
+    except PdfAssemblyError as error:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise PdfQAFailure(
+            f"rendered PDF QA artifacts changed during publication: {error}"
+        ) from error
+    finally:
+        if published is not None:
+            published.close()
+
+    artifacts.clear()
+    artifacts.update(reopened)
+
+
+def _verify_qa_artifact_snapshot(
+    directory: assembly._DirectoryAnchor,
+    artifacts: Mapping[str, assembly._OpenedFile],
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    expected_names = sorted(expected_hashes)
+    try:
+        visible_names = sorted(path.name for path in directory.current_path().iterdir())
+    except (OSError, PdfAssemblyError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect rendered PDF QA artifacts: {error}"
+        ) from error
+    if visible_names != expected_names or sorted(artifacts) != expected_names:
+        raise PdfQAFailure(
+            "rendered PDF QA artifacts do not exactly match the publication snapshot"
+        )
+    try:
+        assembly._verify_anchored_evidence(directory, artifacts)
+        for name in expected_names:
+            item = artifacts[name]
+            if item.identity != expected_identities[name]:
+                raise PdfQAFailure(
+                    f"rendered PDF QA artifacts changed identity: {name}"
+                )
+            payload = assembly._read_opened_bytes(
+                item,
+                directory.path / name,
+                "rendered PDF QA publication artifact",
+            )
+            if hashlib.sha256(payload).hexdigest() != expected_hashes[name]:
+                raise PdfQAFailure(
+                    f"rendered PDF QA artifacts changed content: {name}"
+                )
+        assembly._verify_anchored_evidence(directory, artifacts)
+    except PdfQAFailure:
+        raise
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(
+            f"rendered PDF QA artifacts changed during publication: {error}"
+        ) from error
 
 
 def _require_anchored_directory_identity(

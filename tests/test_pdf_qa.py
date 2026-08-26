@@ -414,6 +414,238 @@ def test_prepare_pdf_qa_renders_every_page_and_covers_contact_sheets(
     assert not assembled_pdf_run.output_dir.exists()
 
 
+def test_prepare_pdf_qa_closes_windows_descendants_for_directory_rename_and_reopens_them(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keeping any rendered child open makes a Windows directory rename fail."""
+    opened_before_publish: list[object] = []
+    reopened_after_publish: list[object] = []
+    real_open = pdf_qa_module.assembly._open_anchored_input_file
+    real_publish_directory = pdf_qa_module._publish_new_directory
+    real_publish_file = pdf_qa_module.assembly._publish_new_file
+    directory_published = False
+
+    def capture_open(
+        directory: object,
+        name: str,
+        context: str,
+    ) -> object:
+        opened = real_open(directory, name, context)  # type: ignore[arg-type]
+        if context in {
+            "rendered PDF QA page",
+            "PDF QA contact sheet",
+            "published rendered PDF QA artifact",
+        }:
+            target = (
+                reopened_after_publish
+                if directory_published
+                else opened_before_publish
+            )
+            target.append(opened)
+        return opened
+
+    def publish_directory(*args: object, **kwargs: object) -> None:
+        nonlocal directory_published
+        assert opened_before_publish
+        assert all(item.stream.closed for item in opened_before_publish)  # type: ignore[attr-defined]
+        real_publish_directory(*args, **kwargs)  # type: ignore[arg-type]
+        directory_published = True
+
+    def publish_file(*args: object, **kwargs: object) -> object:
+        if args[1] == "pdf-qa.json":
+            assert reopened_after_publish
+            assert all(
+                not item.stream.closed for item in reopened_after_publish  # type: ignore[attr-defined]
+            )
+        return real_publish_file(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_open_anchored_input_file",
+        capture_open,
+    )
+    monkeypatch.setattr(pdf_qa_module, "_publish_new_directory", publish_directory)
+    monkeypatch.setattr(pdf_qa_module.assembly, "_publish_new_file", publish_file)
+
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert all(item.stream.closed for item in opened_before_publish)  # type: ignore[attr-defined]
+    assert all(item.stream.closed for item in reopened_after_publish)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra-child", "replacement-identity", "same-identity-content"],
+)
+def test_prepare_pdf_qa_rejects_windows_close_rename_reopen_artifact_races(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """The Windows handle-release window must not publish changed QA evidence."""
+    real_publish = pdf_qa_module._publish_new_directory
+
+    def publish_then_mutate(
+        source_parent: object,
+        source_name: str,
+        source: object,
+        destination_parent: object,
+        destination_name: str,
+    ) -> None:
+        real_publish(
+            source_parent,  # type: ignore[arg-type]
+            source_name,
+            source,  # type: ignore[arg-type]
+            destination_parent,  # type: ignore[arg-type]
+            destination_name,
+        )
+        published = destination_parent.current_path() / destination_name  # type: ignore[attr-defined]
+        page = published / "page-001.png"
+        if mutation == "extra-child":
+            (published / "unexpected.txt").write_bytes(b"foreign extra child")
+        elif mutation == "replacement-identity":
+            page.unlink()
+            page.write_bytes(b"foreign replacement identity")
+        else:
+            with page.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(b"foreign same-inode mutation")
+                stream.truncate()
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS",
+        True,
+        raising=False,
+    )
+    monkeypatch.setattr(pdf_qa_module, "_publish_new_directory", publish_then_mutate)
+
+    with pytest.raises(PdfQAFailure, match="rendered PDF QA artifacts"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows directory rename semantics")
+def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles(
+    tmp_path: Path,
+) -> None:
+    """Windows forbids renaming a directory while one of its children is open."""
+    staging_path = tmp_path / "staging 한국어"
+    destination_path = tmp_path / "destination 한국어"
+    staging_path.mkdir()
+    destination_path.mkdir()
+    staging_anchor = pdf_qa_module.assembly._open_directory_anchor(
+        staging_path, "staging"
+    )
+    destination_anchor = pdf_qa_module.assembly._open_directory_anchor(
+        destination_path, "destination"
+    )
+    pages_anchor = pdf_qa_module.assembly._create_child_directory(
+        staging_anchor,
+        "qa-pages",
+        "rendered PDF QA pages",
+    )
+    opened: dict[str, object] = {}
+    expected_hashes: dict[str, str] = {}
+    try:
+        for name, payload in {
+            "page-001.png": b"held rendered page",
+            "contact-sheet-001.png": b"held contact sheet",
+        }.items():
+            item = pdf_qa_module.assembly._create_anchored_binary_file(
+                pages_anchor, name
+            )
+            item.stream.write(payload)
+            pdf_qa_module.assembly._finalize_opened_file(item, name)
+            opened[name] = item
+            expected_hashes[name] = hashlib.sha256(payload).hexdigest()
+
+        pdf_qa_module._publish_qa_artifact_directory(
+            staging_anchor,
+            "qa-pages",
+            pages_anchor,
+            destination_anchor,
+            "qa-pages",
+            opened,  # type: ignore[arg-type]
+            expected_hashes,
+            release_descendant_handles=True,
+        )
+
+        assert not (staging_path / "qa-pages").exists()
+        published = destination_path / "qa-pages"
+        assert (published / "page-001.png").read_bytes() == b"held rendered page"
+        assert (published / "contact-sheet-001.png").read_bytes() == b"held contact sheet"
+        assert all(not item.stream.closed for item in opened.values())  # type: ignore[attr-defined]
+    finally:
+        for item in opened.values():
+            pdf_qa_module.assembly._close_opened_file(item)  # type: ignore[arg-type]
+        pages_anchor.close()
+        destination_anchor.close()
+        staging_anchor.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows directory rename semantics")
+def test_windows_nonempty_qa_directory_publication_never_clobbers_destination(
+    tmp_path: Path,
+) -> None:
+    staging_path = tmp_path / "staging"
+    destination_path = tmp_path / "destination"
+    staging_path.mkdir()
+    destination_path.mkdir()
+    foreign_destination = destination_path / "qa-pages"
+    foreign_destination.mkdir()
+    (foreign_destination / "foreign.txt").write_bytes(b"foreign destination")
+    staging_anchor = pdf_qa_module.assembly._open_directory_anchor(
+        staging_path, "staging"
+    )
+    destination_anchor = pdf_qa_module.assembly._open_directory_anchor(
+        destination_path, "destination"
+    )
+    pages_anchor = pdf_qa_module.assembly._create_child_directory(
+        staging_anchor,
+        "qa-pages",
+        "rendered PDF QA pages",
+    )
+    item = pdf_qa_module.assembly._create_anchored_binary_file(
+        pages_anchor, "page-001.png"
+    )
+    payload = b"owned rendered page"
+    item.stream.write(payload)
+    pdf_qa_module.assembly._finalize_opened_file(item, "page-001.png")
+    opened = {"page-001.png": item}
+    try:
+        with pytest.raises(PdfQAFailure, match="destination already exists"):
+            pdf_qa_module._publish_qa_artifact_directory(
+                staging_anchor,
+                "qa-pages",
+                pages_anchor,
+                destination_anchor,
+                "qa-pages",
+                opened,
+                {"page-001.png": hashlib.sha256(payload).hexdigest()},
+                release_descendant_handles=True,
+            )
+
+        assert (staging_path / "qa-pages" / "page-001.png").read_bytes() == payload
+        assert (foreign_destination / "foreign.txt").read_bytes() == b"foreign destination"
+    finally:
+        for opened_item in opened.values():
+            pdf_qa_module.assembly._close_opened_file(opened_item)
+        pages_anchor.close()
+        destination_anchor.close()
+        staging_anchor.close()
+
+
 # Production mutation caught: accepting malformed or incomplete visual-review evidence.
 @pytest.mark.parametrize(
     ("mutate", "message"),
