@@ -18,8 +18,9 @@ jobs:
         shell: pwsh
         run: |
           choco install poppler -y
-          $pdfinfo = Get-ChildItem $env:ProgramFiles -Filter pdfinfo.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $pdfinfo) { throw "Chocolatey Poppler installation did not provide pdfinfo.exe under Program Files." }
+          $popplerRoot = Join-Path $env:ChocolateyInstall "lib\poppler\tools"
+          $pdfinfo = Get-ChildItem $popplerRoot -Filter pdfinfo.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $pdfinfo) { throw "Chocolatey Poppler installation did not provide pdfinfo.exe under $popplerRoot." }
           $popplerBin = $pdfinfo.Directory.FullName
           if (-not (Test-Path (Join-Path $popplerBin "pdftoppm.exe"))) { throw "Chocolatey Poppler installation did not provide pdftoppm.exe beside pdfinfo.exe." }
           $popplerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
