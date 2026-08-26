@@ -618,6 +618,12 @@ def _write_acceptance_sidecars(fixture_dir: Path, fixture_name: str) -> None:
         "table_count": 2 if fixture_name == "table-report-v1" else 0,
         "figure_count": 2 if fixture_name == "figures-captions-v1" else 0,
         "footnote_count": 1 if fixture_name == "two-column-footnotes-v1" else 0,
+        "expected_korean_phrase": {
+            "technical-document-v1": "결정론적 시스템 검토",
+            "table-report-v1": "번역 품질 표 보고서",
+            "two-column-footnotes-v1": "두 열 증거 검토",
+            "figures-captions-v1": "그림과 캡션",
+        }[fixture_name],
         "final_artifacts": ["manifest.json", "review-report.md", "translated.pdf"],
     }
     _write_json(fixture_dir / "expected.json", expected)
@@ -644,15 +650,16 @@ def _write_acceptance_sidecars(fixture_dir: Path, fixture_name: str) -> None:
             "unresolved_required": [],
         },
     )
-    page_count = int(expected["page_count"])
     _write_json(
         fixture_dir / "visual-review.json",
         {
             "schema_version": "1.0",
             "staged_pdf_sha256": "0" * 64,
-            "pages_reviewed": list(range(1, page_count + 1)),
+            "pages_reviewed": [1, 2] if fixture_name == "table-report-v1" else [1],
             "contact_sheets_reviewed": {
-                "contact-sheet-001.png": list(range(1, page_count + 1))
+                "contact-sheet-001.png": [1, 2]
+                if fixture_name == "table-report-v1"
+                else [1]
             },
             "findings": {
                 dimension: {
@@ -681,10 +688,16 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
             for line in (temporary / "segments.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+    korean_context = {
+        "technical-document-v1": "결정론적 시스템 검토",
+        "table-report-v1": "번역 품질 표 보고서",
+        "two-column-footnotes-v1": "두 열 증거 검토",
+        "figures-captions-v1": "그림과 캡션",
+    }[fixture_dir.name]
     translations = [
         {
             "segment_id": record["id"],
-            "text": "작업 흐름 workflow"
+            "text": f"{korean_context}: {record['source_text']} workflow"
             + "".join(token["token"] for token in record["protected"]),
             "notes": None,
             "glossary_observations": {},

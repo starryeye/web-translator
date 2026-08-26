@@ -1,4 +1,5 @@
 {
+  "expected_korean_phrase": "그림과 캡션",
   "figure_count": 2,
   "final_artifacts": [
     "manifest.json",

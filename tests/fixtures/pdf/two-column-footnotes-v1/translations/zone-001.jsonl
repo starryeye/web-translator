@@ -1,9 +1,9 @@
-{"segment_id":"seg-000001","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000002","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000003","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000004","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000005","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000006","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000007","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000008","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000009","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000001","text":"두 열 증거 검토: Two-Column Evidence Review workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000002","text":"두 열 증거 검토: Column 1 first logical sentence. Column 1 second logical sentence. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000003","text":"두 열 증거 검토: Column 2 first logical sentence. Column 2 second logical sentence. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000004","text":"두 열 증거 검토: Page-Local Footnote Evidence workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000005","text":"두 열 증거 검토: Source order is validated before bounded zone planning begins. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000006","text":"두 열 증거 검토: Contact-sheet evidence covers every rendered output page exactly once. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000007","text":"두 열 증거 검토: Semantic review checks every required quality dimension. Validated Korean text remains selectable in the staged PDF. Automated QA records exact output and contact-sheet page counts. Final publication exposes exactly three reviewed artifacts. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000008","text":"두 열 증거 검토: The deterministic workflow includes a page-local note 1 workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000009","text":"두 열 증거 검토: 1 Footnote evidence remains linked to its marker. workflow","notes":null,"glossary_observations":{}}

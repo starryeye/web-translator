@@ -1,6 +1,6 @@
-{"segment_id":"seg-000001","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000002","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000003","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000004","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000005","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000006","text":"작업 흐름 workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000001","text":"그림과 캡션: Figures and Captions workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000002","text":"그림과 캡션: Raster and vector evidence must remain paired with the correct explanatory caption. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000003","text":"그림과 캡션: Figure 1. Raster workflow status panel. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000004","text":"그림과 캡션: Figure 2. Vector review coverage trend. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000005","text":"그림과 캡션: The raster panel verifies image preservation and the vector plot verifies path rendering. Each caption follows its figure directly so extraction retains an unambiguous pair. Review checks sharp rendering, readable labels, and the absence of clipping or overlap. workflow","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000006","text":"그림과 캡션: Page 1 workflow","notes":null,"glossary_observations":{}}

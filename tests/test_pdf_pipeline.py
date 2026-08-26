@@ -84,8 +84,11 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 0
     document = json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
     assert document["page_count"] == expected["page_count"]
-    assert sum(block["kind"] == "table-cell" for block in document["blocks"]) >= expected["table_count"]
+    assert len(
+        {block["table_id"] for block in document["blocks"] if block["table_id"]}
+    ) == expected["table_count"]
     assert sum(block["kind"] == "figure" for block in document["blocks"]) == expected["figure_count"]
+    assert sum(block["kind"] == "footnote" for block in document["blocks"]) == expected["footnote_count"]
 
     assert main(["plan-zones", "--run-dir", str(run_dir)]) == 0
     shutil.copy2(fixture_dir / "glossary.json", run_dir / "glossary.json")
@@ -99,9 +102,11 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
 
     qa = json.loads((run_dir / "pdf-qa.json").read_text(encoding="utf-8"))
     visual_review = json.loads((fixture_dir / "visual-review.json").read_text(encoding="utf-8"))
+    assert visual_review["pages_reviewed"] == list(
+        range(1, len(qa["rendered_page_hashes"]) + 1)
+    )
+    assert visual_review["contact_sheets_reviewed"] == qa["contact_sheet_pages"]
     visual_review["staged_pdf_sha256"] = qa["staged_pdf_sha256"]
-    visual_review["pages_reviewed"] = list(range(1, len(qa["rendered_page_hashes"]) + 1))
-    visual_review["contact_sheets_reviewed"] = qa["contact_sheet_pages"]
     (run_dir / "pdf-layout-review.json").write_text(
         json.dumps(visual_review, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -113,8 +118,13 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     translated_text = "\n".join(
         page.extract_text() or "" for page in PdfReader(output_dir / "translated.pdf").pages
     )
-    assert "작업 흐름" in translated_text
+    assert expected["expected_korean_phrase"] in translated_text
     assert translated_text.count("workflow(작업 흐름)") == 1
+    records = [
+        json.loads(line)
+        for line in (fixture_dir / "translations" / "zone-001.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len({record["text"] for record in records}) > 1
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["inspection"]["page_count"] == expected["page_count"]
     assert manifest["output"]["figure_count"] == expected["figure_count"]

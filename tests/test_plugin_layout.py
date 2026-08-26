@@ -47,3 +47,9 @@ def test_pdf_fonts_are_exposed_as_package_resources() -> None:
     assert assets.joinpath("NotoSansKR-Bold.ttf").is_file()
     assert assets.joinpath("OFL.txt").is_file()
     assert assets.joinpath("PROVENANCE.json").is_file()
+
+
+def test_font_license_is_marked_binary_to_preserve_pinned_bytes_on_windows() -> None:
+    assert "src/web_translator/font_assets/OFL.txt -text" in (
+        ROOT / ".gitattributes"
+    ).read_text("utf-8")

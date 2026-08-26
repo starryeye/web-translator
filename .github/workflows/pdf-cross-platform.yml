@@ -15,7 +15,14 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install poppler
       - if: runner.os == 'Windows'
-        run: choco install poppler -y
+        shell: pwsh
+        run: |
+          choco install poppler -y
+          $pdfinfo = Get-ChildItem $env:ProgramFiles -Filter pdfinfo.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $pdfinfo) { throw "Chocolatey Poppler installation did not provide pdfinfo.exe under Program Files." }
+          $popplerBin = $pdfinfo.Directory.FullName
+          if (-not (Test-Path (Join-Path $popplerBin "pdftoppm.exe"))) { throw "Chocolatey Poppler installation did not provide pdftoppm.exe beside pdfinfo.exe." }
+          $popplerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - run: python -m pip install --upgrade pip build
       - run: python -m build
       - shell: bash
