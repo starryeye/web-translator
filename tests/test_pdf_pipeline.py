@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -602,6 +604,254 @@ def prepared_pdf_run(assembled_pdf_run: PdfQARun) -> PdfQARun:
     return assembled_pdf_run
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="requires real Windows durable flush and directory publication",
+)
+def test_windows_finalize_durably_publishes_exact_reviewed_output(
+    prepared_pdf_run: PdfQARun,
+) -> None:
+    """A real Windows run must flush and publish the three-file transaction."""
+    finalized = finalize_pdf_output(
+        prepared_pdf_run.run_dir,
+        prepared_pdf_run.output_dir,
+    )
+
+    assert finalized == prepared_pdf_run.output_dir
+    assert sorted(path.name for path in finalized.iterdir()) == [
+        "manifest.json",
+        "review-report.md",
+        "translated.pdf",
+    ]
+    assert all(path.stat().st_size > 0 for path in finalized.iterdir())
+    assert not (prepared_pdf_run.run_dir / "staged-output").exists()
+
+
+def test_fsync_final_files_uses_anchored_write_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staged = tmp_path / "staged-output"
+    staged.mkdir()
+    payloads = {
+        "manifest.json": b"{}\n",
+        "review-report.md": b"# reviewed\n",
+        "translated.pdf": b"%PDF-1.7\nfinal\n",
+    }
+    for name, payload in payloads.items():
+        (staged / name).write_bytes(payload)
+    anchor = pdf_qa_module.assembly._open_directory_anchor(staged, "staged output")
+    opened = {
+        name: pdf_qa_module.assembly._open_anchored_input_file(
+            anchor, name, "final PDF artifact"
+        )
+        for name in payloads
+    }
+    expected_hashes = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in payloads.items()
+    }
+    real_open = os.open
+    anchored_opens: list[tuple[str, int, int | None]] = []
+
+    def capture_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if isinstance(path, str) and path in payloads:
+            anchored_opens.append((path, flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(pdf_qa_module.os, "open", capture_open)
+    try:
+        pdf_qa_module._fsync_final_files(anchor, opened, expected_hashes)
+    finally:
+        for item in opened.values():
+            pdf_qa_module.assembly._close_opened_file(item)
+        anchor.close()
+
+    assert sorted(name for name, _flags, _dir_fd in anchored_opens) == sorted(payloads)
+    assert all(flags & os.O_RDWR for _name, flags, _dir_fd in anchored_opens)
+    assert all(dir_fd is not None for _name, _flags, dir_fd in anchored_opens)
+    assert {name: (staged / name).read_bytes() for name in payloads} == payloads
+
+
+def test_fsync_final_files_uses_windows_anchored_flush_handles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staged = tmp_path / "staged-output"
+    staged.mkdir()
+    payloads = {
+        "manifest.json": b"{}\n",
+        "review-report.md": b"# reviewed\n",
+        "translated.pdf": b"%PDF-1.7\nfinal\n",
+    }
+    for name, payload in payloads.items():
+        (staged / name).write_bytes(payload)
+    anchor = pdf_qa_module.assembly._open_directory_anchor(staged, "staged output")
+    opened = {
+        name: pdf_qa_module.assembly._open_anchored_input_file(
+            anchor, name, "final PDF artifact"
+        )
+        for name in payloads
+    }
+    expected_hashes = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in payloads.items()
+    }
+    next_handle = 100
+    handle_names: dict[int, str] = {}
+    desired_access: dict[str, int] = {}
+    flushed: list[int] = []
+    closed: list[int] = []
+
+    def open_relative(
+        root_handle: int,
+        name: str,
+        **options: int,
+    ) -> int:
+        nonlocal next_handle
+        assert root_handle == 55
+        handle = next_handle
+        next_handle += 1
+        handle_names[handle] = name
+        desired_access[name] = options["desired_access"]
+        return handle
+
+    monkeypatch.setattr(pdf_qa_module.assembly, "_IS_WINDOWS", True)
+    monkeypatch.setattr(pdf_qa_module.assembly, "_windows_anchor_handle", lambda _anchor: 55)
+    monkeypatch.setattr(pdf_qa_module.assembly, "_windows_nt_create_relative", open_relative)
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_file_identity",
+        lambda handle, require_regular: opened[handle_names[handle]].identity,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_windows_flush_file_buffers",
+        flushed.append,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+    try:
+        pdf_qa_module._fsync_final_files(anchor, opened, expected_hashes)
+    finally:
+        for item in opened.values():
+            pdf_qa_module.assembly._close_opened_file(item)
+        anchor.close()
+
+    assert set(desired_access) == set(payloads)
+    assert all(access & 0x40000000 for access in desired_access.values())
+    assert flushed == closed
+    assert len(flushed) == 3
+
+
+def test_finalize_closes_windows_descendants_before_directory_publication(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+    real_open = pdf_qa_module.assembly._open_anchored_input_file
+    real_rename = pdf_qa_module._rename_anchored_directory_no_replace
+
+    def capture_final_file(
+        directory: object,
+        name: str,
+        context: str,
+    ) -> object:
+        item = real_open(directory, name, context)  # type: ignore[arg-type]
+        if context in {"staged translated PDF", "final PDF artifact"}:
+            captured.append(item)
+        return item
+
+    def require_closed_descendants(*args: object, **kwargs: object) -> None:
+        if args[1] == "staged-output":
+            assert captured
+            assert all(item.stream.closed for item in captured)  # type: ignore[attr-defined]
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS",
+        True,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_open_anchored_input_file",
+        capture_final_file,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_rename_anchored_directory_no_replace",
+        require_closed_descendants,
+    )
+
+    finalized = finalize_pdf_output(
+        prepared_pdf_run.run_dir,
+        prepared_pdf_run.output_dir,
+    )
+
+    assert finalized == prepared_pdf_run.output_dir
+    assert all(item.stream.closed for item in captured)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra-child", "replacement-identity", "same-identity-content"],
+)
+def test_finalize_rechecks_exact_transaction_after_directory_publication(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    real_rename = pdf_qa_module._rename_anchored_directory_no_replace
+
+    def publish_then_mutate(*args: object, **kwargs: object) -> None:
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+        if args[1] != "staged-output":
+            return
+        destination = prepared_pdf_run.output_dir
+        translated = destination / "translated.pdf"
+        if mutation == "extra-child":
+            (destination / "unexpected.txt").write_bytes(b"foreign extra child")
+        elif mutation == "replacement-identity":
+            translated.unlink()
+            translated.write_bytes(b"foreign replacement")
+        else:
+            with translated.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(b"foreign same-inode rewrite")
+                stream.truncate()
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS",
+        True,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_rename_anchored_directory_no_replace",
+        publish_then_mutate,
+    )
+
+    with pytest.raises(PdfQAFailure, match="final PDF artifacts"):
+        finalize_pdf_output(
+            prepared_pdf_run.run_dir,
+            prepared_pdf_run.output_dir,
+        )
+
+    assert not prepared_pdf_run.output_dir.exists()
+    assert (prepared_pdf_run.run_dir / "staged-output").is_dir()
+
+
 # Production mutation caught: leaving a partial public directory when final rename fails.
 def test_finalize_rolls_back_publication_when_rename_fails(
     prepared_pdf_run: PdfQARun,
@@ -1020,12 +1270,47 @@ def test_windows_final_publication_uses_relative_no_replace_rename(
         "_close_windows_handle",
         closed.append,
     )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_verify_final_artifact_snapshot",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def open_published(
+        _parent: object,
+        name: str,
+        _label: str,
+    ) -> object:
+        path = output_parent / name
+        return pdf_qa_module.assembly._DirectoryAnchor(
+            path,
+            "published",
+            staged_anchor.identity,
+            None,
+            FakePathAnchor(44, path),
+        )
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_open_existing_child_directory",
+        open_published,
+    )
+    expected_identities = {
+        name: (1, index)
+        for index, name in enumerate(pdf_qa_module._FINAL_OUTPUT_NAMES, start=1)
+    }
+    expected_hashes = {
+        name: f"{index:064x}"
+        for index, name in enumerate(pdf_qa_module._FINAL_OUTPUT_NAMES, start=1)
+    }
 
     pdf_qa_module._publish_final_directory_no_clobber(
         run_anchor,
         staged_anchor,
         output_anchor,
         "검토 완료",
+        expected_identities,
+        expected_hashes,
     )
 
     assert (output_parent / "검토 완료").is_dir()

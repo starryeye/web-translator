@@ -535,6 +535,60 @@ def test_prepare_pdf_qa_rejects_windows_close_rename_reopen_artifact_races(
     assert not assembled_pdf_run.output_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra-child", "replacement-identity", "same-identity-content"],
+)
+def test_prepare_pdf_qa_rechecks_public_snapshot_after_json_commit(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """The JSON commit must not bless QA pages changed after postverification."""
+    real_publish = pdf_qa_module.assembly._publish_new_file
+
+    def publish_json_then_mutate(
+        source_directory: object,
+        source_name: str,
+        destination_directory: object,
+        destination_name: str,
+    ) -> object:
+        published = real_publish(
+            source_directory,  # type: ignore[arg-type]
+            source_name,
+            destination_directory,  # type: ignore[arg-type]
+            destination_name,
+        )
+        if destination_name != "pdf-qa.json":
+            return published
+        pages = assembled_pdf_run.run_dir / "qa-pages"
+        page = pages / "page-001.png"
+        if mutation == "extra-child":
+            (pages / "unexpected.txt").write_bytes(b"post-JSON extra child")
+        elif mutation == "replacement-identity":
+            page.unlink()
+            page.write_bytes(b"post-JSON replacement identity")
+        else:
+            with page.open("r+b") as stream:
+                stream.seek(0)
+                stream.write(b"post-JSON same-inode rewrite")
+                stream.truncate()
+        return published
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_publish_new_file",
+        publish_json_then_mutate,
+    )
+
+    with pytest.raises(PdfQAFailure, match="rendered PDF QA artifacts"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
+    assert not (assembled_pdf_run.run_dir / "qa-pages").exists()
+    assert not assembled_pdf_run.output_dir.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires real Windows directory rename semantics")
 def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles(
     tmp_path: Path,
@@ -557,6 +611,7 @@ def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_hand
     )
     opened: dict[str, object] = {}
     expected_hashes: dict[str, str] = {}
+    published_anchor = None
     try:
         for name, payload in {
             "page-001.png": b"held rendered page",
@@ -570,7 +625,7 @@ def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_hand
             opened[name] = item
             expected_hashes[name] = hashlib.sha256(payload).hexdigest()
 
-        pdf_qa_module._publish_qa_artifact_directory(
+        published_anchor = pdf_qa_module._publish_qa_artifact_directory(
             staging_anchor,
             "qa-pages",
             pages_anchor,
@@ -589,6 +644,8 @@ def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_hand
     finally:
         for item in opened.values():
             pdf_qa_module.assembly._close_opened_file(item)  # type: ignore[arg-type]
+        if published_anchor is not None:
+            published_anchor.close()
         pages_anchor.close()
         destination_anchor.close()
         staging_anchor.close()

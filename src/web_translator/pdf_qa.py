@@ -45,6 +45,7 @@ _PAGE_NAME = re.compile(r"page-(\d{3})\.png\Z")
 _RAW_PAGE_NAME = re.compile(r"page-\d+\.png\Z")
 _CONTACT_NAME = re.compile(r"contact-sheet-(\d{3})\.png\Z")
 _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS = os.name == "nt"
+_FINAL_OUTPUT_NAMES = ("manifest.json", "review-report.md", "translated.pdf")
 _REVIEW_DIMENSIONS = {
     "semantic_fidelity",
     "qualification_preservation",
@@ -247,6 +248,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     output_parent_anchor: assembly._DirectoryAnchor | None = None
     opened: dict[str, assembly._OpenedFile] = {}
     zone_opened: dict[str, assembly._OpenedFile] = {}
+    final_files: dict[str, assembly._OpenedFile] = {}
     staged_pdf: assembly._OpenedFile | None = None
     completed = False
     publication_rolled_back = False
@@ -268,6 +270,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         staged_pdf = assembly._open_anchored_input_file(
             staged_anchor, "translated.pdf", "staged translated PDF"
         )
+        final_files["translated.pdf"] = staged_pdf
         for name, label in (
             ("source.pdf", "PDF source"),
             ("source.json", "PDF source record"),
@@ -395,10 +398,20 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         )
         write_pdf_review_report(manifest, report_paths[1])
         names = sorted(path.name for path in staged_anchor.current_path().iterdir())
-        if names != ["manifest.json", "review-report.md", "translated.pdf"]:
+        if names != list(_FINAL_OUTPUT_NAMES):
             raise PdfQAFailure(
                 "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
             )
+        for name in ("manifest.json", "review-report.md"):
+            final_files[name] = assembly._open_anchored_input_file(
+                staged_anchor,
+                name,
+                "final PDF artifact",
+            )
+        final_hashes = _final_file_hashes(staged_anchor, final_files)
+        final_identities = {
+            name: item.identity for name, item in final_files.items()
+        }
         _verify_report_evidence_snapshot(run_anchor, opened, snapshot_hashes)
         _verify_report_evidence_snapshot(zone_anchor, zone_opened, zone_hashes)
         if sorted(path.name for path in zone_anchor.current_path().iterdir()) != zone_names:
@@ -411,7 +424,10 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             staged_hash,
             run_dir / "staged-output" / "translated.pdf",
         )
-        _fsync_final_files(staged_anchor.current_path())
+        _fsync_final_files(staged_anchor, final_files, final_hashes)
+        if _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS:
+            for item in final_files.values():
+                assembly._close_opened_file(item)
         output_parent_anchor = _ensure_output_parent(output_dir)
         _validate_locations(run_anchor, output_dir)
         _publish_final_directory_no_clobber(
@@ -419,6 +435,8 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             staged_anchor,
             output_parent_anchor,
             output_dir.name,
+            final_identities,
+            final_hashes,
         )
         completed = True
         return output_dir
@@ -442,6 +460,8 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         for item in opened.values():
             assembly._close_opened_file(item)
         for item in zone_opened.values():
+            assembly._close_opened_file(item)
+        for item in final_files.values():
             assembly._close_opened_file(item)
         if zone_anchor is not None:
             zone_anchor.close()
@@ -619,6 +639,8 @@ def _publish_final_directory_no_clobber(
     source: assembly._DirectoryAnchor,
     destination_parent: assembly._DirectoryAnchor,
     destination_name: str,
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
 ) -> None:
     destination = destination_parent.path / destination_name
     try:
@@ -627,6 +649,11 @@ def _publish_final_directory_no_clobber(
             "staged-output",
             source.identity,
             "final PDF publication source",
+        )
+        _verify_final_artifact_snapshot(
+            source,
+            expected_identities,
+            expected_hashes,
         )
         destination_parent.verify_visible()
         _rename_anchored_directory_no_replace(
@@ -644,6 +671,23 @@ def _publish_final_directory_no_clobber(
                 "published final PDF output",
             )
             destination_parent.verify_visible()
+            published = assembly._open_existing_child_directory(
+                destination_parent,
+                destination_name,
+                "published final PDF output",
+            )
+            try:
+                if published.identity != source.identity:
+                    raise PdfQAFailure(
+                        "published final PDF artifacts changed directory identity"
+                    )
+                _verify_final_artifact_snapshot(
+                    published,
+                    expected_identities,
+                    expected_hashes,
+                )
+            finally:
+                published.close()
         except (PdfQAFailure, PdfAssemblyError) as error:
             try:
                 private_name = _rollback_final_directory(
@@ -804,22 +848,206 @@ def _posix_rename_directory_no_replace(
     raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
-def _fsync_final_files(staged_output: Path) -> None:
+def _fsync_final_files(
+    staged_output: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
     try:
-        for name in ("translated.pdf", "manifest.json", "review-report.md"):
-            with (staged_output / name).open("rb") as stream:
-                os.fsync(stream.fileno())
-        if os.name != "nt":
-            descriptor = os.open(
+        _verify_opened_final_files(staged_output, opened, expected_hashes)
+        for name in _FINAL_OUTPUT_NAMES:
+            _flush_anchored_final_file(
                 staged_output,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                name,
+                opened[name].identity,
             )
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+        if not assembly._IS_WINDOWS:
+            if staged_output.descriptor is None:
+                raise PdfQAFailure(
+                    "anchored final PDF directory fsync is unavailable"
+                )
+            os.fsync(staged_output.descriptor)
+        staged_output.verify_visible()
+        _verify_opened_final_files(staged_output, opened, expected_hashes)
+    except PdfQAFailure:
+        raise
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"cannot fsync final PDF output: {error}") from error
     except OSError as error:
         raise PdfQAFailure(f"cannot fsync final PDF output: {error}") from error
+
+
+def _flush_anchored_final_file(
+    directory: assembly._DirectoryAnchor,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    descriptor: int | None = None
+    windows_handle: int | None = None
+    try:
+        if assembly._IS_WINDOWS:
+            windows_handle = assembly._windows_nt_create_relative(
+                assembly._windows_anchor_handle(directory),
+                name,
+                desired_access=0x40000000 | 0x00000080 | 0x00100000,
+                create_disposition=1,
+                create_options=0x00000020 | 0x00000040 | 0x00200000,
+                file_attributes=0,
+            )
+            identity = assembly._windows_file_identity(
+                windows_handle,
+                require_regular=True,
+            )
+            if identity != expected_identity:
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity before flush: {name}"
+                )
+            _windows_flush_file_buffers(windows_handle)
+            if (
+                assembly._windows_file_identity(
+                    windows_handle,
+                    require_regular=True,
+                )
+                != expected_identity
+            ):
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity during flush: {name}"
+                )
+        else:
+            if directory.descriptor is None:
+                raise PdfQAFailure(
+                    "anchored final PDF file fsync is unavailable"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDWR
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory.descriptor,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or assembly._is_reparse_stat(metadata)
+                or (metadata.st_dev, metadata.st_ino) != expected_identity
+            ):
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity before flush: {name}"
+                )
+            os.fsync(descriptor)
+        assembly._verify_anchored_input_identity(
+            directory,
+            name,
+            expected_identity,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if windows_handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(windows_handle)
+
+
+def _windows_flush_file_buffers(handle: int) -> None:
+    if not assembly._IS_WINDOWS:
+        raise PdfQAFailure("Windows final PDF flush is unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        flush = ctypes.WinDLL("kernel32", use_last_error=True).FlushFileBuffers
+        flush.argtypes = (wintypes.HANDLE,)
+        flush.restype = wintypes.BOOL
+        if not flush(wintypes.HANDLE(handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, OSError) as error:
+        raise PdfQAFailure(
+            f"cannot flush Windows final PDF artifact: {error}"
+        ) from error
+
+
+def _final_file_hashes(
+    directory: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+) -> dict[str, str]:
+    if sorted(opened) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifacts must contain exactly the reviewed three-file transaction"
+        )
+    assembly._verify_anchored_evidence(directory, opened)
+    result = {
+        name: hashlib.sha256(
+            assembly._read_opened_bytes(
+                opened[name],
+                directory.path / name,
+                "final PDF artifact",
+            )
+        ).hexdigest()
+        for name in _FINAL_OUTPUT_NAMES
+    }
+    assembly._verify_anchored_evidence(directory, opened)
+    return result
+
+
+def _verify_opened_final_files(
+    directory: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    if sorted(expected_hashes) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifact snapshot must cover exactly three files"
+        )
+    try:
+        visible_names = sorted(
+            path.name for path in directory.current_path().iterdir()
+        )
+    except (OSError, PdfAssemblyError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect final PDF artifacts: {error}"
+        ) from error
+    if visible_names != list(_FINAL_OUTPUT_NAMES) or sorted(opened) != list(
+        _FINAL_OUTPUT_NAMES
+    ):
+        raise PdfQAFailure(
+            "final PDF artifacts do not exactly match the reviewed transaction"
+        )
+    actual_hashes = _final_file_hashes(directory, opened)
+    for name in _FINAL_OUTPUT_NAMES:
+        if actual_hashes[name] != expected_hashes[name]:
+            raise PdfQAFailure(
+                f"final PDF artifacts changed content: {name}"
+            )
+
+
+def _verify_final_artifact_snapshot(
+    directory: assembly._DirectoryAnchor,
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    if sorted(expected_identities) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifact identity snapshot must cover exactly three files"
+        )
+    opened: dict[str, assembly._OpenedFile] = {}
+    try:
+        for name in _FINAL_OUTPUT_NAMES:
+            opened[name] = assembly._open_anchored_input_file(
+                directory,
+                name,
+                "final PDF artifact",
+            )
+            if opened[name].identity != expected_identities[name]:
+                raise PdfQAFailure(
+                    f"final PDF artifacts changed identity: {name}"
+                )
+        _verify_opened_final_files(directory, opened, expected_hashes)
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(
+            f"cannot verify final PDF artifacts: {error}"
+        ) from error
+    finally:
+        for item in opened.values():
+            assembly._close_opened_file(item)
 
 
 @dataclass(slots=True)
@@ -849,6 +1077,8 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
     published_json: assembly._PublishedFile | None = None
     json_publication_candidate: assembly._PublishedFile | None = None
     prior: _PriorEvidence | None = None
+    qa_artifact_identities: dict[str, tuple[int, int]] = {}
+    qa_artifact_hashes: dict[str, str] = {}
     completed = False
     temporary_name: str | None = None
     try:
@@ -992,6 +1222,10 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             ).hexdigest()
             for name in contacts
         }
+        qa_artifact_hashes = {**page_hashes, **contact_hashes}
+        qa_artifact_identities = {
+            name: item.identity for name, item in qa_artifacts.items()
+        }
         findings = tuple(
             PdfQAFinding(code, evidence)
             for code, evidence in sorted(
@@ -1049,20 +1283,28 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             run_dir / "staged-output" / "translated.pdf",
         )
         qa_pages_publication_attempted = True
-        _publish_qa_artifact_directory(
+        published_qa_pages_anchor = _publish_qa_artifact_directory(
             staging_anchor,
             "qa-pages",
             qa_pages_anchor,
             run_anchor,
             "qa-pages",
             qa_artifacts,
-            {**page_hashes, **contact_hashes},
+            qa_artifact_hashes,
             release_descendant_handles=(
                 _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS
             ),
         )
+        qa_pages_anchor.close()
+        qa_pages_anchor = published_qa_pages_anchor
         published_json = assembly._publish_new_file(
             staging_anchor, "pdf-qa.json", run_anchor, "pdf-qa.json"
+        )
+        _verify_qa_artifact_snapshot(
+            qa_pages_anchor,
+            qa_artifacts,
+            qa_artifact_identities,
+            qa_artifact_hashes,
         )
         completed = True
         if prior is not None:
@@ -2163,7 +2405,7 @@ def _publish_qa_artifact_directory(
     expected_hashes: Mapping[str, str],
     *,
     release_descendant_handles: bool,
-) -> None:
+) -> assembly._DirectoryAnchor:
     """Publish rendered QA evidence without trusting the Windows close window."""
     if not release_descendant_handles:
         _publish_new_directory(
@@ -2173,7 +2415,28 @@ def _publish_qa_artifact_directory(
             destination_parent,
             destination_name,
         )
-        return
+        published: assembly._DirectoryAnchor | None = None
+        try:
+            published = assembly._open_existing_child_directory(
+                destination_parent,
+                destination_name,
+                "published PDF QA pages",
+            )
+            if published.identity != source.identity:
+                raise PdfQAFailure(
+                    "rendered PDF QA artifacts changed directory identity during publication"
+                )
+            _verify_qa_artifact_snapshot(
+                published,
+                artifacts,
+                {name: item.identity for name, item in artifacts.items()},
+                expected_hashes,
+            )
+            return published
+        except BaseException:
+            if published is not None:
+                published.close()
+            raise
 
     expected_names = sorted(expected_hashes)
     if sorted(artifacts) != expected_names:
@@ -2201,6 +2464,7 @@ def _publish_qa_artifact_directory(
 
     published: assembly._DirectoryAnchor | None = None
     reopened: dict[str, assembly._OpenedFile] = {}
+    keep_published = False
     try:
         published = assembly._open_existing_child_directory(
             destination_parent,
@@ -2223,6 +2487,10 @@ def _publish_qa_artifact_directory(
             expected_identities,
             expected_hashes,
         )
+        artifacts.clear()
+        artifacts.update(reopened)
+        keep_published = True
+        return published
     except PdfQAFailure:
         for item in reopened.values():
             assembly._close_opened_file(item)
@@ -2233,12 +2501,13 @@ def _publish_qa_artifact_directory(
         raise PdfQAFailure(
             f"rendered PDF QA artifacts changed during publication: {error}"
         ) from error
+    except BaseException:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise
     finally:
-        if published is not None:
+        if published is not None and not keep_published:
             published.close()
-
-    artifacts.clear()
-    artifacts.update(reopened)
 
 
 def _verify_qa_artifact_snapshot(

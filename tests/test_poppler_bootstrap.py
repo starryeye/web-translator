@@ -4,8 +4,10 @@ import hashlib
 import importlib.util
 from io import BytesIO
 from pathlib import Path
+import stat
 import sys
 from types import ModuleType
+import warnings
 import zipfile
 
 import pytest
@@ -49,6 +51,53 @@ def _zip_bytes(entries: dict[str, bytes]) -> bytes:
         for name, payload in entries.items():
             archive.writestr(name, payload)
     return output.getvalue()
+
+
+def _zip_members(entries: list[tuple[str | zipfile.ZipInfo, bytes]]) -> bytes:
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            for name, payload in entries:
+                archive.writestr(name, payload)
+    return output.getvalue()
+
+
+def _replace_raw_member_name(payload: bytes, old: str, new: str) -> bytes:
+    old_bytes = old.encode("utf-8")
+    new_bytes = new.encode("utf-8")
+    assert len(old_bytes) == len(new_bytes)
+    assert payload.count(old_bytes) == 2, "expected local and central ZIP names"
+    return payload.replace(old_bytes, new_bytes)
+
+
+def _mark_zip_members_encrypted(payload: bytes) -> bytes:
+    patched = bytearray(payload)
+    for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        start = 0
+        found = 0
+        while True:
+            offset = patched.find(signature, start)
+            if offset < 0:
+                break
+            flags = int.from_bytes(
+                patched[offset + flag_offset : offset + flag_offset + 2],
+                "little",
+            )
+            patched[offset + flag_offset : offset + flag_offset + 2] = (
+                flags | 0x1
+            ).to_bytes(2, "little")
+            start = offset + 4
+            found += 1
+        assert found > 0
+    return bytes(patched)
+
+
+def _valid_entries() -> list[tuple[str | zipfile.ZipInfo, bytes]]:
+    return [
+        ("poppler-test/Library/bin/pdfinfo.exe", b"pdfinfo"),
+        ("poppler-test/Library/bin/pdftoppm.exe", b"pdftoppm"),
+    ]
 
 
 def _contract(
@@ -167,6 +216,104 @@ def test_install_rejects_unsafe_zip_member_paths_before_extraction(
 
     assert not destination.exists()
     assert not (tmp_path / "escape.exe").exists()
+
+
+def test_validated_members_rejects_raw_backslash_after_runtime_normalization() -> None:
+    module = _load_script()
+    safe_name = "poppler-test/Library/bin/escape.dll"
+    raw_name = "poppler-test\\Library\\bin\\escape.dll"
+    payload = _replace_raw_member_name(
+        _zip_members([*_valid_entries(), (safe_name, b"escape")]),
+        safe_name,
+        raw_name,
+    )
+    contract = _contract(module, payload)
+
+    with zipfile.ZipFile(BytesIO(payload), "r") as archive:
+        member = archive.infolist()[-1]
+        assert member.orig_filename == raw_name
+        # Reproduce ZipInfo's Windows host normalization while retaining the raw name.
+        member.filename = member.filename.replace("\\", "/")
+        with pytest.raises(module.PopplerBootstrapError, match="unsafe path"):
+            module._validated_members(archive, contract)
+
+
+def test_install_rejects_raw_backslash_member_independent_of_host_writer(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    safe_name = "poppler-test/Library/bin/escape.dll"
+    raw_name = "poppler-test\\Library\\bin\\escape.dll"
+    payload = _replace_raw_member_name(
+        _zip_members([*_valid_entries(), (safe_name, b"escape")]),
+        safe_name,
+        raw_name,
+    )
+
+    with pytest.raises(module.PopplerBootstrapError, match="unsafe path"):
+        module.install_pinned_poppler(
+            tmp_path / "installed",
+            contract=_contract(module, payload),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+        )
+
+
+@pytest.mark.parametrize("name", ["/rooted/escape.dll", "C:/drive/escape.dll"])
+def test_install_rejects_rooted_and_drive_zip_paths(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    module = _load_script()
+    payload = _zip_members([*_valid_entries(), (name, b"escape")])
+
+    with pytest.raises(module.PopplerBootstrapError, match="unsafe path"):
+        module.install_pinned_poppler(
+            tmp_path / "installed",
+            contract=_contract(module, payload),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+        )
+
+
+def test_install_rejects_duplicate_zip_member(tmp_path: Path) -> None:
+    module = _load_script()
+    duplicate = "poppler-test/Library/bin/dependency.dll"
+    payload = _zip_members(
+        [*_valid_entries(), (duplicate, b"first"), (duplicate, b"second")]
+    )
+
+    with pytest.raises(module.PopplerBootstrapError, match="duplicate member"):
+        module.install_pinned_poppler(
+            tmp_path / "installed",
+            contract=_contract(module, payload),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+        )
+
+
+def test_install_rejects_symbolic_link_zip_member(tmp_path: Path) -> None:
+    module = _load_script()
+    link = zipfile.ZipInfo("poppler-test/Library/bin/link.dll")
+    link.create_system = 3
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    payload = _zip_members([*_valid_entries(), (link, b"dependency.dll")])
+
+    with pytest.raises(module.PopplerBootstrapError, match="symbolic link"):
+        module.install_pinned_poppler(
+            tmp_path / "installed",
+            contract=_contract(module, payload),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+        )
+
+
+def test_install_rejects_encrypted_zip_member(tmp_path: Path) -> None:
+    module = _load_script()
+    payload = _mark_zip_members_encrypted(_zip_members(_valid_entries()))
+
+    with pytest.raises(module.PopplerBootstrapError, match="encrypted member"):
+        module.install_pinned_poppler(
+            tmp_path / "installed",
+            contract=_contract(module, payload),
+            opener=lambda *_args, **_kwargs: _Response(payload),
+        )
 
 
 @pytest.mark.parametrize(

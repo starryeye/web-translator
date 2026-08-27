@@ -8,7 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import stat
@@ -207,6 +207,7 @@ def _validated_members(
     if len(members) > contract.max_entries:
         raise PopplerBootstrapError("Poppler ZIP entry count exceeds limit")
     seen: set[str] = set()
+    seen_raw: set[str] = set()
     total_uncompressed = 0
     required_names = {
         f"{contract.root_prefix}{relative}"
@@ -214,27 +215,22 @@ def _validated_members(
     }
     for member in members:
         name = member.filename
-        trimmed = name[:-1] if name.endswith("/") else name
-        segments = trimmed.split("/")
-        if (
-            not name
-            or "\x00" in name
-            or "\\" in name
-            or PurePosixPath(name).is_absolute()
-            or any(segment in {"", ".", ".."} for segment in segments)
-        ):
+        raw_name = member.orig_filename
+        candidate_names = (
+            (raw_name,) if raw_name == name else (raw_name, name)
+        )
+        for candidate in candidate_names:
+            _validate_zip_member_name(candidate)
+            if not candidate.startswith(contract.root_prefix):
+                raise PopplerBootstrapError(
+                    f"Poppler ZIP member is outside pinned root: {candidate!r}"
+                )
+        if name in seen or raw_name in seen_raw:
             raise PopplerBootstrapError(
-                f"Poppler ZIP contains an unsafe path: {name!r}"
-            )
-        if not name.startswith(contract.root_prefix):
-            raise PopplerBootstrapError(
-                f"Poppler ZIP member is outside pinned root: {name!r}"
-            )
-        if name in seen:
-            raise PopplerBootstrapError(
-                f"Poppler ZIP contains a duplicate member: {name!r}"
+                f"Poppler ZIP contains a duplicate member: {raw_name!r}"
             )
         seen.add(name)
+        seen_raw.add(raw_name)
         unix_mode = (member.external_attr >> 16) & 0o170000
         if unix_mode == stat.S_IFLNK:
             raise PopplerBootstrapError(
@@ -255,6 +251,22 @@ def _validated_members(
             f"Poppler ZIP is missing required files: {', '.join(missing)}"
         )
     return members
+
+
+def _validate_zip_member_name(name: str) -> None:
+    trimmed = name[:-1] if name.endswith("/") else name
+    segments = trimmed.split("/")
+    if (
+        not name
+        or "\x00" in name
+        or "\\" in name
+        or PurePosixPath(name).is_absolute()
+        or bool(PureWindowsPath(name).drive)
+        or any(segment in {"", ".", ".."} for segment in segments)
+    ):
+        raise PopplerBootstrapError(
+            f"Poppler ZIP contains an unsafe path: {name!r}"
+        )
 
 
 def _extract_members(

@@ -86,6 +86,7 @@ def test_windows_workflow_runs_live_nonempty_directory_publication_contracts() -
     for node in (
         "tests/test_pdf_qa.py::test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles",
         "tests/test_pdf_qa.py::test_windows_nonempty_qa_directory_publication_never_clobbers_destination",
+        "tests/test_pdf_pipeline.py::test_windows_finalize_durably_publishes_exact_reviewed_output",
     ):
         assert node in workflow
 
