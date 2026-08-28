@@ -589,6 +589,129 @@ def test_prepare_pdf_qa_rechecks_public_snapshot_after_json_commit(
     assert not assembled_pdf_run.output_dir.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
+def test_prepare_pdf_qa_cleanup_preserves_replacement_raced_before_unlink(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement = b"unrelated replacement PDF QA record"
+    keep = assembled_pdf_run.run_dir / "keep.txt"
+    keep.write_bytes(b"unrelated run content")
+    real_verify = pdf_qa_module._verify_qa_artifact_snapshot
+    real_unlink = os.unlink
+    real_rename = os.rename
+    race_installed = False
+
+    def fail_after_json_commit(*args: object, **kwargs: object) -> None:
+        if (assembled_pdf_run.run_dir / "pdf-qa.json").exists():
+            raise PdfQAFailure("injected post-JSON integrity failure")
+        real_verify(*args, **kwargs)  # type: ignore[arg-type]
+
+    def race_cleanup_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal race_installed
+        name = os.fsdecode(path)
+        if not race_installed and (
+            name == "pdf-qa.json" or name.startswith(".pdf-qa-cleanup-")
+        ):
+            if name == "pdf-qa.json":
+                real_rename(
+                    "pdf-qa.json",
+                    "captured-owned-pdf-qa.json",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+            (assembled_pdf_run.run_dir / "pdf-qa.json").write_bytes(replacement)
+            race_installed = True
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_verify_qa_artifact_snapshot",
+        fail_after_json_commit,
+    )
+    monkeypatch.setattr(pdf_qa_module.os, "unlink", race_cleanup_unlink)
+
+    with pytest.raises(PdfQAFailure, match="post-JSON integrity failure"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert race_installed
+    assert (assembled_pdf_run.run_dir / "pdf-qa.json").read_bytes() == replacement
+    assert keep.read_bytes() == b"unrelated run content"
+    assert not assembled_pdf_run.output_dir.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
+def test_remove_owned_qa_record_restores_a_mismatching_visible_file(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    replacement = run_dir / "pdf-qa.json"
+    replacement.write_bytes(b"unrelated visible record")
+    anchor = pdf_qa_module.assembly._open_directory_anchor(run_dir, "run")
+    try:
+        pdf_qa_module._remove_owned_qa_record(
+            anchor,
+            "pdf-qa.json",
+            pdf_qa_module.assembly._PublishedFile((0, 0)),
+        )
+    finally:
+        anchor.close()
+
+    assert replacement.read_bytes() == b"unrelated visible record"
+    assert list(run_dir.glob(".pdf-qa-cleanup-*")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
+def test_qa_snapshot_enumerates_the_held_directory_after_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = tmp_path / "held"
+    replacement = tmp_path / "replacement"
+    held.mkdir()
+    replacement.mkdir()
+    payload = b"rendered artifact"
+    for directory in (held, replacement):
+        (directory / "page-001.png").write_bytes(payload)
+    (held / "unexpected.txt").write_bytes(b"held extra child")
+    anchor = pdf_qa_module.assembly._open_directory_anchor(held, "held QA pages")
+    artifact = pdf_qa_module.assembly._open_anchored_input_file(
+        anchor,
+        "page-001.png",
+        "rendered PDF QA artifact",
+    )
+    real_current_path = pdf_qa_module.assembly._DirectoryAnchor.current_path
+
+    def replaced_path(
+        current: pdf_qa_module.assembly._DirectoryAnchor,
+    ) -> Path:
+        if current is anchor:
+            return replacement
+        return real_current_path(current)
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly._DirectoryAnchor,
+        "current_path",
+        replaced_path,
+    )
+    try:
+        with pytest.raises(PdfQAFailure, match="exactly match"):
+            pdf_qa_module._verify_qa_artifact_snapshot(
+                anchor,
+                {"page-001.png": artifact},
+                {"page-001.png": artifact.identity},
+                {"page-001.png": hashlib.sha256(payload).hexdigest()},
+            )
+    finally:
+        pdf_qa_module.assembly._close_opened_file(artifact)
+        anchor.close()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires real Windows directory rename semantics")
 def test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles(
     tmp_path: Path,

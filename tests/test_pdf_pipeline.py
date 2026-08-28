@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -411,6 +412,36 @@ def test_committed_pdf_acceptance_fixtures_regenerate_byte_for_byte(
         for relative in committed_files
     )
 
+    repository_root = PDF_FIXTURE_ROOT.parents[2]
+    windows_checkout = tmp_path / "windows-checkout"
+    windows_checkout.mkdir()
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.autocrlf=true",
+            "checkout-index",
+            f"--prefix={windows_checkout.as_posix()}/",
+            "--",
+            *[
+                str((PDF_FIXTURE_ROOT / relative).relative_to(repository_root))
+                for relative in committed_files
+            ],
+        ],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    windows_fixture_root = windows_checkout / "tests" / "fixtures" / "pdf"
+    windows_mismatches = [
+        str(relative)
+        for relative in committed_files
+        if (regenerated / relative).read_bytes()
+        != (windows_fixture_root / relative).read_bytes()
+    ]
+    assert windows_mismatches == []
+
 
 @pytest.mark.parametrize(
     ("fixture_name", "source_relative"),
@@ -627,7 +658,8 @@ def test_windows_finalize_durably_publishes_exact_reviewed_output(
     assert not (prepared_pdf_run.run_dir / "staged-output").exists()
 
 
-def test_fsync_final_files_uses_anchored_write_descriptors(
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
+def test_fsync_final_files_uses_anchored_read_descriptors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,7 +706,10 @@ def test_fsync_final_files_uses_anchored_write_descriptors(
         anchor.close()
 
     assert sorted(name for name, _flags, _dir_fd in anchored_opens) == sorted(payloads)
-    assert all(flags & os.O_RDWR for _name, flags, _dir_fd in anchored_opens)
+    assert all(
+        not flags & (os.O_RDWR | os.O_WRONLY)
+        for _name, flags, _dir_fd in anchored_opens
+    )
     assert all(dir_fd is not None for _name, _flags, dir_fd in anchored_opens)
     assert {name: (staged / name).read_bytes() for name in payloads} == payloads
 
@@ -705,7 +740,7 @@ def test_fsync_final_files_uses_windows_anchored_flush_handles(
     }
     next_handle = 100
     handle_names: dict[int, str] = {}
-    desired_access: dict[str, int] = {}
+    desired_access: dict[int, int] = {}
     flushed: list[int] = []
     closed: list[int] = []
 
@@ -719,11 +754,16 @@ def test_fsync_final_files_uses_windows_anchored_flush_handles(
         handle = next_handle
         next_handle += 1
         handle_names[handle] = name
-        desired_access[name] = options["desired_access"]
+        desired_access[handle] = options["desired_access"]
         return handle
 
     monkeypatch.setattr(pdf_qa_module.assembly, "_IS_WINDOWS", True)
     monkeypatch.setattr(pdf_qa_module.assembly, "_windows_anchor_handle", lambda _anchor: 55)
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_windows_directory_names",
+        lambda handle: list(payloads) if handle == 55 else [],
+    )
     monkeypatch.setattr(pdf_qa_module.assembly, "_windows_nt_create_relative", open_relative)
     monkeypatch.setattr(
         pdf_qa_module.assembly,
@@ -748,10 +788,145 @@ def test_fsync_final_files_uses_windows_anchored_flush_handles(
             pdf_qa_module.assembly._close_opened_file(item)
         anchor.close()
 
-    assert set(desired_access) == set(payloads)
-    assert all(access & 0x40000000 for access in desired_access.values())
-    assert flushed == closed
+    write_handles = {
+        handle for handle, access in desired_access.items() if access & 0x40000000
+    }
+    assert {handle_names[handle] for handle in write_handles} == set(payloads)
+    assert set(flushed) == write_handles
+    assert set(flushed).issubset(closed)
     assert len(flushed) == 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
+def test_final_snapshot_enumerates_the_held_directory_after_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = tmp_path / "held"
+    replacement = tmp_path / "replacement"
+    held.mkdir()
+    replacement.mkdir()
+    payloads = {
+        "manifest.json": b"{}\n",
+        "review-report.md": b"# reviewed\n",
+        "translated.pdf": b"%PDF-1.7\nfinal\n",
+    }
+    for directory in (held, replacement):
+        for name, payload in payloads.items():
+            (directory / name).write_bytes(payload)
+    (held / "unexpected.txt").write_bytes(b"held extra child")
+    anchor = pdf_qa_module.assembly._open_directory_anchor(held, "held final output")
+    opened = {
+        name: pdf_qa_module.assembly._open_anchored_input_file(
+            anchor,
+            name,
+            "final PDF artifact",
+        )
+        for name in payloads
+    }
+    expected_hashes = {
+        name: hashlib.sha256(payload).hexdigest()
+        for name, payload in payloads.items()
+    }
+    real_current_path = pdf_qa_module.assembly._DirectoryAnchor.current_path
+
+    def replaced_path(
+        current: pdf_qa_module.assembly._DirectoryAnchor,
+    ) -> Path:
+        if current is anchor:
+            return replacement
+        return real_current_path(current)
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly._DirectoryAnchor,
+        "current_path",
+        replaced_path,
+    )
+    try:
+        with pytest.raises(PdfQAFailure, match="exactly match"):
+            pdf_qa_module._verify_opened_final_files(
+                anchor,
+                opened,
+                expected_hashes,
+            )
+    finally:
+        for item in opened.values():
+            pdf_qa_module.assembly._close_opened_file(item)
+        anchor.close()
+
+
+def test_final_snapshot_uses_windows_held_handle_for_child_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    for name in pdf_qa_module._FINAL_OUTPUT_NAMES:
+        (replacement / name).write_bytes(b"clean replacement")
+
+    class FakeAnchor:
+        descriptor = None
+        path = replacement
+
+        def current_path(self) -> Path:
+            return replacement
+
+    expected_hashes = {name: "0" * 64 for name in pdf_qa_module._FINAL_OUTPUT_NAMES}
+    monkeypatch.setattr(pdf_qa_module.assembly, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_anchor_handle",
+        lambda _anchor: 73,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_windows_directory_names",
+        lambda handle: [*pdf_qa_module._FINAL_OUTPUT_NAMES, "unexpected.txt"]
+        if handle == 73
+        else [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_final_file_hashes",
+        lambda *_args, **_kwargs: expected_hashes,
+    )
+
+    with pytest.raises(PdfQAFailure, match="exactly match"):
+        pdf_qa_module._verify_opened_final_files(
+            FakeAnchor(),  # type: ignore[arg-type]
+            {name: object() for name in pdf_qa_module._FINAL_OUTPUT_NAMES},  # type: ignore[arg-type]
+            expected_hashes,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows directory handles")
+def test_windows_enumerates_exact_children_from_the_held_directory_handle(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent"
+    directory = parent / "held 한국어"
+    directory.mkdir(parents=True)
+    (directory / "alpha.txt").write_bytes(b"alpha")
+    (directory / "한글.txt").write_bytes(b"korean")
+    parent_anchor = pdf_qa_module.assembly._open_directory_anchor(parent, "parent")
+    anchor = pdf_qa_module.assembly._open_existing_child_directory(
+        parent_anchor,
+        directory.name,
+        "held",
+    )
+    try:
+        assert pdf_qa_module._anchored_directory_names(anchor) == [
+            "alpha.txt",
+            "한글.txt",
+        ]
+        assert pdf_qa_module._anchored_directory_names(anchor) == [
+            "alpha.txt",
+            "한글.txt",
+        ]
+    finally:
+        anchor.close()
+        parent_anchor.close()
 
 
 def test_finalize_closes_windows_descendants_before_directory_publication(
@@ -772,11 +947,13 @@ def test_finalize_closes_windows_descendants_before_directory_publication(
             captured.append(item)
         return item
 
-    def require_closed_descendants(*args: object, **kwargs: object) -> None:
+    def require_closed_descendants(
+        *args: object, **kwargs: object
+    ) -> int | None:
         if args[1] == "staged-output":
             assert captured
             assert all(item.stream.closed for item in captured)  # type: ignore[attr-defined]
-        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+        return real_rename(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
         pdf_qa_module,
@@ -814,10 +991,10 @@ def test_finalize_rechecks_exact_transaction_after_directory_publication(
 ) -> None:
     real_rename = pdf_qa_module._rename_anchored_directory_no_replace
 
-    def publish_then_mutate(*args: object, **kwargs: object) -> None:
-        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+    def publish_then_mutate(*args: object, **kwargs: object) -> int | None:
+        handle = real_rename(*args, **kwargs)  # type: ignore[arg-type]
         if args[1] != "staged-output":
-            return
+            return handle
         destination = prepared_pdf_run.output_dir
         translated = destination / "translated.pdf"
         if mutation == "extra-child":
@@ -830,6 +1007,7 @@ def test_finalize_rechecks_exact_transaction_after_directory_publication(
                 stream.seek(0)
                 stream.write(b"foreign same-inode rewrite")
                 stream.truncate()
+        return handle
 
     monkeypatch.setattr(
         pdf_qa_module,
@@ -990,7 +1168,7 @@ def test_finalize_rollback_preserves_raced_private_name_and_moved_identity(
     ]
 
 
-def test_finalize_commits_success_if_postpublication_rollback_is_unavailable(
+def test_finalize_fails_closed_if_postpublication_rollback_is_unavailable(
     prepared_pdf_run: PdfQARun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1007,6 +1185,10 @@ def test_finalize_commits_success_if_postpublication_rollback_is_unavailable(
         real_require_identity(parent, name, expected, context)  # type: ignore[arg-type]
 
     def fail_rollback(*args: object, **kwargs: object) -> str:
+        raced_staging = prepared_pdf_run.run_dir / "staged-output"
+        raced_staging.mkdir()
+        (raced_staging / "manifest.json").write_bytes(b"foreign manifest")
+        (raced_staging / "review-report.md").write_bytes(b"foreign review")
         raise PdfQAFailure("injected rollback failure")
 
     monkeypatch.setattr(
@@ -1016,18 +1198,26 @@ def test_finalize_commits_success_if_postpublication_rollback_is_unavailable(
     )
     monkeypatch.setattr(pdf_qa_module, "_rollback_final_directory", fail_rollback)
 
-    finalized = finalize_pdf_output(
-        prepared_pdf_run.run_dir,
-        prepared_pdf_run.output_dir,
-    )
+    with pytest.raises(
+        PdfQAFailure,
+        match="injected post-publication identity failure",
+    ):
+        finalize_pdf_output(
+            prepared_pdf_run.run_dir,
+            prepared_pdf_run.output_dir,
+        )
 
-    assert finalized == prepared_pdf_run.output_dir
-    assert sorted(path.name for path in finalized.iterdir()) == [
+    assert sorted(path.name for path in prepared_pdf_run.output_dir.iterdir()) == [
         "manifest.json",
         "review-report.md",
         "translated.pdf",
     ]
-    assert not (prepared_pdf_run.run_dir / "staged-output").exists()
+    assert (
+        prepared_pdf_run.run_dir / "staged-output" / "manifest.json"
+    ).read_bytes() == b"foreign manifest"
+    assert (
+        prepared_pdf_run.run_dir / "staged-output" / "review-report.md"
+    ).read_bytes() == b"foreign review"
 
 
 @pytest.mark.parametrize("racer_kind", ["empty-directory", "symlink"])
@@ -1315,6 +1505,133 @@ def test_windows_final_publication_uses_relative_no_replace_rename(
 
     assert (output_parent / "검토 완료").is_dir()
     assert closed == [99]
+
+
+def test_windows_final_rollback_reuses_the_held_publication_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePathAnchor:
+        def __init__(self, handle: int, path: Path) -> None:
+            self.handle = handle
+            self.path = path
+
+        def current_path(self) -> Path:
+            return self.path
+
+        def close(self) -> None:
+            return
+
+    run_dir = tmp_path / "run"
+    staged = run_dir / "staged-output"
+    output_parent = tmp_path / "final-parent"
+    output = output_parent / "result"
+    staged.mkdir(parents=True)
+    output_parent.mkdir()
+
+    def make_anchor(path: Path, label: str, handle: int) -> object:
+        metadata = path.stat()
+        return pdf_qa_module.assembly._DirectoryAnchor(
+            path,
+            label,
+            (metadata.st_dev, metadata.st_ino),
+            None,
+            FakePathAnchor(handle, path),
+        )
+
+    run_anchor = make_anchor(run_dir, "run", 41)
+    staged_anchor = make_anchor(staged, "staged", 42)
+    output_anchor = make_anchor(output_parent, "output", 43)
+    next_handle = 99
+    rename_handles: list[int] = []
+    closed: list[int] = []
+
+    def open_source(
+        root_handle: int,
+        name: str,
+        **options: int,
+    ) -> int:
+        nonlocal next_handle
+        assert options["desired_access"] & 0x00010000
+        assert (root_handle, name) in {(41, "staged-output"), (43, "result")}
+        handle = next_handle
+        next_handle += 1
+        return handle
+
+    def rename_directory(
+        source_handle: int,
+        destination_handle: int,
+        destination_name: str,
+    ) -> None:
+        rename_handles.append(source_handle)
+        if destination_handle == 43:
+            assert destination_name == "result"
+            staged.rename(output)
+        else:
+            assert (destination_handle, destination_name) == (41, "staged-output")
+            output.rename(staged)
+
+    def open_published(
+        _parent: object,
+        name: str,
+        _label: str,
+    ) -> object:
+        return make_anchor(output_parent / name, "published", 44)
+
+    snapshots = 0
+
+    def fail_postpublication_snapshot(*_args: object, **_kwargs: object) -> None:
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots == 2:
+            raise PdfQAFailure("injected post-publication snapshot failure")
+
+    monkeypatch.setattr(pdf_qa_module.assembly, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_nt_create_relative",
+        open_source,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_file_identity",
+        lambda _handle, require_regular: staged_anchor.identity,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_rename_open_file",
+        rename_directory,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_open_existing_child_directory",
+        open_published,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module,
+        "_verify_final_artifact_snapshot",
+        fail_postpublication_snapshot,
+    )
+
+    with pytest.raises(PdfQAFailure, match="snapshot failure"):
+        pdf_qa_module._publish_final_directory_no_clobber(
+            run_anchor,  # type: ignore[arg-type]
+            staged_anchor,  # type: ignore[arg-type]
+            output_anchor,  # type: ignore[arg-type]
+            "result",
+            {name: (1, index) for index, name in enumerate(pdf_qa_module._FINAL_OUTPUT_NAMES)},
+            {name: f"{index:064x}" for index, name in enumerate(pdf_qa_module._FINAL_OUTPUT_NAMES)},
+        )
+
+    assert rename_handles == [99, 99]
+    assert closed == [99]
+    assert staged.is_dir()
+    assert not output.exists()
 
 
 # Production mutation caught: nondeterministic PDF manifest serialization from unchanged evidence.

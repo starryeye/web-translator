@@ -78,6 +78,10 @@ class _PdfPublicationRolledBack(PdfQAFailure):
         self.private_name = private_name
 
 
+class _PdfPublicationRollbackFailed(PdfQAFailure):
+    """A failed post-publication check could not restore private staging."""
+
+
 @dataclass(frozen=True, slots=True)
 class PdfQAFinding:
     code: str
@@ -443,6 +447,9 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     except _PdfPublicationRolledBack:
         publication_rolled_back = True
         raise
+    except _PdfPublicationRollbackFailed:
+        publication_rolled_back = True
+        raise
     except PdfQAFailure:
         raise
     except (PdfAssemblyError, PdfContractError) as error:
@@ -643,6 +650,7 @@ def _publish_final_directory_no_clobber(
     expected_hashes: Mapping[str, str],
 ) -> None:
     destination = destination_parent.path / destination_name
+    publication_handle: int | None = None
     try:
         _require_anchored_directory_identity(
             source_parent,
@@ -656,12 +664,13 @@ def _publish_final_directory_no_clobber(
             expected_hashes,
         )
         destination_parent.verify_visible()
-        _rename_anchored_directory_no_replace(
+        publication_handle = _rename_anchored_directory_no_replace(
             source_parent,
             "staged-output",
             source.identity,
             destination_parent,
             destination_name,
+            retain_windows_handle=True,
         )
         try:
             _require_anchored_directory_identity(
@@ -695,6 +704,7 @@ def _publish_final_directory_no_clobber(
                     destination_name,
                     source,
                     source_parent,
+                    windows_source_handle=publication_handle,
                 )
             except (
                 AttributeError,
@@ -702,8 +712,15 @@ def _publish_final_directory_no_clobber(
                 OSError,
                 PdfAssemblyError,
                 PdfQAFailure,
-            ):
-                return
+            ) as rollback_error:
+                message = (
+                    str(error)
+                    if isinstance(error, PdfQAFailure)
+                    else f"cannot publish final PDF output: {error}"
+                )
+                raise _PdfPublicationRollbackFailed(
+                    f"{message}; publication rollback failed: {rollback_error}"
+                ) from error
             message = (
                 str(error)
                 if isinstance(error, PdfQAFailure)
@@ -720,6 +737,9 @@ def _publish_final_directory_no_clobber(
                 f"reserved final output already exists: {destination}"
             ) from error
         raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+    finally:
+        if publication_handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(publication_handle)
 
 
 def _rename_anchored_directory_no_replace(
@@ -728,8 +748,11 @@ def _rename_anchored_directory_no_replace(
     source_identity: tuple[int, int],
     destination_parent: assembly._DirectoryAnchor,
     destination_name: str,
-) -> None:
+    *,
+    retain_windows_handle: bool = False,
+) -> int | None:
     source_handle: int | None = None
+    keep_source_handle = False
     try:
         if (
             source_parent.descriptor is not None
@@ -762,12 +785,16 @@ def _rename_anchored_directory_no_replace(
                 assembly._windows_anchor_handle(destination_parent),
                 destination_name,
             )
+            if retain_windows_handle:
+                keep_source_handle = True
+                return source_handle
         else:
             raise PdfQAFailure(
                 "safe atomic no-clobber PDF directory rename is unavailable"
             )
+        return None
     finally:
-        if source_handle is not None:
+        if source_handle is not None and not keep_source_handle:
             assembly.pdf_acquire_module._close_windows_handle(source_handle)
 
 
@@ -776,6 +803,8 @@ def _rollback_final_directory(
     public_name: str,
     source: assembly._DirectoryAnchor,
     private_parent: assembly._DirectoryAnchor,
+    *,
+    windows_source_handle: int | None = None,
 ) -> str:
     private_parent.verify_visible()
     candidates = ["staged-output"] + [
@@ -789,17 +818,104 @@ def _rollback_final_directory(
                 source.identity,
                 "failed published final PDF output",
             )
-            _rename_anchored_directory_no_replace(
-                public_parent,
-                public_name,
-                source.identity,
-                private_parent,
-                private_name,
-            )
+            if windows_source_handle is not None:
+                assembly._windows_rename_open_file(
+                    windows_source_handle,
+                    assembly._windows_anchor_handle(private_parent),
+                    private_name,
+                )
+            else:
+                _rename_anchored_directory_no_replace(
+                    public_parent,
+                    public_name,
+                    source.identity,
+                    private_parent,
+                    private_name,
+                )
             return private_name
         except FileExistsError:
             continue
     raise PdfQAFailure("cannot reserve private PDF publication rollback directory")
+
+
+def _remove_owned_qa_record(
+    directory: assembly._DirectoryAnchor,
+    name: str,
+    published: assembly._PublishedFile | None,
+) -> None:
+    if published is None:
+        return
+    if assembly._IS_WINDOWS:
+        assembly._remove_owned_file(directory, name, published)
+        return
+    if directory.descriptor is None:
+        return
+
+    private_name: str | None = None
+    for _ in range(100):
+        candidate = f".pdf-qa-cleanup-{os.urandom(16).hex()}"
+        try:
+            _posix_rename_directory_no_replace(
+                directory.descriptor,
+                name,
+                directory.descriptor,
+                candidate,
+            )
+            private_name = candidate
+            break
+        except FileNotFoundError:
+            return
+        except FileExistsError:
+            continue
+        except (AttributeError, NotImplementedError, OSError):
+            return
+    if private_name is None:
+        return
+
+    descriptor: int | None = None
+    moved_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(
+            private_name,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory.descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or assembly._is_reparse_stat(metadata):
+            return
+        moved_identity = (metadata.st_dev, metadata.st_ino)
+        if moved_identity != published.identity:
+            return
+        os.unlink(private_name, dir_fd=directory.descriptor)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != moved_identity:
+            raise PdfQAFailure("moved PDF QA cleanup handle changed identity")
+    except (AttributeError, NotImplementedError, OSError, PdfQAFailure):
+        return
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if moved_identity != published.identity:
+            try:
+                _posix_rename_directory_no_replace(
+                    directory.descriptor,
+                    private_name,
+                    directory.descriptor,
+                    name,
+                )
+            except (
+                AttributeError,
+                FileExistsError,
+                FileNotFoundError,
+                NotImplementedError,
+                OSError,
+            ):
+                pass
 
 
 def _posix_rename_directory_no_replace(
@@ -920,7 +1036,7 @@ def _flush_anchored_final_file(
                 )
             descriptor = os.open(
                 name,
-                os.O_RDWR
+                os.O_RDONLY
                 | getattr(os, "O_BINARY", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=directory.descriptor,
@@ -998,9 +1114,7 @@ def _verify_opened_final_files(
             "final PDF artifact snapshot must cover exactly three files"
         )
     try:
-        visible_names = sorted(
-            path.name for path in directory.current_path().iterdir()
-        )
+        visible_names = _anchored_directory_names(directory)
     except (OSError, PdfAssemblyError) as error:
         raise PdfQAFailure(
             f"cannot inspect final PDF artifacts: {error}"
@@ -1324,7 +1438,7 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             # before exact held-directory rollback/quarantine on failure.
             for artifact in qa_artifacts.values():
                 assembly._close_opened_file(artifact)
-            assembly._remove_owned_file(
+            _remove_owned_qa_record(
                 run_anchor,
                 "pdf-qa.json",
                 published_json or json_publication_candidate,
@@ -1369,7 +1483,7 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                 "render-input.pdf",
                 render_input_candidate,
             )
-            assembly._remove_owned_file(
+            _remove_owned_qa_record(
                 staging_anchor,
                 "pdf-qa.json",
                 published_json or json_publication_candidate,
@@ -2518,7 +2632,7 @@ def _verify_qa_artifact_snapshot(
 ) -> None:
     expected_names = sorted(expected_hashes)
     try:
-        visible_names = sorted(path.name for path in directory.current_path().iterdir())
+        visible_names = _anchored_directory_names(directory)
     except (OSError, PdfAssemblyError) as error:
         raise PdfQAFailure(
             f"cannot inspect rendered PDF QA artifacts: {error}"
@@ -2550,6 +2664,129 @@ def _verify_qa_artifact_snapshot(
     except PdfAssemblyError as error:
         raise PdfQAFailure(
             f"rendered PDF QA artifacts changed during publication: {error}"
+        ) from error
+
+
+def _anchored_directory_names(
+    directory: assembly._DirectoryAnchor,
+) -> list[str]:
+    try:
+        if directory.descriptor is not None:
+            return sorted(os.listdir(directory.descriptor))
+        if assembly._IS_WINDOWS:
+            return sorted(
+                _windows_directory_names(
+                    assembly._windows_anchor_handle(directory)
+                )
+            )
+        raise PdfAssemblyError(
+            f"safe anchored directory enumeration is unavailable: {directory.path}"
+        )
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate anchored directory {directory.path}: {error}"
+        ) from error
+
+
+def _windows_directory_names(directory_handle: int) -> list[str]:
+    if not assembly._IS_WINDOWS:
+        raise PdfAssemblyError("Windows anchored directory enumeration is unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("status_or_pointer", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            )
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        query_directory = ntdll.NtQueryDirectoryFile
+        query_directory.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            ctypes.POINTER(IoStatusBlock),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int32,
+            wintypes.BOOLEAN,
+            wintypes.LPVOID,
+            wintypes.BOOLEAN,
+        )
+        query_directory.restype = ctypes.c_int32
+        to_dos_error = ntdll.RtlNtStatusToDosError
+        to_dos_error.argtypes = (ctypes.c_int32,)
+        to_dos_error.restype = wintypes.ULONG
+
+        names: list[str] = []
+        restart_scan = True
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            status_block = IoStatusBlock()
+            status = int(
+                query_directory(
+                    wintypes.HANDLE(directory_handle),
+                    wintypes.HANDLE(),
+                    None,
+                    None,
+                    ctypes.byref(status_block),
+                    buffer,
+                    len(buffer),
+                    12,  # FileNamesInformation
+                    False,
+                    None,
+                    restart_scan,
+                )
+            )
+            status_value = ctypes.c_uint32(status).value
+            if status_value == 0x80000006:  # STATUS_NO_MORE_FILES
+                break
+            if status < 0:
+                raise ctypes.WinError(int(to_dos_error(status)))
+
+            used = int(status_block.information)
+            offset = 0
+            while offset < used:
+                if used - offset < 12:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned a truncated record"
+                    )
+                next_offset = int.from_bytes(
+                    buffer.raw[offset : offset + 4],
+                    "little",
+                )
+                name_length = int.from_bytes(
+                    buffer.raw[offset + 8 : offset + 12],
+                    "little",
+                )
+                name_start = offset + 12
+                name_end = name_start + name_length
+                if name_length % 2 or name_end > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid name"
+                    )
+                name = buffer.raw[name_start:name_end].decode("utf-16-le")
+                if name not in {".", ".."}:
+                    names.append(name)
+                if next_offset == 0:
+                    break
+                if next_offset < 12 or offset + next_offset > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid offset"
+                    )
+                offset += next_offset
+            restart_scan = False
+        return names
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate Windows anchored directory: {error}"
         ) from error
 
 

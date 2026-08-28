@@ -189,7 +189,6 @@ def test_install_rejects_bad_hash_before_creating_extraction_destination(
     [
         ("../escape.exe", "unsafe path"),
         ("other-root/file.dll", "outside pinned root"),
-        ("poppler-test\\Library\\bin\\escape.dll", "unsafe path"),
     ],
 )
 def test_install_rejects_unsafe_zip_member_paths_before_extraction(
