@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,11 +22,27 @@ from web_translator.pdf_models import (
     PdfContractError,
     PdfDocument,
     PdfLayoutReview,
+    PdfLinkEvidence,
     PdfPage,
     PdfPageEvidence,
     PdfSourceRecord,
     PdfTableCell,
 )
+
+
+def _link_evidence() -> PdfLinkEvidence:
+    return PdfLinkEvidence(
+        id="pdf:page-0001:link-0001",
+        page_number=1,
+        source_block_id="pdf:page-0001:block-0001",
+        source_span=(0, 10),
+        bounds=(72.0, 72.0, 140.0, 96.0),
+        visible_label="Selectable",
+        uri="https://example.com/one",
+        destination=None,
+        reconstructed=True,
+        reason=None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -38,6 +56,7 @@ from web_translator.pdf_models import (
         (PdfPage, make_pdf_page()),
         (PdfDocument, make_pdf_document()),
         (PdfLayoutReview, make_pdf_layout_review()),
+        (PdfLinkEvidence, _link_evidence()),
     ],
 )
 def test_pdf_records_round_trip_exact_json_contract(record_type: type[object], record: object) -> None:
@@ -116,12 +135,52 @@ def test_pdf_document_round_trip_rejects_unknown_fields() -> None:
                 segment_id="seg-000001",
             )
         ],
+        links=[_link_evidence()],
+        extraction_warnings=[],
     )
     assert PdfDocument.from_dict(document.to_dict()) == document
     payload = document.to_dict()
     payload["unknown"] = True
     with pytest.raises(PdfContractError, match="fields must be exactly"):
         PdfDocument.from_dict(payload)
+
+
+def test_pdf_document_strictly_validates_link_spans_and_warning_evidence() -> None:
+    document = make_pdf_document()
+    payload = document.to_dict()
+    payload["links"] = [_link_evidence().to_dict()]
+    payload["extraction_warnings"] = [
+        "page 1 link 2: label='Docs' destination='missing-target' reason=unresolved"
+    ]
+
+    parsed = PdfDocument.from_dict(payload)
+
+    assert parsed.links == [_link_evidence()]
+    assert parsed.extraction_warnings == payload["extraction_warnings"]
+
+    payload["links"][0]["source_span"] = [0, 11]
+    with pytest.raises(PdfContractError, match="visible label|source span"):
+        PdfDocument.from_dict(payload)
+
+
+def test_unreconstructed_link_requires_complete_label_destination_and_reason() -> None:
+    payload = _link_evidence().to_dict()
+    payload.update(
+        {
+            "source_block_id": None,
+            "source_span": None,
+            "uri": None,
+            "destination": "unresolved-named-destination",
+            "reconstructed": False,
+            "reason": "visible source intersects multiple blocks",
+        }
+    )
+
+    assert PdfLinkEvidence.from_dict(payload).visible_label == "Selectable"
+
+    payload["visible_label"] = ""
+    with pytest.raises(PdfContractError, match="visible_label"):
+        PdfLinkEvidence.from_dict(payload)
 
 
 def test_pdf_document_rejects_blocks_outside_document_order() -> None:
@@ -195,3 +254,134 @@ def test_pdf_run_paths_portably_derive_slug_from_source_label(
 
     assert paths.run_id == expected_run_id
     assert paths.work_dir.name == expected_run_id
+
+
+def test_pdf_run_paths_return_lexically_absolute_paths_without_resolving_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    paths = create_pdf_run_paths(
+        Path("workspace"),
+        "report.pdf",
+        datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC),
+    )
+
+    assert paths.work_dir.is_absolute()
+    assert paths.output_dir.is_absolute()
+    assert paths.work_dir == (
+        tmp_path
+        / "workspace"
+        / ".web-translator"
+        / "runs"
+        / "report-20260821-010203"
+    )
+
+
+@pytest.mark.parametrize("linked_component", ["workspace", "runs", "output", "dangling-output"])
+def test_pdf_run_paths_reject_linked_workspace_run_and_output_roots(
+    tmp_path: Path,
+    linked_component: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "linked-target"
+    target.mkdir()
+    try:
+        if linked_component == "workspace":
+            workspace.symlink_to(target, target_is_directory=True)
+        else:
+            workspace.mkdir()
+            if linked_component == "runs":
+                control = workspace / ".web-translator"
+                control.mkdir()
+                (control / "runs").symlink_to(target, target_is_directory=True)
+            elif linked_component == "output":
+                (workspace / "translated-pdfs").symlink_to(
+                    target, target_is_directory=True
+                )
+            else:
+                (workspace / "translated-pdfs").symlink_to(
+                    tmp_path / "missing-target", target_is_directory=True
+                )
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="link|reparse|safe directory"):
+        create_pdf_run_paths(
+            workspace,
+            "report.pdf",
+            datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC),
+        )
+
+
+def test_pdf_run_paths_reject_windows_reparse_output_root_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    output_root = workspace / "translated-pdfs"
+    output_root.mkdir(parents=True)
+    real_stat = os.stat
+
+    def reparse_stat(path: str | os.PathLike[str], *args: object, **kwargs: object) -> object:
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) == output_root:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_file_attributes=0x400,
+            )
+        return result
+
+    monkeypatch.setattr(os, "stat", reparse_stat)
+
+    with pytest.raises(ValueError, match="reparse"):
+        create_pdf_run_paths(
+            workspace,
+            "report.pdf",
+            datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC),
+        )
+
+
+def test_pdf_run_paths_reject_workspace_replacement_during_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    held_workspace = tmp_path / "held-workspace"
+    run_id = "report-20260821-010203"
+    real_mkdir = os.mkdir
+    replaced = False
+
+    def replace_workspace_then_mkdir(
+        path: str | os.PathLike[str],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replaced
+        if not replaced and Path(path).name == run_id:
+            replaced = True
+            workspace.rename(held_workspace)
+            real_mkdir(workspace)
+            real_mkdir(workspace / ".web-translator")
+            real_mkdir(workspace / ".web-translator" / "runs")
+            real_mkdir(workspace / "translated-pdfs")
+        if dir_fd is None:
+            real_mkdir(path, mode)
+        else:
+            real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", replace_workspace_then_mkdir)
+
+    with pytest.raises(ValueError, match="changed identity|moved"):
+        create_pdf_run_paths(
+            workspace,
+            "report.pdf",
+            datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC),
+        )
+
+    assert replaced is True
+    assert not (workspace / ".web-translator" / "runs" / run_id).exists()

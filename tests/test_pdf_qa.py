@@ -11,7 +11,14 @@ import struct
 from PIL import Image, ImageDraw
 import pytest
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DecodedStreamObject, NameObject, TextStringObject
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    FloatObject,
+    NameObject,
+    NullObject,
+    TextStringObject,
+)
 from reportlab.pdfgen.canvas import Canvas
 
 from web_translator.models import ProtectedToken, Segment, Translation, write_segments
@@ -32,6 +39,7 @@ from web_translator.pdf_qa import (
     read_pdf_layout_review,
 )
 from web_translator.pdf_media import build_contact_sheets, render_pdf_pages
+from web_translator.pdf_review import build_pdf_semantic_review_input
 import web_translator.pdf_qa as pdf_qa_module
 from tests.pdf_fixtures import make_text_pdf
 
@@ -75,9 +83,11 @@ def _sha256(path: Path) -> str:
 
 
 def _write_review(run_dir: Path) -> None:
+    semantic_input = build_pdf_semantic_review_input(run_dir)
     _write_json(
         run_dir / "review.json",
         {
+            "semantic_input_sha256": semantic_input.semantic_input_sha256,
             "retries": {"zone-001": 0},
             "section_findings": {
                 "zone-001": [
@@ -92,6 +102,15 @@ def _write_review(run_dir: Path) -> None:
             "unresolved_required": [],
         },
     )
+
+
+def _refresh_review_digest(run_dir: Path) -> None:
+    review_path = run_dir / "review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["semantic_input_sha256"] = build_pdf_semantic_review_input(
+        run_dir
+    ).semantic_input_sha256
+    _write_json(review_path, review)
 
 
 def _write_passing_layout_review(run_dir: Path, *, staged_sha256: str | None = None) -> None:
@@ -360,6 +379,23 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
         ),
         encoding="utf-8",
     )
+    assignments = run_dir / "assignments"
+    assignments.mkdir()
+    _write_json(
+        assignments / "zone-001.json",
+        {
+            "context_after": [],
+            "context_before": [],
+            "document_summary": "QA fixture",
+            "glossary": {},
+            "schema_version": "1.0",
+            "targets": [
+                {"id": segment.id, "source_text": segment.source_text}
+                for segment in segments
+            ],
+            "zone_id": "zone-001",
+        },
+    )
     _write_review(run_dir)
     media = run_dir / "media"
     media.mkdir()
@@ -412,6 +448,29 @@ def test_prepare_pdf_qa_renders_every_page_and_covers_contact_sheets(
         finding["code"] for finding in record["findings"]
     )
     assert not assembled_pdf_run.output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "segments.jsonl",
+        "zones/zone-001.json",
+        "assignments/zone-001.json",
+        "translations/zone-001.jsonl",
+        "glossary.json",
+    ],
+)
+def test_prepare_pdf_qa_rejects_inputs_mutated_after_semantic_review(
+    assembled_pdf_run: PdfQARun,
+    relative_path: str,
+) -> None:
+    path = assembled_pdf_run.run_dir / relative_path
+    path.write_bytes(path.read_bytes() + b" ")
+
+    with pytest.raises(PdfQAFailure, match="digest does not match"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
 
 
 def test_prepare_pdf_qa_closes_windows_descendants_for_directory_rename_and_reopens_them(
@@ -1152,6 +1211,7 @@ def test_prepare_pdf_qa_rejects_missing_translation_id(
     translations = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
     lines = translations.read_text(encoding="utf-8").splitlines()
     translations.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="translations must exactly cover"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
@@ -1167,6 +1227,7 @@ def test_prepare_pdf_qa_rejects_changed_protected_token(
         ),
         encoding="utf-8",
     )
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="protected-token|restore"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
@@ -1250,6 +1311,7 @@ def test_prepare_pdf_qa_rejects_unselectable_translated_block(
         path.read_text(encoding="utf-8").replace("그림 설명", "스테이지에 없는 번역"),
         encoding="utf-8",
     )
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="not selectable"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
@@ -1973,6 +2035,7 @@ def test_prepare_pdf_qa_rejects_rendered_glyph_replacement_box(
         {},
         assembled_pdf_run.output_dir,
     )
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="glyph replacement boxes"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
@@ -2132,7 +2195,13 @@ def test_prepare_pdf_qa_rejects_layout_block_text_mapping_swap(
     heading["block_id"], caption["block_id"] = caption["block_id"], heading["block_id"]
     _write_json(path, layout)
 
-    with pytest.raises(PdfQAFailure, match="not selectable.*seg-000001|not selectable.*seg-000005"):
+    with pytest.raises(
+        PdfQAFailure,
+        match=(
+            "not selectable.*seg-000001|not selectable.*seg-000005|"
+            "expected output destination"
+        ),
+    ):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -2154,6 +2223,33 @@ def test_prepare_pdf_qa_rejects_missing_required_internal_link(
     _rewrite_pdf(assembled_pdf_run, remove_internal_link)
 
     with pytest.raises(PdfQAFailure, match="internal link"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_internal_link_to_wrong_valid_output_target(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    def retarget_internal_link(writer: PdfWriter) -> None:
+        for page in writer.pages:
+            for reference in page.get("/Annots", []):
+                annotation = reference.get_object()
+                if annotation.get("/Dest") is None:
+                    continue
+                annotation[NameObject("/Dest")] = ArrayObject(
+                    [
+                        writer.pages[0].indirect_reference,
+                        NameObject("/XYZ"),
+                        FloatObject(260.0),
+                        FloatObject(600.0),
+                        NullObject(),
+                    ]
+                )
+                return
+        raise AssertionError("fixture internal link was not found")
+
+    _rewrite_pdf(assembled_pdf_run, retarget_internal_link)
+
+    with pytest.raises(PdfQAFailure, match="expected output destination"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -59,23 +61,169 @@ def create_pdf_run_paths(workspace: Path, source_label: str, now: datetime) -> R
 
 
 def _allocate_run_paths(workspace: Path, base_run_id: str, output_root: Path) -> RunPaths:
-    runs_dir = workspace / ".web-translator" / "runs"
-    outputs_dir = workspace / output_root
+    # ``abspath`` is deliberately lexical: unlike ``resolve`` it does not erase
+    # symlink evidence before each ancestor has been opened without following it.
+    workspace = Path(os.path.abspath(os.fspath(workspace)))
+    if output_root.parent != Path(".") or output_root.name != os.fspath(output_root):
+        raise ValueError("run output root must be one direct workspace child")
 
-    suffix = 1
-    while True:
-        run_id = base_run_id if suffix == 1 else f"{base_run_id}-{suffix}"
-        work_dir = runs_dir / run_id
-        output_dir = outputs_dir / run_id
-        if output_dir.exists():
-            suffix += 1
-            continue
+    # The PDF assembly anchor implementation is the package's common held-directory
+    # primitive on POSIX and Windows.  Import lazily so URL-only helpers stay light and
+    # to avoid the paths -> acquisition -> paths import cycle.
+    import web_translator.pdf_assemble as anchored
+
+    created_run: anchored._DirectoryAnchor | None = None
+    runs_anchor: anchored._DirectoryAnchor | None = None
+    try:
+        with ExitStack() as stack:
+            workspace_anchor = _open_or_create_anchored_path(
+                workspace,
+                anchored,
+                stack,
+            )
+            control_anchor = _open_or_create_anchored_child(
+                workspace_anchor,
+                ".web-translator",
+                "run control",
+                anchored,
+            )
+            stack.callback(control_anchor.close)
+            runs_anchor = _open_or_create_anchored_child(
+                control_anchor,
+                "runs",
+                "run root",
+                anchored,
+            )
+            stack.callback(runs_anchor.close)
+            outputs_anchor = _open_or_create_anchored_child(
+                workspace_anchor,
+                output_root.name,
+                "output root",
+                anchored,
+            )
+            stack.callback(outputs_anchor.close)
+
+            for suffix in range(1, 10_001):
+                run_id = base_run_id if suffix == 1 else f"{base_run_id}-{suffix}"
+                try:
+                    anchored._require_anchored_name_absent(outputs_anchor, run_id)
+                except anchored.PdfAssemblyError:
+                    continue
+                try:
+                    created_run = anchored._create_child_directory(
+                        runs_anchor,
+                        run_id,
+                        "run",
+                    )
+                except FileExistsError:
+                    continue
+
+                try:
+                    # Close the allocation race: the output name must still be absent
+                    # after the exact run child has been created.
+                    anchored._require_anchored_name_absent(outputs_anchor, run_id)
+                    workspace_anchor.verify_visible()
+                    control_anchor.verify_visible()
+                    runs_anchor.verify_visible()
+                    outputs_anchor.verify_visible()
+                    created_run.verify_visible()
+                    return RunPaths(
+                        run_id=run_id,
+                        work_dir=workspace
+                        / ".web-translator"
+                        / "runs"
+                        / run_id,
+                        output_dir=workspace / output_root.name / run_id,
+                    )
+                except anchored.PdfAssemblyError:
+                    anchored._remove_owned_directory(
+                        runs_anchor,
+                        run_id,
+                        created_run.identity,
+                        child=created_run,
+                    )
+                    created_run.close()
+                    created_run = None
+                    # If all held roots remain visible, this was only an output-name
+                    # collision.  A moved/replaced ancestor is a hard failure.
+                    workspace_anchor.verify_visible()
+                    control_anchor.verify_visible()
+                    runs_anchor.verify_visible()
+                    outputs_anchor.verify_visible()
+                    continue
+                finally:
+                    if created_run is not None:
+                        created_run.close()
+                        created_run = None
+            raise ValueError("cannot reserve a unique run and output name")
+    except ValueError:
+        raise
+    except anchored.PdfAssemblyError as error:
+        if created_run is not None and runs_anchor is not None:
+            anchored._remove_owned_directory(
+                runs_anchor,
+                created_run.path.name,
+                created_run.identity,
+                child=created_run,
+            )
+            created_run.close()
+        raise ValueError(f"cannot safely allocate run paths: {error}") from error
+
+
+def _open_or_create_anchored_path(
+    path: Path,
+    anchored: object,
+    stack: ExitStack,
+) -> object:
+    """Open/create every lexical component while retaining all parent anchors."""
+    parts = path.parts
+    if not parts or not path.is_absolute():
+        raise ValueError("workspace must have an absolute lexical path")
+    current = Path(parts[0])
+    try:
+        parent = anchored._open_directory_anchor(current, "workspace root")
+    except anchored.PdfAssemblyError as error:
+        raise ValueError(f"workspace root is not a safe directory: {error}") from error
+    stack.callback(parent.close)
+    for name in parts[1:]:
+        child = _open_or_create_anchored_child(
+            parent,
+            name,
+            "workspace",
+            anchored,
+        )
+        stack.callback(child.close)
+        parent = child
+        current /= name
+    parent.verify_visible()
+    return parent
+
+
+def _open_or_create_anchored_child(
+    parent: object,
+    name: str,
+    label: str,
+    anchored: object,
+) -> object:
+    absent = True
+    try:
+        anchored._require_anchored_name_absent(parent, name)
+    except anchored.PdfAssemblyError:
+        absent = False
+    if not absent:
         try:
-            work_dir.mkdir(parents=True)
-        except FileExistsError:
-            suffix += 1
-            continue
-        return RunPaths(run_id=run_id, work_dir=work_dir, output_dir=output_dir)
+            return anchored._open_existing_child_directory(parent, name, label)
+        except anchored.PdfAssemblyError as error:
+            raise ValueError(
+                f"{label} is a link, reparse point, or unsafe directory: "
+                f"{parent.path / name}: {error}"
+            ) from error
+    try:
+        return anchored._create_child_directory(parent, name, label)
+    except (FileExistsError, anchored.PdfAssemblyError) as error:
+        raise ValueError(
+            f"{label} changed identity while it was created: {parent.path / name}: {error}"
+        ) from error
 
 
 def _utc_timestamp(now: datetime) -> str:

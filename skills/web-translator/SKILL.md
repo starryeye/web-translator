@@ -48,8 +48,15 @@ preserving spaces and non-ASCII characters.
    authenticated pages, JavaScript-only applications, recursive sites, and PDF input.
    Do not silently narrow or broaden scope.
 
-2. Create unique paths with `web_translator.paths.create_run_paths(Path.cwd(), url,
-   datetime.now(UTC))`. Keep the returned `work_dir` and unused `output_dir` absolute.
+2. Set `workspace = Path.cwd().absolute()`, then create unique paths with
+   `web_translator.paths.create_run_paths(workspace, url, datetime.now(UTC))`. Keep the
+   returned `work_dir` and unused `output_dir` absolute without resolving either path.
+   Verify lexically that `work_dir.parent == workspace / ".web-translator" / "runs"`
+   and `output_dir.parent == workspace / "translated-pages"`; each must be an exact child
+   of that intended root. Abort if the run, either root, or any ancestor is a
+   symlink or reparse point, has been replaced/moved, or if the reserved output exists even as a
+   dangling link. The allocator and every stage recheck held directory identities; never
+   substitute a path discovered through link resolution.
    Run these commands with the platform execution contract above and stop on any nonzero
    exit:
 

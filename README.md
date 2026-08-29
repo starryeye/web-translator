@@ -82,6 +82,10 @@ translated-pages/<host>-<path>-<UTC timestamp>/
 The completion response links to `index.html` and `review-report.md` with absolute local
 paths and reports optional asset warnings.
 
+Allocation keeps absolute lexical paths and requires the run and reserved output to be
+exact children of the held `.web-translator/runs` and `translated-pages` roots. A symlink
+or reparse ancestor, dangling link, or replacement race fails closed.
+
 ### Local, attached, or public PDF
 
 Ask Codex to translate exactly one supported PDF. Local paths containing spaces and
@@ -115,6 +119,21 @@ translated-pdfs/<source>-<UTC timestamp>/
 
 The completion response links to all three files using absolute local paths. Staged or
 partially reviewed PDFs are never presented as completed output.
+
+PDF allocation applies the same held-root contract with `translated-pdfs`. The workflow
+accepts a standalone uncaptioned figure and preserves it once, while orphan or ambiguous
+captions fail. An unreconstructed visible link is only a warning when its
+visible label and destination remain in both final artifacts; missing visible text fails.
+
+After translations and glossary content are final, `pdf-review-input` creates canonical
+semantic-review evidence. PDF `review.json` carries its `semantic_input_sha256`, binding
+the exact segments, zones, assignments, translations, and glossary policy/content before
+assembly and both QA stages.
+
+Poppler/Pillow rendering is limited to 36,000,000 pixels per page, 360,000,000 pixels per
+PDF, 64 MiB per encoded PNG, and 1 GiB for the rendered set. Decoded dimensions are
+checked before full decode. These deterministic budgets remain enforced on platforms
+without an OS-level address-space limit.
 
 ### Performance-oriented orchestration
 
@@ -166,6 +185,7 @@ run the PDF stages in order:
 <PYTHON> -m web_translator prepare-assignments --run-dir <WORK_DIR>
 <PYTHON> -m web_translator validate-translations --run-dir <WORK_DIR> --zone-id <ZONE_ID>
 <PYTHON> -m web_translator validate-translations --run-dir <WORK_DIR>
+<PYTHON> -m web_translator pdf-review-input --run-dir <WORK_DIR>
 <PYTHON> -m web_translator pdf-assemble --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 <PYTHON> -m web_translator pdf-qa prepare --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 <MASTER> inspect every contact sheet and write strict pdf-layout-review.json

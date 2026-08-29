@@ -40,8 +40,14 @@ from web_translator.paths import validate_public_url
 from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
 from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
 from web_translator.pdf_extract import PdfExtractionError, extract_pdf
+from web_translator.pdf_extract_transaction import extract_pdf_transaction
 from web_translator.pdf_models import PdfContractError, PdfSourceRecord
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
+from web_translator.pdf_review import (
+    PdfSemanticReviewError,
+    build_pdf_semantic_review_input,
+    validate_pdf_semantic_review,
+)
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -171,6 +177,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_dir(pdf_extract)
     pdf_extract.set_defaults(handler=_pdf_extract_command)
 
+    pdf_review_input = subparsers.add_parser(
+        "pdf-review-input",
+        help="Bind the finalized PDF semantic-review inputs to one digest.",
+    )
+    _add_run_dir(pdf_review_input)
+    pdf_review_input.set_defaults(handler=_pdf_review_input_command)
+
     extract = subparsers.add_parser("extract", help="Extract translation segments.")
     _add_run_dir(extract)
     extract.set_defaults(handler=_extract_command)
@@ -283,108 +296,28 @@ def _pdf_acquire_command(args: argparse.Namespace) -> None:
 
 
 def _pdf_extract_command(args: argparse.Namespace) -> None:
-    run_dir = Path(args.run_dir)
     try:
-        _validate_run_root(run_dir)
-        source = run_dir / "source.pdf"
-        source_record_path = run_dir / "source.json"
-        _require_safe_file(source)
-        _require_safe_file(source_record_path)
-        _validate_pdf_source_record(source, source_record_path)
-        destinations = (
-            run_dir / "document.json",
-            run_dir / "segments.jsonl",
-            run_dir / "media",
-        )
-        _validate_pdf_extraction_destinations(destinations)
-        with tempfile.TemporaryDirectory(
-            prefix=".pdf-extracting-", dir=run_dir
-        ) as temporary_name:
-            temporary = Path(temporary_name)
-            staged_document = temporary / "document.json"
-            staged_segments = temporary / "segments.jsonl"
-            staged_media = temporary / "media"
-            extract_pdf(
-                source,
-                staged_document,
-                staged_segments,
-                staged_media,
-            )
-            _publish_pdf_extraction(
-                (
-                    (staged_document, destinations[0]),
-                    (staged_segments, destinations[1]),
-                    (staged_media, destinations[2]),
-                ),
-                temporary / "rollback",
-            )
+        extract_pdf_transaction(Path(args.run_dir), extractor=extract_pdf)
     except PdfExtractionError:
         raise
-    except (CLIContractError, PdfContractError, OSError, UnicodeError) as error:
+    except (CLIContractError, OSError, UnicodeError) as error:
         raise CLIContractError(f"cannot extract PDF source: {error}") from error
 
 
-def _validate_pdf_source_record(source: Path, record_path: Path) -> None:
-    record = PdfSourceRecord.from_dict(_read_json_object(record_path))
+def _pdf_review_input_command(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir)
+    _validate_run_root(run_dir)
+    destination = run_dir / "semantic-review-input.json"
+    _reject_if_link(destination)
     try:
-        byte_length = source.stat().st_size
+        semantic_input = build_pdf_semantic_review_input(run_dir)
+        _write_json_atomic(destination, semantic_input.to_dict())
+    except PdfSemanticReviewError as error:
+        raise CLIContractError(str(error)) from error
     except OSError as error:
-        raise CLIContractError(f"cannot inspect source.pdf: {error}") from error
-    if record.byte_length != byte_length:
-        raise CLIContractError("source.json byte_length does not match source.pdf")
-    if record.sha256 != _sha256_file(source):
-        raise CLIContractError("source.json sha256 does not match source.pdf")
-
-
-def _validate_pdf_extraction_destinations(
-    destinations: tuple[Path, Path, Path],
-) -> None:
-    document, segments, media = destinations
-    for destination in (document, segments):
-        if destination.exists():
-            _require_safe_file(destination)
-        else:
-            _reject_if_link(destination)
-    if media.exists():
-        _require_safe_directory(media)
-    else:
-        _reject_if_link(media)
-
-
-def _publish_pdf_extraction(
-    publications: tuple[tuple[Path, Path], ...], rollback_dir: Path
-) -> None:
-    """Publish all staged PDF artifacts, restoring every prior artifact on failure."""
-    rollback_dir.mkdir()
-    backups: list[tuple[Path, Path]] = []
-    published: list[tuple[Path, Path]] = []
-    try:
-        for _, destination in publications:
-            if destination.exists() or destination.is_symlink():
-                backup = rollback_dir / f"original-{destination.name}"
-                os.replace(destination, backup)
-                backups.append((backup, destination))
-        for staged, destination in publications:
-            os.replace(staged, destination)
-            published.append((destination, rollback_dir / f"new-{destination.name}"))
-    except BaseException as publish_error:
-        try:
-            for destination, discarded in reversed(published):
-                if destination.exists() or destination.is_symlink():
-                    os.replace(destination, discarded)
-            for backup, destination in reversed(backups):
-                if backup.exists() or backup.is_symlink():
-                    os.replace(backup, destination)
-        except OSError as rollback_error:
-            raise CLIContractError(
-                "PDF extraction publication and rollback both failed: "
-                f"publish={publish_error}; rollback={rollback_error}"
-            ) from publish_error
-        if isinstance(publish_error, OSError):
-            raise CLIContractError(
-                f"cannot publish PDF extraction: {publish_error}"
-            ) from publish_error
-        raise
+        raise CLIContractError(
+            f"cannot write PDF semantic review input: {error}"
+        ) from error
 
 
 def _extract_command(args: argparse.Namespace) -> None:
@@ -598,7 +531,7 @@ def _pdf_assemble_command(args: argparse.Namespace) -> None:
     zones = _read_zones(args.run_dir)
     result_dir = _validate_translation_files(args.run_dir, zones)
     translations = merge_translations(segments, zones, result_dir)
-    review = _read_review(args.run_dir / "review.json", zones)
+    review = _read_pdf_review(args.run_dir / "review.json", zones)
     if review.unresolved_required:
         raise PdfAssemblyError(
             "semantic review has unresolved required findings: "
@@ -935,6 +868,27 @@ def _detect_source_language(segments: Sequence[Segment]) -> str:
 
 def _read_review(path: Path, zones: Sequence[Zone]) -> MasterReview:
     data = _read_json_object(path)
+    return _review_from_value(data, path, zones)
+
+
+def _read_pdf_review(path: Path, zones: Sequence[Zone]) -> MasterReview:
+    data = _read_json_object(path)
+    try:
+        validate_pdf_semantic_review(path.parent, data)
+    except PdfSemanticReviewError as error:
+        raise CLIContractError(str(error)) from error
+    return _review_from_value(
+        {key: value for key, value in data.items() if key != "semantic_input_sha256"},
+        path,
+        zones,
+    )
+
+
+def _review_from_value(
+    data: Mapping[str, Any],
+    path: Path,
+    zones: Sequence[Zone],
+) -> MasterReview:
     if set(data) != {"unresolved_required", "retries", "section_findings"}:
         raise CLIContractError(f"review fields must be exactly unresolved_required, retries, section_findings: {path}")
     retries_raw = _mapping(data, "retries", path)

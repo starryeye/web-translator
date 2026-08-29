@@ -28,6 +28,7 @@ _BLOCK_ID = re.compile(
 )
 _TABLE_ID = re.compile(r"pdf:page-(?P<page>\d{4}):table-\d{4}\Z")
 _TABLE_CELL_ID = re.compile(r"pdf:page-\d{4}:table-\d{4}:row-\d{4}:cell-\d{4}\Z")
+_LINK_ID = re.compile(r"pdf:page-(?P<page>\d{4}):link-\d{4}\Z")
 _SEGMENT_ID = re.compile(r"seg-\d{6}\Z")
 _BLOCK_KINDS = {
     "heading", "paragraph", "list-item", "table-cell", "figure",
@@ -367,6 +368,117 @@ class PdfPage:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfLinkEvidence:
+    """One source annotation and its exact reconstruction disposition."""
+
+    id: str
+    page_number: int
+    source_block_id: str | None
+    source_span: tuple[int, int] | None
+    bounds: BBox
+    visible_label: str
+    uri: str | None
+    destination: str | None
+    reconstructed: bool
+    reason: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "page_number": self.page_number,
+            "source_block_id": self.source_block_id,
+            "source_span": list(self.source_span) if self.source_span is not None else None,
+            "bounds": list(self.bounds),
+            "visible_label": self.visible_label,
+            "uri": self.uri,
+            "destination": self.destination,
+            "reconstructed": self.reconstructed,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfLinkEvidence:
+        context = "PdfLinkEvidence"
+        data = _require_exact_fields(
+            data,
+            context,
+            {
+                "id",
+                "page_number",
+                "source_block_id",
+                "source_span",
+                "bounds",
+                "visible_label",
+                "uri",
+                "destination",
+                "reconstructed",
+                "reason",
+            },
+        )
+        identifier = _require_string(data, "id", context)
+        match = _LINK_ID.fullmatch(identifier)
+        if match is None:
+            raise PdfContractError(f"{context}.id must be a stable link ID")
+        page_number = _require_positive_int(data, "page_number", context)
+        if int(match.group("page")) != page_number:
+            raise PdfContractError(f"{context}.id page must match page_number")
+        source_block_id = _require_optional_string(data, "source_block_id", context)
+        if source_block_id is not None and _BLOCK_ID.fullmatch(source_block_id) is None:
+            raise PdfContractError(
+                f"{context}.source_block_id must be a stable block ID"
+            )
+        span_value = data["source_span"]
+        source_span: tuple[int, int] | None
+        if span_value is None:
+            source_span = None
+        elif (
+            isinstance(span_value, list)
+            and len(span_value) == 2
+            and all(type(value) is int for value in span_value)
+            and 0 <= span_value[0] < span_value[1]
+        ):
+            source_span = (span_value[0], span_value[1])
+        else:
+            raise PdfContractError(
+                f"{context}.source_span must be null or an increasing integer pair"
+            )
+        visible_label = _require_string(data, "visible_label", context)
+        if not visible_label:
+            raise PdfContractError(f"{context}.visible_label must be nonempty")
+        uri = _require_optional_string(data, "uri", context)
+        destination = _require_optional_string(data, "destination", context)
+        if (uri is None) == (destination is None):
+            raise PdfContractError(
+                f"{context} must contain exactly one URI or internal destination"
+            )
+        reconstructed = _require_bool(data, "reconstructed", context)
+        reason = _require_optional_string(data, "reason", context)
+        if reconstructed:
+            if source_block_id is None or source_span is None or reason is not None:
+                raise PdfContractError(
+                    f"{context} reconstructed links require a source block/span and null reason"
+                )
+        elif reason is None or not reason.strip():
+            raise PdfContractError(
+                f"{context} unreconstructed links require a nonempty reason"
+            )
+        bounds_data = dict(data)
+        bounds_data["bbox"] = data["bounds"]
+        return cls(
+            id=identifier,
+            page_number=page_number,
+            source_block_id=source_block_id,
+            source_span=source_span,
+            bounds=_require_bbox(bounds_data, context),
+            visible_label=visible_label,
+            uri=uri,
+            destination=destination,
+            reconstructed=reconstructed,
+            reason=reason,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PdfDocument:
     schema_version: str
     source_sha256: str
@@ -376,6 +488,8 @@ class PdfDocument:
     pages: list[PdfPage]
     blocks: list[PdfBlock]
     table_cells: list[PdfTableCell] = field(default_factory=list)
+    links: list[PdfLinkEvidence] = field(default_factory=list)
+    extraction_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -387,6 +501,8 @@ class PdfDocument:
             "pages": [page.to_dict() for page in self.pages],
             "blocks": [block.to_dict() for block in self.blocks],
             "table_cells": [cell.to_dict() for cell in self.table_cells],
+            "links": [link.to_dict() for link in self.links],
+            "extraction_warnings": list(self.extraction_warnings),
         }
 
     @classmethod
@@ -394,7 +510,7 @@ class PdfDocument:
         context = "PdfDocument"
         data = _require_exact_fields(
             data, context,
-            {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells"},
+            {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
         )
         pages = [PdfPage.from_dict(_require_mapping(item, f"{context}.pages[{index}]")) for index, item in enumerate(_require_list(data, "pages", context))]
         page_count = _require_positive_int(data, "page_count", context)
@@ -418,6 +534,51 @@ class PdfDocument:
         block_ids = {block.id for block in blocks}
         if any(cell.block_id not in block_ids for cell in table_cells):
             raise PdfContractError(f"{context}.table_cells must refer to emitted blocks")
+        links = [
+            PdfLinkEvidence.from_dict(
+                _require_mapping(item, f"{context}.links[{index}]")
+            )
+            for index, item in enumerate(_require_list(data, "links", context))
+        ]
+        if links != sorted(links, key=lambda link: (link.page_number, link.id)):
+            raise PdfContractError(f"{context}.links must be in exact source order")
+        if len({link.id for link in links}) != len(links):
+            raise PdfContractError(f"{context}.links must have unique IDs")
+        by_id = {block.id: block for block in blocks}
+        for link in links:
+            if link.page_number > page_count:
+                raise PdfContractError(f"{context}.links must refer to source pages")
+            if link.source_block_id is None:
+                continue
+            block = by_id.get(link.source_block_id)
+            if block is None or block.page_number != link.page_number:
+                raise PdfContractError(
+                    f"{context}.links must refer to a source block on the same page"
+                )
+            if link.source_span is not None:
+                start, end = link.source_span
+                if (
+                    end > len(block.source_text)
+                    or block.source_text[start:end] != link.visible_label
+                ):
+                    raise PdfContractError(
+                        f"{context}.link source span must exactly match its visible label"
+                    )
+            if (
+                link.reconstructed
+                and link.destination is not None
+                and link.destination not in block_ids
+            ):
+                raise PdfContractError(
+                    f"{context}.reconstructed internal link destination is unresolved"
+                )
+        extraction_warnings = _require_string_list(
+            data, "extraction_warnings", context
+        )
+        if extraction_warnings != sorted(set(extraction_warnings)):
+            raise PdfContractError(
+                f"{context}.extraction_warnings must be sorted and unique"
+            )
         return cls(
             schema_version=_require_schema_version(data, context),
             source_sha256=_require_sha256(data, "source_sha256", context),
@@ -427,6 +588,8 @@ class PdfDocument:
             pages=pages,
             blocks=blocks,
             table_cells=table_cells,
+            links=links,
+            extraction_warnings=extraction_warnings,
         )
 
 

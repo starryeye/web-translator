@@ -62,9 +62,15 @@ PDFs, files larger than 50 MiB, and documents over 100 pages. `pdf-acquire` and
 a rejection and never pass a PDF to the HTML `capture` or `extract` commands.
 
 Create unique paths with
-`web_translator.paths.create_pdf_run_paths(Path.cwd(), source_label, datetime.now(UTC))`.
+`web_translator.paths.create_pdf_run_paths(Path.cwd().absolute(), source_label,
+datetime.now(UTC))`.
 Keep its returned `work_dir` and reserved, unused `output_dir` absolute. The final output
-directory must not exist before finalization.
+directory must not exist before finalization. Never resolve either result: link resolution
+erases the evidence needed to reject a symlink or reparse point. Verify that
+`work_dir.parent == workspace / ".web-translator" / "runs"` and
+`output_dir.parent == workspace / "translated-pdfs"`, where
+`workspace = Path.cwd().absolute()`. Each returned path must be an exact child of the
+intended held root. Abort on a linked, dangling, replaced, or moved run/root/ancestor.
 
 Bind exactly one source value, then allocate the paths through the resolved interpreter.
 For a local or attached file, use its absolute native path; for a public URL, assign the
@@ -79,7 +85,7 @@ assignment:
   # For a public URL instead, replace the line above with:
   # $source = 'https://example.com/reports/분기-보고서.pdf'
 
-  $allocationJson = & $python -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; paths = create_pdf_run_paths(Path.cwd(), sys.argv[1], datetime.now(UTC)); print(json.dumps({"work_dir": str(paths.work_dir.resolve()), "output_dir": str(paths.output_dir.resolve())}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' $source
+  $allocationJson = & $python -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; workspace = Path.cwd().absolute(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' $source
   if ($LASTEXITCODE -ne 0) { throw 'PDF run-path allocation failed.' }
   try {
       $allocation = $allocationJson | ConvertFrom-Json -ErrorAction Stop
@@ -113,7 +119,7 @@ assignment:
   # For a public URL instead, replace the line above with:
   # source="https://example.com/reports/분기-보고서.pdf"
 
-  allocation_json=$("$python" -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; paths = create_pdf_run_paths(Path.cwd(), sys.argv[1], datetime.now(UTC)); print(json.dumps({"work_dir": str(paths.work_dir.resolve()), "output_dir": str(paths.output_dir.resolve())}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' "$source") || exit 1
+  allocation_json=$("$python" -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; workspace = Path.cwd().absolute(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' "$source") || exit 1
   allocation_field() {
       "$python" -c '
 import json, os, sys
@@ -123,7 +129,14 @@ try:
         raise ValueError
     if any(type(data[name]) is not str or not data[name] or not os.path.isabs(data[name]) for name in data):
         raise ValueError
-    if not os.path.isdir(data["work_dir"]) or os.path.exists(data["output_dir"]):
+    workspace = os.path.abspath(os.getcwd())
+    if os.path.dirname(data["work_dir"]) != os.path.join(workspace, ".web-translator", "runs"):
+        raise ValueError
+    if os.path.dirname(data["output_dir"]) != os.path.join(workspace, "translated-pdfs"):
+        raise ValueError
+    if os.path.islink(data["work_dir"]) or not os.path.isdir(data["work_dir"]):
+        raise ValueError
+    if os.path.lexists(data["output_dir"]):
         raise ValueError
     key = sys.argv[2]
     if key not in data:
@@ -154,6 +167,7 @@ Run the following commands in this exact order. Substitute the completed zone ID
 <python> -m web_translator prepare-assignments --run-dir <work-dir>
 <python> -m web_translator validate-translations --run-dir <work-dir> --zone-id zone-001
 <python> -m web_translator validate-translations --run-dir <work-dir>
+<python> -m web_translator pdf-review-input --run-dir <work-dir>
 <python> -m web_translator pdf-assemble --run-dir <work-dir> --output-dir <output-dir>
 <python> -m web_translator pdf-qa prepare --run-dir <work-dir> --output-dir <output-dir>
 <python> -m web_translator pdf-qa finalize --run-dir <work-dir> --output-dir <output-dir>
@@ -198,16 +212,36 @@ Apply these requirements at each stage:
    it.
 
 6. After every zone is valid, run aggregate `validate-translations`. Normalize first-use
-   glossary placement only after master judgment. Write `review.json` using the package's
-   existing review contract: `retries` and `section_findings` exactly cover all planned
-   zones, each zone has all six canonical dimensions once with `pass` or `required-fix`
-   plus nonempty evidence, and `unresolved_required` is the sorted unique set of every
-   `zone-ID:dimension` marked `required-fix`. Do not assemble until it is empty.
+   glossary placement only after master judgment. Once `segments.jsonl`, every zone and
+   assignment, every translation file, and the glossary policy/content are final, run
+   `pdf-review-input`. Read `semantic-review-input.json` and copy its exact
+   `semantic_input_sha256` into the PDF-only `review.json`; this canonical digest binds
+   the exact reviewed bytes and policy. Write the remaining review fields using the
+   package's existing review contract: `retries` and `section_findings` exactly cover all
+   planned zones, each zone has all six canonical dimensions once with `pass` or
+   `required-fix` plus nonempty evidence, and `unresolved_required` is the sorted unique
+   set of every `zone-ID:dimension` marked `required-fix`. Assembly, QA preparation, and
+   finalization each reject any post-review mutation. The webpage `review.json` contract
+   stays unchanged. Do not assemble until unresolved findings are empty.
 
 7. Run `pdf-assemble`, then `pdf-qa prepare`. Assembly creates only the private staged
    PDF; prepare performs automated contract, structure, font, rendering, bounds, and page
    checks and creates `pdf-qa.json` plus numbered PNGs under `qa-pages/`. It does not
    publish the reserved output directory.
+
+Rendering is bounded before, during, and after Poppler/Pillow work: at most 36,000,000
+pixels per page, 360,000,000 rendered pixels for the complete source/output PDF,
+64 MiB encoded bytes for one PNG, and 1 GiB encoded bytes for the complete rendered-page
+set. Decoded dimensions and pixels are checked before full Pillow decode. Output growth
+is monitored and the timed subprocess is terminated on a limit breach. Platforms that
+cannot impose an OS-level address-space limit still enforce all deterministic geometry,
+encoded-byte, decoded-pixel, and timeout limits.
+
+A valid detected standalone uncaptioned figure is preserved once with `caption_id=None`;
+only an existing figure-caption relationship must be reciprocal and unambiguous. Every
+unreconstructed visible link remains a warning only when its visible label and destination
+are retained in both `manifest.json` and `review-report.md`. Missing visible link text is
+a required failure.
 
 ## Required visual review
 

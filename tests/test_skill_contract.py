@@ -192,6 +192,22 @@ def test_skill_preserves_platform_arguments_as_single_values() -> None:
     assert '"$python" -m web_translator capture "$url" --run-dir "$work_dir"' in readme
 
 
+def test_public_skills_keep_allocated_paths_lexical_and_under_exact_roots() -> None:
+    web = SKILL.read_text("utf-8")
+    pdf = PDF_SKILL.read_text("utf-8")
+
+    for text, output_root in (
+        (web, "translated-pages"),
+        (pdf, "translated-pdfs"),
+    ):
+        assert ".resolve()" not in text
+        assert "Path.cwd().absolute()" in text
+        assert 'workspace / ".web-translator" / "runs"' in text
+        assert f'workspace / "{output_root}"' in text
+        assert "exact child" in text
+        assert "symlink or reparse" in text
+
+
 def test_pdf_skill_is_discoverable_and_fail_closed() -> None:
     text = PDF_SKILL.read_text("utf-8")
     for phrase in (
@@ -264,6 +280,7 @@ def test_pdf_skill_preserves_platform_arguments_and_stage_order() -> None:
         "<python> -m web_translator prepare-assignments --run-dir <work-dir>",
         "<python> -m web_translator validate-translations --run-dir <work-dir> --zone-id zone-001",
         "<python> -m web_translator validate-translations --run-dir <work-dir>",
+        "<python> -m web_translator pdf-review-input --run-dir <work-dir>",
         "<python> -m web_translator pdf-assemble --run-dir <work-dir> --output-dir <output-dir>",
         "<python> -m web_translator pdf-qa prepare --run-dir <work-dir> --output-dir <output-dir>",
         "<python> -m web_translator pdf-qa finalize --run-dir <work-dir> --output-dir <output-dir>",
@@ -291,7 +308,7 @@ def test_pdf_skill_allocates_native_paths_from_strict_json() -> None:
         'set(data) != {"work_dir", "output_dir"}',
         "os.path.isabs",
         "os.path.isdir",
-        "os.path.exists",
+        "os.path.lexists",
         "malformed allocation output",
         "Never use `eval`",
     ):
@@ -362,6 +379,28 @@ def test_pdf_skill_requires_complete_strict_visual_review() -> None:
         and finding["evidence"].strip()
         for finding in schema["findings"].values()
     )
+
+
+def test_pdf_skill_and_spec_bind_review_render_figure_and_link_contracts() -> None:
+    skill = PDF_SKILL.read_text("utf-8")
+    spec = Path(
+        "docs/superpowers/specs/2026-08-21-pdf-translator-design.md"
+    ).read_text("utf-8")
+    readme = Path("README.md").read_text("utf-8")
+    for text in (skill, spec, readme):
+        for phrase in (
+            "36,000,000",
+            "360,000,000",
+            "64 MiB",
+            "1 GiB",
+            "pdf-review-input",
+            "semantic_input_sha256",
+            "standalone uncaptioned figure",
+            "visible label and destination",
+        ):
+            assert phrase in text
+    assert "OS-level address-space limit" in skill
+    assert "OS-level address-space limit" in spec
 
 
 def test_readme_documents_pdf_workflow_and_boundaries() -> None:

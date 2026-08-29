@@ -33,6 +33,7 @@ from web_translator.pdf_models import (
     PdfBlock,
     PdfBlockStyle,
     PdfDocument,
+    PdfLinkEvidence,
     PdfPage,
     PdfSourceRecord,
     PdfTableCell,
@@ -2560,6 +2561,82 @@ def test_assemble_pdf_reflows_rich_content_with_complete_layout_evidence(
     assert section_note_layout.page_number <= target_layout.page_number
 
 
+def test_assemble_pdf_recreates_each_unambiguous_inline_link_span(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document_path = run_dir / "document.json"
+    document = PdfDocument.from_dict(
+        json.loads(document_path.read_text(encoding="utf-8"))
+    )
+    linked_block = document.blocks[1]
+    source_text = "Read Alpha and Beta now"
+    segment_id = linked_block.segment_id
+    assert segment_id is not None
+    blocks = [
+        replace(block, source_text=source_text, uri=None, destination=None)
+        if block.id == linked_block.id
+        else block
+        for block in document.blocks
+    ]
+    document = replace(
+        document,
+        blocks=blocks,
+        links=[
+            PdfLinkEvidence(
+                id="pdf:page-0001:link-0001",
+                page_number=1,
+                source_block_id=linked_block.id,
+                source_span=(5, 10),
+                bounds=(90.0, 108.0, 125.0, 144.0),
+                visible_label="Alpha",
+                uri="https://example.com/alpha",
+                destination=None,
+                reconstructed=True,
+                reason=None,
+            ),
+            PdfLinkEvidence(
+                id="pdf:page-0001:link-0002",
+                page_number=1,
+                source_block_id=linked_block.id,
+                source_span=(15, 19),
+                bounds=(150.0, 108.0, 185.0, 144.0),
+                visible_label="Beta",
+                uri="https://example.com/beta",
+                destination=None,
+                reconstructed=True,
+                reason=None,
+            ),
+        ],
+    )
+    document_path.write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    segments = read_segments(run_dir / "segments.jsonl")
+    write_segments(
+        run_dir / "segments.jsonl",
+        [
+            replace(segment, source_text=source_text, protected=[])
+            if segment.id == segment_id
+            else segment
+            for segment in segments
+        ],
+    )
+    translations[segment_id] = Translation(segment_id, "Read Alpha and Beta now")
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    uris = [
+        str(annotation.get_object()["/A"].get_object()["/URI"])
+        for page in PdfReader(staged).pages
+        for annotation in page.get("/Annots", [])
+        if annotation.get_object().get("/A") is not None
+        and str(annotation.get_object()["/A"].get_object().get("/S")) == "/URI"
+    ]
+    assert uris == ["https://example.com/alpha", "https://example.com/beta"]
+
+
 def test_pdf_layout_reader_rejects_contained_table_cell_peer_overlap(
     tmp_path: Path,
 ) -> None:
@@ -2709,6 +2786,87 @@ def test_caption_above_figure_is_emitted_once_in_source_order(
     assert caption.page_number == figure.page_number
     figure_top = figure.bounds[1] + figure.bounds[3]
     assert 0.0 <= caption.bounds[1] - figure_top <= 12.0
+
+
+def test_standalone_uncaptioned_figure_is_emitted_once(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    document_path = run_dir / "document.json"
+    document = PdfDocument.from_dict(
+        json.loads(document_path.read_text(encoding="utf-8"))
+    )
+    caption = next(
+        block for block in document.blocks if block.id == identifiers["caption"]
+    )
+    blocks = [
+        replace(
+            block,
+            order=order,
+            caption_id=None if block.id == identifiers["figure"] else block.caption_id,
+        )
+        for order, block in enumerate(
+            block for block in document.blocks if block.id != caption.id
+        )
+    ]
+    document_path.write_text(
+        json.dumps(replace(document, blocks=blocks).to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    segments = [
+        segment
+        for segment in read_segments(run_dir / "segments.jsonl")
+        if segment.id != caption.segment_id
+    ]
+    write_segments(run_dir / "segments.jsonl", segments)
+    assert caption.segment_id is not None
+    translations.pop(caption.segment_id)
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert sum(
+        item.block_id == identifiers["figure"] for item in layout.flowables
+    ) == 1
+    assert PdfReader(staged).pages
+
+
+def test_orphan_caption_and_nonreciprocal_pair_still_fail(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary, identifiers = _rich_assembly_run(
+        tmp_path,
+        table_columns=4,
+        table_rows=4,
+    )
+    document_path = run_dir / "document.json"
+    document = PdfDocument.from_dict(
+        json.loads(document_path.read_text(encoding="utf-8"))
+    )
+    figure = next(
+        block for block in document.blocks if block.id == identifiers["figure"]
+    )
+    document_path.write_text(
+        json.dumps(
+            replace(
+                document,
+                blocks=[
+                    replace(block, caption_id=None) if block.id == figure.id else block
+                    for block in document.blocks
+                ],
+            ).to_dict(),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PdfAssemblyError, match="every caption"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ from web_translator.pdf_models import (
     PdfBlock,
     PdfBlockKind,
     PdfBlockStyle,
+    PdfLinkEvidence,
     PdfTableCell,
 )
 
@@ -65,6 +66,7 @@ class TableDetectionResult:
 @dataclass(frozen=True, slots=True)
 class LinkEvidenceResult:
     blocks: tuple[PdfBlock, ...]
+    links: tuple[PdfLinkEvidence, ...]
     warnings: tuple[str, ...]
 
 
@@ -273,14 +275,14 @@ def find_clear_gutter(
     evidence: list[tuple[float, float]] = []
     for left_boundary in candidates:
         for right_boundary in candidates:
-            if right_boundary.x0 - left_boundary.x1 + 1e-9 < minimum_width:
+            if right_boundary.x0 - left_boundary.x1 < minimum_width:
                 continue
             left = [line for line in candidates if line.x1 <= left_boundary.x1]
             right = [line for line in candidates if line.x0 >= right_boundary.x0]
             if not left or not right:
                 continue
             gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
-            if gutter[1] - gutter[0] + 1e-9 < minimum_width:
+            if gutter[1] - gutter[0] < minimum_width:
                 continue
             if not all(
                 line.x1 <= gutter[0]
@@ -952,7 +954,7 @@ def extract_link_evidence(
                     character
                     for character in page.chars
                     if isinstance(character, Mapping)
-                    and str(character.get("text", "")).strip()
+                    and str(character.get("text", ""))
                 )
                 for page in layout_document.pages
             ]
@@ -961,6 +963,7 @@ def extract_link_evidence(
     if len(visible_characters) != len(reader.pages):
         raise PdfExtractionError("PDF readers disagree on link-evidence page count")
     replacements = {block.id: block for block in blocks}
+    links: list[PdfLinkEvidence] = []
     warnings: list[str] = []
     by_page: dict[int, list[PdfBlock]] = defaultdict(list)
     for block in blocks:
@@ -981,8 +984,22 @@ def extract_link_evidence(
                     f"page {page_number} link {annotation_index}: malformed annotation"
                 )
                 continue
+            visible_label = _visible_link_label(
+                visible_characters[page_index], source_bbox
+            )
+            if not visible_label:
+                raise PdfExtractionError(
+                    f"page {page_number} link {annotation_index}: "
+                    "missing visible link text"
+                )
+            if not owners and visible_label:
+                raise PdfExtractionError(
+                    f"page {page_number} link {annotation_index}: "
+                    "visible link text has no emitted owner"
+                )
             if not owners and any(
                 (character_bbox := _character_bbox(character)) is not None
+                and str(character.get("text", "")).strip()
                 and _bbox_intersection(character_bbox, source_bbox) > 0
                 for character in visible_characters[page_index]
             ):
@@ -990,42 +1007,107 @@ def extract_link_evidence(
                     f"page {page_number} link {annotation_index}: "
                     "visible link text has no emitted owner"
                 )
-            if len(owners) != 1:
-                warnings.append(
-                    f"page {page_number} link {annotation_index}: "
-                    "unresolved visible link source"
-                )
-                continue
-            owner = replacements[owners[0].id]
             uri = _annotation_uri(annotation)
-            if uri is not None:
-                if owner.uri is not None and owner.uri != uri:
-                    warnings.append(
-                        f"page {page_number} link {annotation_index}: "
-                        "multiple URI annotations for one block"
-                    )
-                    continue
-                replacements[owner.id] = replace(owner, uri=uri)
-                continue
-            destination = _annotation_destination(annotation)
-            target = _map_internal_destination(reader, destination, by_page)
-            if target is None:
+            raw_destination = _annotation_destination(annotation)
+            missing_destination = uri is None and raw_destination is None
+            target = (
+                None
+                if uri is not None or missing_destination
+                else _map_internal_destination(reader, raw_destination, by_page)
+            )
+            destination = (
+                None
+                if uri is not None
+                else "unresolved:missing-destination"
+                if missing_destination
+                else target.id
+                if target is not None
+                else _display_internal_destination(raw_destination)
+            )
+            owner = owners[0] if len(owners) == 1 else None
+            source_span = (
+                _unique_source_span(owner.source_text, visible_label)
+                if owner is not None
+                else None
+            )
+            reason: str | None = None
+            if owner is None:
+                reason = "visible source intersects multiple blocks"
+            elif source_span is None:
+                reason = "visible label is not unique within source block"
+            elif missing_destination:
+                reason = "link destination is missing or malformed"
+            elif uri is None and target is None:
+                reason = "internal destination is unresolved"
+            reconstructed = reason is None
+            link = PdfLinkEvidence(
+                id=f"pdf:page-{page_number:04d}:link-{annotation_index:04d}",
+                page_number=page_number,
+                source_block_id=owner.id if owner is not None else None,
+                source_span=source_span,
+                bounds=source_bbox,
+                visible_label=visible_label,
+                uri=uri,
+                destination=destination,
+                reconstructed=reconstructed,
+                reason=reason,
+            )
+            links.append(link)
+            if reason is not None:
                 warnings.append(
                     f"page {page_number} link {annotation_index}: "
-                    "unresolved internal destination"
+                    f"unreconstructed link label={visible_label!r} "
+                    f"destination={(uri or destination)!r} reason={reason}"
                 )
-                continue
-            if owner.destination is not None and owner.destination != target.id:
-                warnings.append(
-                    f"page {page_number} link {annotation_index}: "
-                    "multiple destinations for one block"
-                )
-                continue
-            replacements[owner.id] = replace(owner, destination=target.id)
+
+    links_by_block: dict[str, list[PdfLinkEvidence]] = defaultdict(list)
+    for link in links:
+        if link.reconstructed and link.source_block_id is not None:
+            links_by_block[link.source_block_id].append(link)
+    for block_id, block_links in links_by_block.items():
+        block = replacements[block_id]
+        if len(block_links) != 1 or block.uri is not None or block.destination is not None:
+            continue
+        link = block_links[0]
+        replacements[block_id] = replace(
+            block,
+            uri=link.uri,
+            destination=link.destination,
+        )
     return LinkEvidenceResult(
         blocks=tuple(replacements[block.id] for block in blocks),
+        links=tuple(links),
         warnings=tuple(sorted(set(warnings))),
     )
+
+
+def _visible_link_label(
+    characters: Sequence[Mapping[str, object]],
+    bbox: tuple[float, float, float, float],
+) -> str:
+    raw = "".join(
+        str(character.get("text", ""))
+        for character in characters
+        if _character_center_inside_bbox(character, bbox)
+    )
+    return " ".join(raw.split())
+
+
+def _unique_source_span(text: str, label: str) -> tuple[int, int] | None:
+    start = text.find(label)
+    if start < 0 or text.find(label, start + 1) >= 0:
+        return None
+    return (start, start + len(label))
+
+
+def _display_internal_destination(destination: object) -> str:
+    if isinstance(destination, str) and destination:
+        return destination
+    if isinstance(destination, Sequence) and not isinstance(destination, (str, bytes)):
+        rendered = ", ".join(str(item) for item in destination[1:])
+        return f"internal:[{rendered}]"
+    rendered = str(destination)
+    return rendered if rendered else "internal:unresolved"
 
 
 def _usable_table(table: object, strategy: str) -> bool:

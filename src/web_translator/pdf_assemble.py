@@ -58,7 +58,13 @@ from web_translator.pdf_flowables import (
     TrackedFlowable,
 )
 from web_translator.pdf_layout import split_list_marker
-from web_translator.pdf_models import PdfBlock, PdfContractError, PdfDocument, PdfSourceRecord
+from web_translator.pdf_models import (
+    PdfBlock,
+    PdfContractError,
+    PdfDocument,
+    PdfLinkEvidence,
+    PdfSourceRecord,
+)
 from web_translator.protection import ProtectionError, restore_tokens
 from web_translator.terminology import TerminologyError, normalize_first_use
 
@@ -263,7 +269,7 @@ def assemble_pdf(
             temporary_staging_anchor,
             "translated.pdf",
         )
-        uses_rich_layout = any(
+        uses_rich_layout = bool(document.links) or any(
             block.kind in _RICH_KINDS or block.kind in _IGNORED_KINDS
             for block in document.blocks
         )
@@ -278,6 +284,7 @@ def assemble_pdf(
             )
         else:
             records = _build_basic_document(
+                document,
                 ordered,
                 source,
                 temporary_pdf.stream,
@@ -632,19 +639,18 @@ def _validate_rich_relationships(document: PdfDocument) -> None:
         raise PdfAssemblyError("figure media paths must be unique")
     claimed_captions: set[str] = set()
     for figure in figures:
-        if figure.caption_id is None:
-            raise PdfAssemblyError(f"figure is missing its caption: {figure.id}")
-        caption = by_id.get(figure.caption_id)
-        if (
-            caption is None
-            or caption.kind != "caption"
-            or caption.caption_id != figure.id
-            or caption.id in claimed_captions
-        ):
-            raise PdfAssemblyError(
-                f"ambiguous figure-caption relationship for {figure.id}"
-            )
-        claimed_captions.add(caption.id)
+        if figure.caption_id is not None:
+            caption = by_id.get(figure.caption_id)
+            if (
+                caption is None
+                or caption.kind != "caption"
+                or caption.caption_id != figure.id
+                or caption.id in claimed_captions
+            ):
+                raise PdfAssemblyError(
+                    f"ambiguous figure-caption relationship for {figure.id}"
+                )
+            claimed_captions.add(caption.id)
         page = document.pages[figure.page_number - 1]
         x0, top, x1, bottom = figure.bbox
         if (
@@ -770,6 +776,7 @@ def _anchor_name(block_id: str) -> str:
 
 
 def _build_basic_document(
+    document: PdfDocument,
     ordered: Sequence[tuple[PdfBlock, Segment, str]],
     source: PdfSourceRecord,
     destination: BinaryIO,
@@ -808,7 +815,11 @@ def _build_basic_document(
                     list_level=list_levels.get(block.id, 0),
                 )
                 paragraph = Paragraph(
-                    escape(rendered_text),
+                    _linked_markup(
+                        block,
+                        rendered_text,
+                        _links_by_block(document).get(block.id, ()),
+                    ),
                     style,
                     bulletText=escape(bullet_text) if bullet_text is not None else None,
                 )
@@ -861,6 +872,7 @@ def _build_rich_document(
     part_counters: dict[str, int] = {}
     translated = {block.id: text for block, _segment, text in ordered}
     block_by_id = {block.id: block for block in document.blocks}
+    links_by_block = _links_by_block(document)
     left_margin = right_margin = 54.0
     top_margin = 54.0
     bottom_margin = 42.0
@@ -1011,7 +1023,7 @@ def _build_rich_document(
                 continue
             block = block_by_id[note_id]
             paragraph = Paragraph(
-                _linked_markup(block, translated[note_id]),
+                _linked_markup(block, translated[note_id], links_by_block.get(block.id, ())),
                 footnote_style,
             )
             flowable = TrackedFlowable(
@@ -1126,7 +1138,7 @@ def _build_rich_document(
         story.append(
             TrackedFlowable(
                 Paragraph(
-                    _linked_markup(block, rendered_text),
+                    _linked_markup(block, rendered_text, links_by_block.get(block.id, ())),
                     style,
                     bulletText=(
                         escape(bullet_text) if bullet_text is not None else None
@@ -1160,7 +1172,7 @@ def _build_rich_document(
             append_text(block_by_id[note_id], portrait_frame)
             emitted_section_notes.add(note_id)
 
-    def append_figure_pair(figure: PdfBlock, caption: PdfBlock) -> None:
+    def append_figure_pair(figure: PdfBlock, caption: PdfBlock | None) -> None:
         image = _figure_flowable(
             figure,
             media_payloads[figure.id],
@@ -1168,6 +1180,10 @@ def _build_rich_document(
             records,
             part_counters,
         )
+        if caption is None:
+            story.append(image)
+            emitted_figures.add(figure.id)
+            return
         caption_style = ParagraphStyle(
             f"WT-caption-{caption.order}",
             fontName=REGULAR_FONT_NAME,
@@ -1179,7 +1195,11 @@ def _build_rich_document(
         )
         caption_flowable = TrackedFlowable(
             Paragraph(
-                _linked_markup(caption, translated[caption.id]),
+                _linked_markup(
+                    caption,
+                    translated[caption.id],
+                    links_by_block.get(caption.id, ()),
+                ),
                 caption_style,
             ),
             block_id=caption.id,
@@ -1233,6 +1253,7 @@ def _build_rich_document(
                             part_counters,
                             table_header_rows[block.table_id],
                             page_note_callbacks,
+                            links_by_block,
                         )
                     )
                     emitted_tables.add(block.table_id)
@@ -1242,8 +1263,11 @@ def _build_rich_document(
                 if block.kind in {"figure", "caption"}:
                     if block.kind == "figure":
                         figure = block
-                        assert block.caption_id is not None
-                        caption = block_by_id[block.caption_id]
+                        caption = (
+                            block_by_id[block.caption_id]
+                            if block.caption_id is not None
+                            else None
+                        )
                     else:
                         assert block.caption_id is not None
                         figure = block_by_id[block.caption_id]
@@ -1288,7 +1312,30 @@ def _build_rich_document(
     return records
 
 
-def _linked_markup(block: PdfBlock, text: str) -> str:
+def _linked_markup(
+    block: PdfBlock,
+    text: str,
+    links: Sequence[PdfLinkEvidence] = (),
+) -> str:
+    reconstructed = [link for link in links if link.reconstructed]
+    if reconstructed:
+        spans = _translated_link_spans(block, text, reconstructed)
+        rendered_parts: list[str] = []
+        cursor = 0
+        for start, end, link in spans:
+            rendered_parts.append(escape(text[cursor:start]))
+            label = escape(text[start:end])
+            if link.uri is not None:
+                href = _safe_uri(link.uri, link.id)
+            else:
+                assert link.destination is not None
+                href = "#" + _anchor_name(link.destination)
+            rendered_parts.append(
+                f"<link href={quoteattr(href)}>{label}</link>"
+            )
+            cursor = end
+        rendered_parts.append(escape(text[cursor:]))
+        return "".join(rendered_parts)
     rendered = escape(text)
     if block.uri is not None:
         return f"<link href={quoteattr(_safe_uri(block.uri, block.id))}>{rendered}</link>"
@@ -1298,6 +1345,46 @@ def _linked_markup(block: PdfBlock, text: str) -> str:
             f"{rendered}</link>"
         )
     return rendered
+
+
+def _links_by_block(
+    document: PdfDocument,
+) -> dict[str, tuple[PdfLinkEvidence, ...]]:
+    grouped: dict[str, list[PdfLinkEvidence]] = {}
+    for link in document.links:
+        if link.source_block_id is not None:
+            grouped.setdefault(link.source_block_id, []).append(link)
+    return {
+        block_id: tuple(sorted(items, key=lambda item: item.source_span or (0, 0)))
+        for block_id, items in grouped.items()
+    }
+
+
+def _translated_link_spans(
+    block: PdfBlock,
+    text: str,
+    links: Sequence[PdfLinkEvidence],
+) -> list[tuple[int, int, PdfLinkEvidence]]:
+    spans: list[tuple[int, int, PdfLinkEvidence]] = []
+    source_length = max(1, len(block.source_text))
+    target_length = len(text)
+    for link in links:
+        exact = text.find(link.visible_label)
+        if exact >= 0 and text.find(link.visible_label, exact + 1) < 0:
+            start, end = exact, exact + len(link.visible_label)
+        else:
+            assert link.source_span is not None
+            source_start, source_end = link.source_span
+            start = min(target_length, round(source_start * target_length / source_length))
+            end = min(target_length, round(source_end * target_length / source_length))
+            if end <= start:
+                end = min(target_length, start + 1)
+        if end <= start or (spans and start < spans[-1][1]):
+            raise PdfAssemblyError(
+                f"ambiguous translated link spans for {block.id}"
+            )
+        spans.append((start, end, link))
+    return spans
 
 
 def _classify_footnotes(
@@ -1403,6 +1490,7 @@ def _native_table(
     part_counters: dict[str, int],
     header_rows: set[int],
     on_draw_by_block: Mapping[str, Callable[[Any, int], None]],
+    links_by_block: Mapping[str, Sequence[PdfLinkEvidence]],
 ) -> Table:
     row_count = max((block.row or 0) + block.row_span for block in blocks)
     column_count = len(widths)
@@ -1425,7 +1513,14 @@ def _native_table(
         assert block.row is not None and block.column is not None
         style = header_style if block.row in header_rows else cell_style
         if block.source_text.strip():
-            paragraph = Paragraph(_linked_markup(block, translated[block.id]), style)
+            paragraph = Paragraph(
+                _linked_markup(
+                    block,
+                    translated[block.id],
+                    links_by_block.get(block.id, ()),
+                ),
+                style,
+            )
         else:
             paragraph = Spacer(1.0, MINIMUM_FONT_SIZE)
         data[block.row][block.column] = TrackedFlowable(

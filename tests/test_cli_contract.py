@@ -25,6 +25,7 @@ from web_translator.pdf_models import (
     PdfSourceRecord,
 )
 from web_translator.pdf_qa import PdfQAFailure
+from web_translator.pdf_review import build_pdf_semantic_review_input
 from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
@@ -111,7 +112,14 @@ def _write_pdf_assembly_cli_run(run_dir: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    _write_json(run_dir / "review.json", _review_payload())
+    assignments = run_dir / "assignments"
+    assignments.mkdir()
+    _write_json(assignments / "zone-001.json", {"zone_id": "zone-001"})
+    review = _review_payload()
+    review["semantic_input_sha256"] = build_pdf_semantic_review_input(
+        run_dir
+    ).semantic_input_sha256
+    _write_json(run_dir / "review.json", review)
 
 
 def test_pdf_assemble_cli_requires_review_and_stages_without_publishing(
@@ -161,7 +169,7 @@ def test_pdf_assemble_cli_rejects_unresolved_semantic_review_as_assembly_failure
 ) -> None:
     run_dir = tmp_path / "run"
     _write_pdf_assembly_cli_run(run_dir)
-    review = _review_payload()
+    review = json.loads((run_dir / "review.json").read_text(encoding="utf-8"))
     review["section_findings"]["zone-001"][0]["verdict"] = "required-fix"
     review["unresolved_required"] = ["zone-001:semantic_fidelity"]
     _write_json(run_dir / "review.json", review)

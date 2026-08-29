@@ -36,6 +36,10 @@ from web_translator.pdf_models import (
     PdfLayoutReview,
     PdfSourceRecord,
 )
+from web_translator.pdf_review import (
+    PdfSemanticReviewError,
+    validate_pdf_semantic_review,
+)
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -256,10 +260,6 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     staged_pdf: assembly._OpenedFile | None = None
     completed = False
     publication_rolled_back = False
-    report_paths = (
-        run_dir / "staged-output" / "manifest.json",
-        run_dir / "staged-output" / "review-report.md",
-    )
     try:
         run_anchor = assembly._open_directory_anchor(run_dir, "run")
         _validate_locations(run_anchor, output_dir)
@@ -353,6 +353,10 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         semantic_value = _strict_json_mapping(
             snapshot_bytes["review.json"], "semantic review"
         )
+        try:
+            validate_pdf_semantic_review(run_dir, semantic_value)
+        except PdfSemanticReviewError as error:
+            raise PdfQAFailure(str(error)) from error
         zone_values = {
             Path(name).stem: _strict_json_mapping(payload, f"PDF zone {name}")
             for name, payload in zone_bytes.items()
@@ -397,20 +401,30 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
                 "staged PDF hash does not match current automated, visual, and layout evidence"
             )
         _verify_pdf_qa_artifacts(run_anchor, qa)
-        manifest = write_pdf_manifest(
-            run_dir, report_paths[0], evidence=report_evidence
+        manifest_file = assembly._create_anchored_binary_file(
+            staged_anchor, "manifest.json"
         )
-        write_pdf_review_report(manifest, report_paths[1])
+        final_files["manifest.json"] = manifest_file
+        manifest = write_pdf_manifest(
+            run_dir, manifest_file.stream, evidence=report_evidence
+        )
+        assembly._finalize_opened_file(manifest_file, "final PDF manifest")
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"manifest.json": manifest_file}
+        )
+        review_file = assembly._create_anchored_binary_file(
+            staged_anchor, "review-report.md"
+        )
+        final_files["review-report.md"] = review_file
+        write_pdf_review_report(manifest, review_file.stream)
+        assembly._finalize_opened_file(review_file, "final PDF review report")
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"review-report.md": review_file}
+        )
         names = sorted(path.name for path in staged_anchor.current_path().iterdir())
         if names != list(_FINAL_OUTPUT_NAMES):
             raise PdfQAFailure(
                 "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
-            )
-        for name in ("manifest.json", "review-report.md"):
-            final_files[name] = assembly._open_anchored_input_file(
-                staged_anchor,
-                name,
-                "final PDF artifact",
             )
         final_hashes = _final_file_hashes(staged_anchor, final_files)
         final_identities = {
@@ -458,11 +472,15 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
     finally:
         if not completed and not publication_rolled_back:
-            for path in report_paths:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            for name in ("manifest.json", "review-report.md"):
+                assembly._close_opened_file(final_files.get(name))
+                item = final_files.get(name)
+                if staged_anchor is not None and item is not None:
+                    _remove_owned_qa_record(
+                        staged_anchor,
+                        name,
+                        assembly._PublishedFile(item.identity),
+                    )
         assembly._close_opened_file(staged_pdf)
         for item in opened.values():
             assembly._close_opened_file(item)
@@ -1648,7 +1666,16 @@ def _review(
     expected_zone_ids: set[str],
 ) -> Mapping[str, Any]:
     value = _json(opened, path, "semantic review")
-    if set(value) != {"retries", "section_findings", "unresolved_required"}:
+    try:
+        validate_pdf_semantic_review(path.parent, value)
+    except PdfSemanticReviewError as error:
+        raise PdfQAFailure(str(error)) from error
+    if set(value) != {
+        "semantic_input_sha256",
+        "retries",
+        "section_findings",
+        "unresolved_required",
+    }:
         raise PdfQAFailure("semantic review fields are not exact")
     unresolved = value["unresolved_required"]
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
@@ -1876,12 +1903,6 @@ def _validate_pdf_structure(
         raise PdfQAFailure("staged translated PDF has no pages")
     font_faces: set[str] = set()
     link_count = 0
-    internal_link_count = 0
-    expected_uris = {block.uri for block in document.blocks if block.uri is not None}
-    expected_internal_links = sum(
-        block.destination is not None for block in document.blocks
-    )
-    actual_uris: set[str] = set()
     validated_font_programs: set[str] = set()
     page_sizes: list[tuple[float, float]] = []
     link_annotations: list[
@@ -1936,24 +1957,18 @@ def _validate_pdf_structure(
                     assembly._safe_uri(uri, f"page-{page_number}")
                 except PdfAssemblyError as error:
                     raise PdfQAFailure(str(error)) from error
-                actual_uris.add(uri)
                 link_annotations.append((page_number, rectangle, uri, None))
             elif destination is None or not _valid_destination(reader, destination):
                 raise PdfQAFailure(
                     "internal PDF link does not resolve to an output destination"
                 )
             else:
-                internal_link_count += 1
                 link_annotations.append(
                     (page_number, rectangle, None, destination)
                 )
     if font_faces != {"Regular", "Bold"}:
         missing = sorted({"Regular", "Bold"} - font_faces)
         raise PdfQAFailure("missing embedded Korean font face: " + ", ".join(missing))
-    if not expected_uris.issubset(actual_uris):
-        raise PdfQAFailure("required external URI annotation is missing")
-    if internal_link_count < expected_internal_links:
-        raise PdfQAFailure("required internal link annotation is missing")
     if any(item.page_number > len(reader.pages) for item in layout.flowables):
         raise PdfQAFailure("layout refers to a nonexistent output page")
     for item in layout.flowables:
@@ -1975,28 +1990,70 @@ def _validate_pdf_structure(
     layout_by_block: dict[str, list[Any]] = {}
     for item in layout.flowables:
         layout_by_block.setdefault(item.block_id, []).append(item)
-    for block in document.blocks:
-        source_items = layout_by_block.get(block.id, [])
-        if block.uri is not None and not any(
-            uri == block.uri
-            and page_number == item.page_number
-            and _rectangle_intersects_bounds(rectangle, item.bounds)
-            for page_number, rectangle, uri, _destination in link_annotations
-            for item in source_items
-        ):
-            raise PdfQAFailure(
-                f"required external URI annotation is missing for block {block.id}"
-            )
-        if block.destination is not None and not any(
-            destination is not None
-            and page_number == item.page_number
-            and _rectangle_intersects_bounds(rectangle, item.bounds)
-            for page_number, rectangle, _uri, destination in link_annotations
-            for item in source_items
-        ):
-            raise PdfQAFailure(
-                f"required internal link annotation is missing for block {block.id}"
-            )
+    structured_blocks = {
+        link.source_block_id
+        for link in document.links
+        if link.reconstructed and link.source_block_id is not None
+    }
+    expected_links = [
+        (link.source_block_id, link.uri, link.destination)
+        for link in document.links
+        if link.reconstructed and link.source_block_id is not None
+    ]
+    expected_links.extend(
+        (block.id, block.uri, block.destination)
+        for block in document.blocks
+        if block.id not in structured_blocks
+        and (block.uri is not None or block.destination is not None)
+    )
+    remaining_annotations = set(range(len(link_annotations)))
+    for source_block_id, expected_uri, expected_destination in expected_links:
+        assert source_block_id is not None
+        source_items = layout_by_block.get(source_block_id, [])
+        source_matches: list[int] = []
+        for index in sorted(remaining_annotations):
+            page_number, rectangle, _uri, _destination = link_annotations[index]
+            if any(
+                page_number == item.page_number
+                and _rectangle_intersects_bounds(rectangle, item.bounds)
+                for item in source_items
+            ):
+                source_matches.append(index)
+        if expected_uri is not None:
+            matches = [
+                index
+                for index in source_matches
+                if link_annotations[index][2] == expected_uri
+            ]
+            if not matches:
+                raise PdfQAFailure(
+                    "required external URI annotation is missing for block "
+                    f"{source_block_id}"
+                )
+        else:
+            assert expected_destination is not None
+            target_items = layout_by_block.get(expected_destination, [])
+            matches = [
+                index
+                for index in source_matches
+                if link_annotations[index][3] is not None
+                and target_items
+                and _destination_matches_layout(
+                    reader,
+                    link_annotations[index][3],
+                    target_items[0],
+                )
+            ]
+            if not matches:
+                if any(link_annotations[index][3] is not None for index in source_matches):
+                    raise PdfQAFailure(
+                        "internal PDF link does not resolve to its expected output "
+                        f"destination for block {source_block_id}"
+                    )
+                raise PdfQAFailure(
+                    f"required internal link annotation is missing for block {source_block_id}"
+                )
+        remaining_annotations.remove(matches[0])
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
@@ -2147,6 +2204,43 @@ def _valid_destination(reader: PdfReader, destination: object) -> bool:
         except Exception:
             return False
     return False
+
+
+def _destination_matches_layout(
+    reader: PdfReader,
+    destination: object,
+    target: Any,
+) -> bool:
+    value = destination.get_object() if hasattr(destination, "get_object") else destination
+    if isinstance(value, str):
+        value = reader.named_destinations.get(value)
+        if value is None:
+            return False
+    if hasattr(value, "dest_array"):
+        value = value.dest_array
+    if not isinstance(value, (ArrayObject, list)) or len(value) < 2:
+        return False
+    try:
+        page_number = reader.get_page_number(value[0].get_object()) + 1
+    except Exception:
+        return False
+    if page_number != target.page_number or str(value[1]) != "/XYZ":
+        return False
+    if len(value) < 4:
+        return False
+    try:
+        left = float(value[2])
+        top = float(value[3])
+    except (TypeError, ValueError):
+        return False
+    expected_left = target.bounds[0]
+    expected_top = target.bounds[1] + target.bounds[3]
+    return (
+        math.isfinite(left)
+        and math.isfinite(top)
+        and abs(left - expected_left) <= 1.0
+        and abs(top - expected_top) <= 1.0
+    )
 
 
 def _validate_rendered_pages(

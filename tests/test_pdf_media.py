@@ -122,6 +122,108 @@ def test_render_pdf_pages_uses_fixed_dpi_and_returns_png_pages(tmp_path: Path) -
         assert image.size == (400, 200)
 
 
+@pytest.mark.parametrize(
+    ("pixels", "encoded_bytes", "message"),
+    [
+        ([36_000_001], [1], "pixels per page"),
+        ([36_000_000] * 10 + [1], [1] * 11, "total rendered pixels"),
+        ([1], [64 * 1024 * 1024 + 1], "encoded bytes per page"),
+        ([1] * 17, [64 * 1024 * 1024] * 16 + [1], "encoded bytes total"),
+    ],
+)
+def test_render_budget_rejects_one_unit_above_each_exact_limit(
+    pixels: list[int],
+    encoded_bytes: list[int],
+    message: str,
+) -> None:
+    import web_translator.pdf_media as media_module
+
+    with pytest.raises(media_module.PdfMediaError, match=message):
+        media_module._validate_render_budget_counts(pixels, encoded_bytes)
+
+
+def test_render_budget_accepts_exact_limits_and_one_unit_below() -> None:
+    import web_translator.pdf_media as media_module
+
+    media_module._validate_render_budget_counts(
+        [36_000_000] * 10,
+        [1] * 10,
+    )
+    media_module._validate_render_budget_counts(
+        [1] * 16,
+        [64 * 1024 * 1024] * 16,
+    )
+    media_module._validate_render_budget_counts(
+        [35_999_999] * 10,
+        [1] * 10,
+    )
+    media_module._validate_render_budget_counts(
+        [1] * 16,
+        [64 * 1024 * 1024 - 1] * 16,
+    )
+
+
+def test_render_rejects_oversized_geometry_before_locating_poppler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_media as media_module
+
+    source = tmp_path / "oversized.pdf"
+    canvas = Canvas(str(source), pagesize=(14_401, 792))
+    canvas.drawString(72, 720, "oversized render geometry")
+    canvas.save()
+
+    def poppler_must_not_run() -> object:
+        raise AssertionError("geometry budget must reject before Poppler lookup")
+
+    monkeypatch.setattr(media_module, "find_poppler", poppler_must_not_run)
+
+    with pytest.raises(media_module.PdfMediaError, match="pixels per page"):
+        media_module.render_pdf_pages(source, tmp_path / "rendered", dpi=144)
+
+
+def test_render_geometry_normalizes_strict_pdf_parser_failures(
+    tmp_path: Path,
+) -> None:
+    import web_translator.pdf_media as media_module
+
+    source = tmp_path / "malformed.pdf"
+    source.write_bytes(b"not a PDF")
+
+    with pytest.raises(media_module.PdfMediaError, match="inspect PDF render geometry"):
+        media_module.render_pdf_pages(source, tmp_path / "rendered", dpi=144)
+
+
+def test_render_rejects_oversized_user_unit_before_locating_poppler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import FloatObject, NameObject
+
+    import web_translator.pdf_media as media_module
+
+    source = tmp_path / "oversized-user-unit.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.drawString(72, 720, "ordinary media box with an extreme user unit")
+    canvas.save()
+    reader = PdfReader(source)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    writer.pages[0][NameObject("/UserUnit")] = FloatObject(100.0)
+    with source.open("wb") as stream:
+        writer.write(stream)
+
+    def poppler_must_not_run() -> object:
+        raise AssertionError("geometry budget must reject before Poppler lookup")
+
+    monkeypatch.setattr(media_module, "find_poppler", poppler_must_not_run)
+
+    with pytest.raises(media_module.PdfMediaError, match="pixels per page"):
+        media_module.render_pdf_pages(source, tmp_path / "rendered", dpi=144)
+
+
 def test_crop_figure_regions_keeps_rendered_pixels_and_exact_dimensions(
     tmp_path: Path,
 ) -> None:
@@ -215,3 +317,69 @@ def test_crop_figure_regions_rejects_a_region_outside_the_rendered_page(
             ],
             tmp_path / "media",
         )
+
+
+def test_crop_figure_regions_cleans_first_root_when_second_allocation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    import web_translator.pdf_media as media_module
+    from web_translator.pdf_media import FigureRegion, PdfMediaError
+
+    real_mkdtemp = tempfile.mkdtemp
+    calls = 0
+
+    def fail_second_mkdtemp(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("crop root allocation failed")
+        return real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(media_module.tempfile, "mkdtemp", fail_second_mkdtemp)
+    destination = tmp_path / "new-parent" / "media"
+
+    with pytest.raises(PdfMediaError, match="crop root allocation failed"):
+        media_module.crop_figure_regions(
+            _graphic_pdf(tmp_path / "source.pdf"),
+            [FigureRegion(1, (50, 25, 150, 75), 200, 100)],
+            destination,
+        )
+
+    assert not list(destination.parent.glob(".pdf-render-*"))
+    assert not destination.parent.exists()
+
+
+def test_crop_figure_regions_cleans_first_root_when_second_allocation_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    import web_translator.pdf_media as media_module
+    from web_translator.pdf_media import FigureRegion
+
+    real_mkdtemp = tempfile.mkdtemp
+    calls = 0
+
+    def interrupt_second_mkdtemp(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(media_module.tempfile, "mkdtemp", interrupt_second_mkdtemp)
+    destination = tmp_path / "new-parent" / "media"
+
+    with pytest.raises(KeyboardInterrupt):
+        media_module.crop_figure_regions(
+            _graphic_pdf(tmp_path / "source.pdf"),
+            [FigureRegion(1, (50, 25, 150, 75), 200, 100)],
+            destination,
+        )
+
+    assert not list(destination.parent.glob(".pdf-render-*"))
+    assert not destination.parent.exists()

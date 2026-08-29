@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import math
 from pathlib import Path
 
 from PIL import Image
@@ -187,6 +189,21 @@ def test_order_page_lines_uses_an_eighteen_point_gutter_boundary() -> None:
         "R2",
     ]
     assert [line.text for line in order_page_lines(below_lines, 200)] == [
+        "L1",
+        "R1",
+        "L2",
+        "R2",
+    ]
+
+    infinitesimally_below = group_words_into_lines(
+        [
+            _word("L1", x0=10, x1=90, top=10, bottom=20),
+            _word("R1", x0=math.nextafter(108.0, -math.inf), x1=190, top=10, bottom=20),
+            _word("L2", x0=10, x1=90, top=30, bottom=40),
+            _word("R2", x0=math.nextafter(108.0, -math.inf), x1=190, top=30, bottom=40),
+        ]
+    )
+    assert [line.text for line in order_page_lines(infinitesimally_below, 200)] == [
         "L1",
         "R1",
         "L2",
@@ -742,10 +759,17 @@ def test_peer_overlap_accepts_exactly_ten_percent_and_rejects_above() -> None:
         style=style,
         source_text="above",
     )
+    infinitesimally_above = replace(
+        above,
+        id="pdf:page-0001:block-0004",
+        bbox=(math.nextafter(9.0, -math.inf), 0, 19, 10),
+    )
 
     _validate_peer_overlap([left, exact])
     with pytest.raises(PdfExtractionError, match="above 10 percent.*block-0001"):
         _validate_peer_overlap([left, above])
+    with pytest.raises(PdfExtractionError, match="above 10 percent.*block-0001"):
+        _validate_peer_overlap([left, infinitesimally_above])
 
 
 def test_extract_pdf_emits_heading_context_and_opaque_locators(tmp_path: Path) -> None:
@@ -1242,6 +1266,50 @@ def _orphan_visible_link_pdf(path: Path) -> Path:
     return path
 
 
+def _link_without_visible_text_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 400))
+    canvas.drawString(50, 350, "Visible text outside the link annotation")
+    canvas.linkURL("https://example.com/hidden", (50, 298, 150, 312), relative=0)
+    canvas.save()
+    return path
+
+
+def _multiple_inline_links_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(400, 200))
+    canvas.drawString(50, 120, "Read Alpha and Beta now")
+    canvas.linkURL("https://example.com/alpha", (78, 118, 114, 132), relative=0)
+    canvas.linkURL("https://example.com/beta", (134, 118, 166, 132), relative=0)
+    canvas.save()
+    return path
+
+
+def _unresolved_internal_link_pdf(path: Path) -> Path:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, NameObject, NumberObject
+
+    canvas = Canvas(str(path), pagesize=(400, 200))
+    canvas.drawString(50, 120, "Unresolved internal target")
+    canvas.linkURL("https://placeholder.example", (50, 118, 230, 132), relative=0)
+    canvas.save()
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    annotation = writer.pages[0]["/Annots"][0].get_object()
+    del annotation["/A"]
+    annotation[NameObject("/Dest")] = ArrayObject(
+        [
+            writer.pages[0].indirect_reference,
+            NameObject("/XYZ"),
+            NumberObject(350),
+            NumberObject(50),
+            NumberObject(0),
+        ]
+    )
+    with path.open("wb") as destination:
+        writer.write(destination)
+    return path
+
+
 def _nonzero_origin_link_pdf(path: Path, *, rotation: int = 0) -> Path:
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import ArrayObject, NameObject, NumberObject
@@ -1392,6 +1460,29 @@ def test_upright_extraction_staging_preserves_pdf_evidence_and_always_cleans(
     assert not staging_parent.exists()
     assert source.read_bytes() == original_bytes
 
+
+def test_upright_extraction_cleans_new_parent_when_root_allocation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_translator import pdf_extract
+
+    source = _nonzero_rich_coordinates_pdf(
+        tmp_path / "staging-source.pdf",
+        rotation=90,
+    )
+    staging_parent = tmp_path / "new-staging-parent"
+
+    def fail_mkdtemp(*args: object, **kwargs: object) -> str:
+        raise OSError("upright root allocation failed")
+
+    monkeypatch.setattr(pdf_extract.tempfile, "mkdtemp", fail_mkdtemp)
+
+    with pytest.raises(OSError, match="upright root allocation failed"):
+        with pdf_extract._upright_extraction_source(source, staging_parent):
+            pytest.fail("allocation failure must happen before yielding")
+
+    assert not staging_parent.exists()
 
 def test_detect_tables_preserves_merged_spans_and_empty_structural_cells(
     tmp_path: Path,
@@ -1549,8 +1640,12 @@ def test_extract_pdf_emits_figures_captions_footnotes_tables_and_links(
     target = next(
         block for block in document.blocks if block.source_text == "Internal Destination"
     )
-    assert external.uri == "https://example.com/spec"
-    assert internal.destination == target.id
+    assert external is internal
+    assert [(link.visible_label, link.uri, link.destination) for link in document.links] == [
+        ("External specification link", "https://example.com/spec", None),
+        ("Continue at the internal destination", None, target.id),
+    ]
+    assert document.extraction_warnings == []
 
     segments = read_segments(tmp_path / "segments.jsonl")
     empty_cell = next(
@@ -2041,9 +2136,73 @@ def test_extract_link_evidence_warns_and_fails_closed_for_ambiguous_source(
     )
 
     assert [block.uri for block in evidence.blocks] == [None, None]
-    assert evidence.warnings == (
-        "page 1 link 1: unresolved visible link source",
+    assert len(evidence.links) == 1
+    assert evidence.links[0].visible_label
+    assert evidence.links[0].uri == "https://example.com/ambiguous"
+    assert evidence.links[0].reconstructed is False
+    assert evidence.links[0].reason == "visible source intersects multiple blocks"
+    assert "https://example.com/ambiguous" in evidence.warnings[0]
+    assert evidence.links[0].visible_label in evidence.warnings[0]
+
+
+def test_extract_link_evidence_preserves_multiple_inline_spans_per_block(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    source = _multiple_inline_links_pdf(tmp_path / "multiple-links.pdf")
+    block = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(50.0, 68.0, 180.0, 85.0),
+        style=PdfBlockStyle(12.0, False, "left", 0.0, 0.0),
+        source_text="Read Alpha and Beta now",
     )
+
+    evidence = extract_link_evidence(source, [block])
+
+    assert [link.uri for link in evidence.links] == [
+        "https://example.com/alpha",
+        "https://example.com/beta",
+    ]
+    assert [link.source_block_id for link in evidence.links] == [block.id, block.id]
+    assert [link.source_span for link in evidence.links] == [(5, 10), (15, 19)]
+    assert [link.visible_label for link in evidence.links] == ["Alpha", "Beta"]
+    assert all(link.reconstructed for link in evidence.links)
+    assert evidence.blocks[0].uri is None
+    assert evidence.warnings == ()
+
+
+def test_extract_link_evidence_preserves_unresolved_internal_destination(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    block = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(50.0, 68.0, 240.0, 85.0),
+        style=PdfBlockStyle(12.0, False, "left", 0.0, 0.0),
+        source_text="Unresolved internal target",
+    )
+
+    evidence = extract_link_evidence(
+        _unresolved_internal_link_pdf(tmp_path / "unresolved-internal.pdf"),
+        [block],
+    )
+
+    assert len(evidence.links) == 1
+    link = evidence.links[0]
+    assert link.visible_label == "Unresolved internal target"
+    assert link.uri is None
+    assert link.destination is not None
+    assert link.reconstructed is False
+    assert link.reason == "internal destination is unresolved"
+    assert link.destination in evidence.warnings[0]
 
 
 def test_extract_link_evidence_rejects_visible_text_without_an_emitted_owner(
@@ -2054,5 +2213,17 @@ def test_extract_link_evidence_rejects_visible_text_without_an_emitted_owner(
     with pytest.raises(PdfExtractionError, match="visible link text has no emitted owner"):
         extract_link_evidence(
             _orphan_visible_link_pdf(tmp_path / "orphan-visible-link.pdf"),
+            [],
+        )
+
+
+def test_extract_link_evidence_rejects_annotation_without_visible_text(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_layout import extract_link_evidence
+
+    with pytest.raises(PdfExtractionError, match="missing visible link text"):
+        extract_link_evidence(
+            _link_without_visible_text_pdf(tmp_path / "hidden-link.pdf"),
             [],
         )

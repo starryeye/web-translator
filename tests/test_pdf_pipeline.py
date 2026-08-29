@@ -24,7 +24,11 @@ from tests.pdf_fixtures import make_many_pages_pdf, make_oversized_pdf
 from tests.test_pdf_extract import _column_pdf, _ruled_table_pdf
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
 from web_translator.pdf_media import PdfMediaError
-from web_translator.pdf_report import build_pdf_manifest
+from web_translator.pdf_report import (
+    PdfFinalManifest,
+    build_pdf_manifest,
+    render_pdf_review_report,
+)
 from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_pdf_run
 
 
@@ -481,7 +485,16 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     shutil.copy2(fixture_dir / "document-summary.txt", run_dir / "document-summary.txt")
     assert main(["prepare-assignments", "--run-dir", str(run_dir)]) == 0
     shutil.copytree(fixture_dir / "translations", run_dir / "translations")
-    shutil.copy2(fixture_dir / "review.json", run_dir / "review.json")
+    assert main(["pdf-review-input", "--run-dir", str(run_dir)]) == 0
+    review = json.loads((fixture_dir / "review.json").read_text(encoding="utf-8"))
+    semantic_input = json.loads(
+        (run_dir / "semantic-review-input.json").read_text(encoding="utf-8")
+    )
+    review["semantic_input_sha256"] = semantic_input["semantic_input_sha256"]
+    (run_dir / "review.json").write_text(
+        json.dumps(review, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     assert main(["validate-translations", "--run-dir", str(run_dir)]) == 0
     assert main(["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
     assert main(["pdf-qa", "prepare", "--run-dir", str(run_dir), "--output-dir", str(output_dir)]) == 0
@@ -519,9 +532,9 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     ]
     _assert_committed_fixture_semantics(fixture_name, segments, records)
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["inspection"]["page_count"] == expected["page_count"]
+    assert manifest["source"]["page_count"] == expected["page_count"]
     assert manifest["output"]["figure_count"] == expected["figure_count"]
-    assert manifest["automated_qa"]["contact_sheet_pages"] == qa["contact_sheet_pages"]
+    assert manifest["qa"]["automated"]["contact_sheet_pages"] == qa["contact_sheet_pages"]
 
 
 @pytest.mark.parametrize("filename", ["image-only-scan.pdf", "encrypted.pdf", "malformed.pdf"])
@@ -1283,6 +1296,82 @@ def test_finalize_rolls_back_when_report_writer_fails(
     assert not prepared_pdf_run.output_dir.exists()
 
 
+def test_finalize_rejects_inputs_mutated_after_semantic_review(
+    prepared_pdf_run: PdfQARun,
+) -> None:
+    assignment = prepared_pdf_run.run_dir / "assignments" / "zone-001.json"
+    assignment.write_bytes(assignment.read_bytes() + b" ")
+
+    with pytest.raises(PdfQAFailure, match="digest does not match"):
+        finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
+
+    assert not prepared_pdf_run.output_dir.exists()
+    assert (prepared_pdf_run.run_dir / "staged-output" / "translated.pdf").is_file()
+
+
+def test_finalize_preserves_foreign_reports_when_staging_is_replaced(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = prepared_pdf_run.run_dir / "staged-output"
+    held_staging = prepared_pdf_run.run_dir / "held-staged-output"
+    real_write = pdf_report_module.write_pdf_manifest
+
+    def write_then_replace_staging(*args: object, **kwargs: object) -> object:
+        manifest = real_write(*args, **kwargs)
+        staging.rename(held_staging)
+        staging.mkdir()
+        (staging / "manifest.json").write_bytes(b"foreign manifest")
+        (staging / "review-report.md").write_bytes(b"foreign review")
+        return manifest
+
+    monkeypatch.setattr(
+        pdf_report_module,
+        "write_pdf_manifest",
+        write_then_replace_staging,
+    )
+
+    with pytest.raises(PdfQAFailure, match="staged.*changed identity"):
+        finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
+
+    assert (staging / "manifest.json").read_bytes() == b"foreign manifest"
+    assert (staging / "review-report.md").read_bytes() == b"foreign review"
+    assert not prepared_pdf_run.output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("report_name", "writer_name"),
+    [
+        ("manifest.json", "write_pdf_manifest"),
+        ("review-report.md", "write_pdf_review_report"),
+    ],
+)
+def test_finalize_rejects_report_name_replacement_and_preserves_racer(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+    report_name: str,
+    writer_name: str,
+) -> None:
+    staging = prepared_pdf_run.run_dir / "staged-output"
+    report_path = staging / report_name
+    foreign = prepared_pdf_run.run_dir / f"foreign-{report_name}"
+    foreign.write_bytes(f"foreign {report_name}".encode())
+    real_write = getattr(pdf_report_module, writer_name)
+
+    def write_then_replace_name(*args: object, **kwargs: object) -> object:
+        result = real_write(*args, **kwargs)
+        os.replace(foreign, report_path)
+        return result
+
+    monkeypatch.setattr(pdf_report_module, writer_name, write_then_replace_name)
+
+    with pytest.raises(PdfQAFailure, match="changed identity"):
+        finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
+
+    assert report_path.read_bytes() == f"foreign {report_name}".encode()
+    assert not prepared_pdf_run.output_dir.exists()
+
+
 def test_finalize_rejects_report_evidence_mutated_during_manifest_write(
     prepared_pdf_run: PdfQARun,
     monkeypatch: pytest.MonkeyPatch,
@@ -1644,6 +1733,137 @@ def test_pdf_manifest_is_deterministic(prepared_pdf_run: PdfQARun) -> None:
     )
 
 
+def test_pdf_manifest_schema_is_exact_and_report_contains_equivalent_evidence(
+    prepared_pdf_run: PdfQARun,
+) -> None:
+    manifest = build_pdf_manifest(prepared_pdf_run.run_dir)
+
+    assert set(manifest) == {
+        "schema_version",
+        "tool_version",
+        "input",
+        "source",
+        "extraction",
+        "counts",
+        "translation",
+        "output",
+        "qa",
+    }
+    assert set(manifest["input"]) == {"kind", "name", "requested_url", "final_url"}
+    assert set(manifest["source"]) == {
+        "sha256",
+        "byte_length",
+        "page_count",
+        "selectable_characters",
+        "scan_candidate_pages",
+        "pages",
+    }
+    assert set(manifest["extraction"]) == {
+        "layout_validation_counts",
+        "warnings",
+        "unreconstructed_links",
+    }
+    assert set(manifest["counts"]) == {
+        "headings",
+        "paragraphs",
+        "lists",
+        "tables",
+        "cells",
+        "figures",
+        "captions",
+        "footnotes",
+        "segments",
+        "zones",
+    }
+    assert set(manifest["translation"]) == {
+        "source_language",
+        "target_language",
+        "terminology",
+        "retries",
+        "master_semantic_review",
+    }
+    assert set(manifest["output"]) == {
+        "page_count",
+        "sha256",
+        "embedded_fonts",
+        "link_count",
+        "figure_count",
+        "qa_status",
+    }
+    assert set(manifest["qa"]) == {
+        "rendered_page_hashes",
+        "layout_findings",
+        "contact_sheet_coverage",
+        "automated",
+        "visual",
+        "warnings",
+        "final_status",
+    }
+    assert PdfFinalManifest.from_dict(manifest).to_dict() == manifest
+
+    report = render_pdf_review_report(manifest)
+    canonical = report.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(canonical) == manifest
+
+    invalid = json.loads(json.dumps(manifest))
+    invalid["input"]["unexpected"] = True
+    with pytest.raises(PdfQAFailure, match="input fields must be exactly"):
+        PdfFinalManifest.from_dict(invalid)
+
+    invalid_qa = json.loads(json.dumps(manifest))
+    invalid_qa["qa"]["automated"]["metrics"]["unexpected"] = 0
+    with pytest.raises(PdfQAFailure, match="metrics fields are not exact"):
+        PdfFinalManifest.from_dict(invalid_qa)
+
+    invalid_review = json.loads(json.dumps(manifest))
+    invalid_review["translation"]["master_semantic_review"]["section_findings"][
+        "zone-001"
+    ].pop()
+    with pytest.raises(PdfQAFailure, match="dimensions are incomplete"):
+        PdfFinalManifest.from_dict(invalid_review)
+
+
+def test_pdf_manifest_and_report_preserve_complete_unreconstructed_link_evidence(
+    prepared_pdf_run: PdfQARun,
+) -> None:
+    path = prepared_pdf_run.run_dir / "document.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    warning = (
+        "page 1 link 7: unreconstructed link label='Quality' "
+        "destination='https://missing.example/target' "
+        "reason=visible source intersects multiple blocks"
+    )
+    document["links"] = [
+        {
+            "id": "pdf:page-0001:link-0007",
+            "page_number": 1,
+            "source_block_id": "pdf:page-0001:block-0001",
+            "source_span": None,
+            "bounds": [72.0, 72.0, 130.0, 100.0],
+            "visible_label": "Quality",
+            "uri": "https://missing.example/target",
+            "destination": None,
+            "reconstructed": False,
+            "reason": "visible source intersects multiple blocks",
+        }
+    ]
+    document["extraction_warnings"] = [warning]
+    path.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    manifest = build_pdf_manifest(prepared_pdf_run.run_dir)
+    unresolved = manifest["extraction"]["unreconstructed_links"]
+    assert unresolved[0]["visible_label"] == "Quality"
+    assert unresolved[0]["uri"] == "https://missing.example/target"
+    assert manifest["extraction"]["warnings"] == [warning]
+    assert manifest["qa"]["warnings"] == [warning]
+    report = render_pdf_review_report(manifest)
+    assert "Quality" in report
+    assert "https://missing.example/target" in report
+
+
 # Production mutation caught: exposing any artifact set other than the reviewed three-file final output.
 def test_finalize_atomically_publishes_exact_reviewed_output(prepared_pdf_run: PdfQARun) -> None:
     finalized = finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
@@ -1656,24 +1876,20 @@ def test_finalize_atomically_publishes_exact_reviewed_output(prepared_pdf_run: P
     ]
     manifest = json.loads((finalized / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest) == {
-        "automated_qa",
-        "block_counts",
-        "inspection",
-        "languages",
+        "counts",
+        "extraction",
+        "input",
         "output",
-        "qa_status",
+        "qa",
         "schema_version",
         "source",
-        "terminology",
         "tool_version",
         "translation",
-        "visual_review",
-        "warnings",
     }
-    assert manifest["qa_status"] == "passed"
-    assert manifest["output"]["sha256"] == manifest["automated_qa"]["staged_pdf_sha256"]
+    assert manifest["output"]["qa_status"] == "passed"
+    assert manifest["output"]["sha256"] == manifest["qa"]["automated"]["staged_pdf_sha256"]
     assert manifest["translation"]["retries"] == {"zone-001": 0}
-    assert manifest["visual_review"]["unresolved_required"] == []
+    assert manifest["qa"]["visual"]["unresolved_required"] == []
     report = (finalized / "review-report.md").read_text(encoding="utf-8")
     assert "Status: **PASS**" in report
     assert "Checked semantic_fidelity against the source." in report

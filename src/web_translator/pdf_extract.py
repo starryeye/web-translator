@@ -98,13 +98,14 @@ def _upright_extraction_source(
         return
     staging_parent = Path(staging_parent)
     remove_empty_parent = not staging_parent.exists()
-    staging_parent.mkdir(parents=True, exist_ok=True)
-    staging_root = Path(
-        tempfile.mkdtemp(prefix=".pdf-upright-", dir=str(staging_parent))
-    )
-    partial = staging_root / "source.partial.pdf"
-    staged = staging_root / "source.pdf"
+    staging_root: Path | None = None
     try:
+        staging_parent.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(
+            tempfile.mkdtemp(prefix=".pdf-upright-", dir=str(staging_parent))
+        )
+        partial = staging_root / "source.partial.pdf"
+        staged = staging_root / "source.pdf"
         writer = PdfWriter()
         writer.clone_document_from_reader(reader)
         for page in writer.pages:
@@ -114,7 +115,8 @@ def _upright_extraction_source(
         os.replace(partial, staged)
         yield staged
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
         if remove_empty_parent:
             try:
                 staging_parent.rmdir()
@@ -303,6 +305,8 @@ def extract_pdf(
         ],
         blocks=blocks,
         table_cells=table_cells,
+        links=list(link_evidence.links),
+        extraction_warnings=list(link_evidence.warnings),
     )
     try:
         PdfDocument.from_dict(document.to_dict())
@@ -535,7 +539,7 @@ def _validate_peer_overlap(blocks: list[PdfBlock]) -> None:
                 if intersection == 0:
                     continue
                 smaller_area = min(_bbox_area(left.bbox), _bbox_area(right.bbox))
-                if smaller_area > 0 and intersection / smaller_area > 0.10 + 1e-9:
+                if smaller_area > 0 and intersection / smaller_area > 0.10:
                     raise PdfExtractionError(
                         "PDF peer text blocks overlap above 10 percent on page "
                         f"{page_number}: {left.id}, {right.id}"

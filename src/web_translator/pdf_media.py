@@ -12,9 +12,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 
 from PIL import Image
 from PIL import ImageDraw, ImageFont
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 
 
 _POPPLER_TIMEOUT_SECONDS = 60
@@ -25,6 +28,10 @@ _CONTACT_THUMBNAIL = (360, 480)
 _CONTACT_LABEL_HEIGHT = 28
 _CONTACT_GAP = 16
 _RENDERED_PAGE_NAME = re.compile(r"page-(\d+)\.png\Z")
+MAX_RENDERED_PIXELS_PER_PAGE = 36_000_000
+MAX_RENDERED_PIXELS_TOTAL = 360_000_000
+MAX_RENDERED_PNG_BYTES_PER_PAGE = 64 * 1024 * 1024
+MAX_RENDERED_PNG_BYTES_TOTAL = 1024 * 1024 * 1024
 
 
 class PdfMediaError(RuntimeError):
@@ -84,6 +91,7 @@ def render_pdf_pages(
     """Render every source page to a deterministic PNG prefix."""
     if type(dpi) is not int or dpi <= 0:
         raise PdfMediaError("PDF render DPI must be a positive integer")
+    expected_pixels = _expected_render_pixel_counts(Path(source_pdf), dpi)
     tools = find_poppler()
     destination = Path(destination)
     destination_identity = _prepare_render_destination(
@@ -104,6 +112,7 @@ def render_pdf_pages(
     pages = _rendered_page_files(destination)
     if not pages:
         raise PdfMediaError("render PDF pages produced no PNG output")
+    _validate_rendered_png_set(pages, expected_page_count=len(expected_pixels))
     if name_width is not None:
         if type(name_width) is not int or name_width <= 0:
             raise PdfMediaError("PDF render name width must be a positive integer")
@@ -125,7 +134,92 @@ def render_pdf_pages(
         raise PdfMediaError(
             "rendered PDF page set changed during name normalization"
         )
+    _validate_rendered_png_set(final_pages, expected_page_count=len(expected_pixels))
     return final_pages
+
+
+def _expected_render_pixel_counts(source_pdf: Path, dpi: int) -> list[int]:
+    try:
+        reader = PdfReader(source_pdf, strict=True)
+        pixels = []
+        for page in reader.pages:
+            user_unit = float(page.user_unit)
+            width = abs(float(page.cropbox.width)) * user_unit
+            height = abs(float(page.cropbox.height)) * user_unit
+            if (
+                not math.isfinite(user_unit)
+                or user_unit <= 0
+                or not math.isfinite(width)
+                or not math.isfinite(height)
+                or width <= 0
+                or height <= 0
+            ):
+                raise PdfMediaError("PDF render geometry must be finite and positive")
+            pixel_width = math.ceil(width * dpi / 72.0)
+            pixel_height = math.ceil(height * dpi / 72.0)
+            pixels.append(pixel_width * pixel_height)
+    except PdfMediaError:
+        raise
+    except (OSError, PyPdfError, TypeError, ValueError) as error:
+        raise PdfMediaError(f"cannot inspect PDF render geometry: {error}") from error
+    if not pixels:
+        raise PdfMediaError("PDF render geometry contains no pages")
+    _validate_render_budget_counts(pixels, [0] * len(pixels))
+    return pixels
+
+
+def _validate_render_budget_counts(
+    page_pixels: Sequence[int],
+    encoded_bytes: Sequence[int],
+) -> None:
+    if len(page_pixels) != len(encoded_bytes):
+        raise PdfMediaError("render budget evidence page counts disagree")
+    if any(value > MAX_RENDERED_PIXELS_PER_PAGE for value in page_pixels):
+        raise PdfMediaError(
+            "PDF render exceeds 36,000,000 pixels per page"
+        )
+    if sum(page_pixels) > MAX_RENDERED_PIXELS_TOTAL:
+        raise PdfMediaError(
+            "PDF render exceeds 360,000,000 total rendered pixels"
+        )
+    if any(value > MAX_RENDERED_PNG_BYTES_PER_PAGE for value in encoded_bytes):
+        raise PdfMediaError(
+            "PDF render exceeds 64 MiB encoded bytes per page"
+        )
+    if sum(encoded_bytes) > MAX_RENDERED_PNG_BYTES_TOTAL:
+        raise PdfMediaError("PDF render exceeds 1 GiB encoded bytes total")
+
+
+def _validate_rendered_png_set(
+    pages: Sequence[Path],
+    *,
+    expected_page_count: int,
+) -> None:
+    if len(pages) != expected_page_count:
+        raise PdfMediaError(
+            "rendered PNG page count does not match source PDF geometry"
+        )
+    pixels: list[int] = []
+    encoded_bytes: list[int] = []
+    for page in pages:
+        try:
+            encoded_bytes.append(page.stat().st_size)
+            with page.open("rb") as stream:
+                header = stream.read(24)
+        except OSError as error:
+            raise PdfMediaError(f"cannot inspect rendered PNG budget: {error}") from error
+        if (
+            len(header) != 24
+            or header[:8] != b"\x89PNG\r\n\x1a\n"
+            or header[12:16] != b"IHDR"
+        ):
+            raise PdfMediaError(f"rendered page is not a valid PNG: {page}")
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+        if width <= 0 or height <= 0:
+            raise PdfMediaError("rendered PNG dimensions must be positive")
+        pixels.append(width * height)
+    _validate_render_budget_counts(pixels, encoded_bytes)
 
 
 def _prepare_render_destination(
@@ -229,6 +323,7 @@ def build_contact_sheets(
     expected_names = [f"page-{number:03d}.png" for number in range(1, len(pages) + 1)]
     if [path.name for path in pages] != expected_names:
         raise PdfMediaError("rendered pages must be exact sequential page-NNN.png files")
+    _validate_rendered_png_set(pages, expected_page_count=len(pages))
     destination = Path(destination)
     if destination.exists():
         try:
@@ -315,14 +410,17 @@ def crop_figure_regions(
             ) from error
         return []
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    render_root = Path(
-        tempfile.mkdtemp(prefix=".pdf-render-", dir=str(destination.parent))
-    )
-    crop_root = Path(
-        tempfile.mkdtemp(prefix=".pdf-crops-", dir=str(destination.parent))
-    )
+    remove_empty_parent = not destination.parent.exists()
+    render_root: Path | None = None
+    crop_root: Path | None = None
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        render_root = Path(
+            tempfile.mkdtemp(prefix=".pdf-render-", dir=str(destination.parent))
+        )
+        crop_root = Path(
+            tempfile.mkdtemp(prefix=".pdf-crops-", dir=str(destination.parent))
+        )
         rendered = render_pdf_pages(Path(source_pdf), render_root / "pages", dpi=dpi)
         crops: list[Path] = []
         for index, region in enumerate(regions, start=1):
@@ -342,9 +440,15 @@ def crop_figure_regions(
     except (OSError, ValueError) as error:
         raise PdfMediaError(f"cannot crop figure regions: {error}") from error
     finally:
-        shutil.rmtree(render_root, ignore_errors=True)
-        if crop_root.exists():
+        if render_root is not None:
+            shutil.rmtree(render_root, ignore_errors=True)
+        if crop_root is not None and crop_root.exists():
             shutil.rmtree(crop_root, ignore_errors=True)
+        if remove_empty_parent:
+            try:
+                destination.parent.rmdir()
+            except OSError:
+                pass
 
 
 def detect_figure_regions(
@@ -426,22 +530,62 @@ def detect_figure_regions(
 
 
 def _run_poppler(command: list[str], action: str) -> None:
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             shell=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_POPPLER_TIMEOUT_SECONDS,
-            check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+        deadline = time.monotonic() + _POPPLER_TIMEOUT_SECONDS
+        output_directory = Path(command[-1]).parent
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise PdfMediaError(
+                    f"cannot {action}: exceeded {_POPPLER_TIMEOUT_SECONDS} second timeout"
+                )
+            try:
+                _stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                sizes = _current_render_output_sizes(output_directory)
+                if (
+                    any(size > MAX_RENDERED_PNG_BYTES_PER_PAGE for size in sizes)
+                    or sum(sizes) > MAX_RENDERED_PNG_BYTES_TOTAL
+                ):
+                    process.kill()
+                    process.communicate()
+                    raise PdfMediaError(
+                        f"cannot {action}: encoded PNG output exceeded render budget"
+                    )
+    except PdfMediaError:
+        raise
+    except (OSError, subprocess.SubprocessError) as error:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
         raise PdfMediaError(f"cannot {action}: {error}") from error
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() or "no error detail"
+    if process.returncode != 0:
+        detail = stderr.strip() or "no error detail"
         raise PdfMediaError(
-            f"cannot {action}: Poppler exited {completed.returncode}: {stderr}"
+            f"cannot {action}: Poppler exited {process.returncode}: {detail}"
         )
+
+
+def _current_render_output_sizes(directory: Path) -> list[int]:
+    try:
+        return [
+            entry.stat().st_size
+            for entry in directory.iterdir()
+            if entry.is_file() and not entry.is_symlink()
+        ]
+    except OSError as error:
+        raise PdfMediaError(f"cannot monitor Poppler output growth: {error}") from error
 
 
 def _crop_rendered_region(
@@ -450,6 +594,7 @@ def _crop_rendered_region(
     destination: Path,
     index: int,
 ) -> None:
+    _validate_rendered_png_set([rendered_page], expected_page_count=1)
     crop_bbox = region.crop_bbox or region.bbox
     x0, top, x1, bottom = crop_bbox
     if (

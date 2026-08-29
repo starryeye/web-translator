@@ -94,12 +94,19 @@ pdf-extract --run-dir <WORK_DIR>
 plan-zones --run-dir <WORK_DIR>
 prepare-assignments --run-dir <WORK_DIR>
 validate-translations --run-dir <WORK_DIR> [--zone-id <ZONE_ID>]
+pdf-review-input --run-dir <WORK_DIR>
 pdf-assemble --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 pdf-qa prepare --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 pdf-qa finalize --run-dir <WORK_DIR> --output-dir <OUTPUT_DIR>
 ```
 
 The existing commands retain their current arguments and behavior.
+
+Both workflows allocate `.web-translator/runs/<run-id>` and their reserved output as
+exact lexical children beneath held workspace roots. Allocation and every consuming
+command reject symlink, reparse, dangling, replaced, or moved ancestors and never erase
+link evidence through path resolution. Web output remains beneath `translated-pages`;
+PDF output remains beneath `translated-pdfs`.
 
 ## Architecture
 
@@ -217,17 +224,25 @@ outside the crop and becomes a separate translation segment. Text visually embed
 the figure remains unchanged.
 
 The assembler preserves aspect ratio, never enlarges a crop above its rendered source
-resolution, and tries to keep a figure and its caption together. A detected figure that
-cannot be rendered or cropped is a required failure.
+resolution, and tries to keep a figure and its caption together. A valid
+standalone uncaptioned figure has `caption_id=None` and is emitted once as standalone media. A
+relationship is reciprocal only when a caption exists; orphan captions and ambiguous or
+multiple pairings remain required failures. A detected figure that cannot be rendered or
+cropped is a required failure.
 
 ### Footnotes, links, and navigation
 
-Footnote markers and bodies become linked blocks. The reflowed document places footnotes
+Footnote markers and bodies become linked blocks. Each source annotation persists as
+structured evidence containing its source page, source block/span or bounds, visible
+label, external URI or internal destination, reconstruction status, and reason. Multiple
+unambiguous inline annotations in one block are recreated on their individual translated
+spans instead of the whole paragraph. The reflowed document places footnotes
 at the end of the containing section or, when the relationship is page-local and clear,
 at the bottom of the relevant output page. External URI annotations are recreated on the
 translated text. Internal outline and destination links are rebuilt only when both source
 and destination map unambiguously to emitted blocks. A noncritical link that cannot be
-rebuilt becomes a warning; missing visible text never becomes a warning.
+rebuilt becomes a warning only while its visible label and destination remain in both
+final artifacts; missing visible text never becomes a warning.
 
 ## Shared Translation Contract
 
@@ -246,6 +261,14 @@ neighbor context preserve document context across zones.
 The existing zone planner, immutable assignment packager, per-zone validator, aggregate
 validator, canonical glossary, retry limit, review dimensions, and first-use terminology
 normalization apply without format-specific exceptions.
+
+After translations, zones/assignments, segments, and glossary policy/content are final,
+`pdf-review-input` writes deterministic `semantic-review-input.json`. Its canonical
+`semantic_input_sha256` covers the exact bytes of `segments.jsonl`, every zone and
+assignment file, every translation file, and the identified/versioned glossary policy
+plus glossary content. PDF `review.json` requires that digest. `pdf-assemble`,
+`pdf-qa prepare`, and `pdf-qa finalize` recompute it and fail on any mismatch. This is a
+PDF-specific review reader and does not change the webpage `review.json` contract.
 
 ## PDF Assembly
 
@@ -300,7 +323,16 @@ The generated PDF is reopened independently. QA requires:
 
 ### Rendering QA
 
-Poppler renders every output page to PNG. The assembler records flowable and frame bounds,
+Poppler renders every output page to PNG. Before launch, source/output page dimensions and
+DPI are rejected above 36,000,000 rendered pixels per page or 360,000,000 pixels across
+one PDF. While and after rendering, any PNG above 64 MiB or complete rendered-page set
+above 1 GiB terminates or fails the operation. PNG headers and decoded raster dimensions
+are validated against the same per-page pixel limit before full Pillow decode. Subprocess
+timeouts remain mandatory. Where a platform cannot impose an OS-level address-space limit,
+these deterministic pre/while/post geometry, encoded-byte, decoded-pixel, and timeout
+budgets remain mandatory.
+
+The assembler records flowable and frame bounds,
 which QA uses to reject content outside a page frame, peer-flowable overlap, body or table
 text below 9 points, blank pages without an intentional section break, missing figures,
 and glyph rendering failures. Render failure for any page is required.
@@ -334,6 +366,7 @@ media/
 zones/
 assignments/
 translations/
+semantic-review-input.json
 review.json
 pdf-layout-review.json
 staged-output/
@@ -366,7 +399,7 @@ Required failures include:
 - scanned-PDF threshold reached;
 - ambiguous reading order, unmatched selectable text, overlapping peer blocks, or
   ambiguous table cells;
-- missing required figure crop, caption, translation, protected token, or review evidence;
+- missing required figure crop, paired caption, translation, protected token, or review evidence;
 - Korean font load or embedding failure;
 - unreadable table at the minimum font size;
 - PDF write, reopen, text extraction, page render, or visual-review failure; and
