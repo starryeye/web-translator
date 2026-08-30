@@ -976,6 +976,36 @@ def test_capture_deadline_has_a_stable_monotonic_boundary(
             )
 
 
+def test_capture_deadline_crossing_after_download_raises_capture_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [0.0]
+
+    class DeadlineCrossingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"<main>Docs</main>"
+            now[0] = 1.001
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(capture_module, "MAX_CAPTURE_SECONDS", 1.0, raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    with pytest.raises(CaptureError, match="resource budget exceeded: deadline"):
+        capture_page(
+            "https://example.com/",
+            tmp_path,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    stream=DeadlineCrossingStream(),
+                )
+            ),
+        )
+
+
 def test_nested_css_duplicate_aliases_charge_one_unique_request_each(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

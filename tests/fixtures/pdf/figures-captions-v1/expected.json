@@ -1,0 +1,14 @@
+{
+  "expected_korean_phrase": "그림과 캡션",
+  "figure_count": 2,
+  "final_artifacts": [
+    "manifest.json",
+    "review-report.md",
+    "translated.pdf"
+  ],
+  "fixture": "figures-captions-v1",
+  "footnote_count": 0,
+  "page_count": 1,
+  "schema_version": "1.0",
+  "table_count": 0
+}

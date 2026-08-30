@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -34,9 +36,24 @@ from web_translator.models import (
     Segment,
     SegmentContractError,
     SemanticReviewFinding,
+    Translation,
     read_segments,
+    read_segments_stream,
 )
-from web_translator.paths import validate_public_url
+from web_translator.paths import hold_allocated_run_paths, validate_public_url
+from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
+from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
+from web_translator.pdf_extract import PdfExtractionError, extract_pdf
+from web_translator.pdf_extract_transaction import extract_pdf_transaction
+from web_translator.pdf_models import PdfContractError, PdfSourceRecord
+from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
+from web_translator.pdf_review import (
+    PdfSemanticReviewError,
+    build_pdf_semantic_review_input,
+    hold_pdf_semantic_inputs,
+    validate_pdf_semantic_review,
+    validate_pdf_semantic_review_snapshot,
+)
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -121,20 +138,70 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = str(namespace.command)
     handler: Handler = namespace.handler
     try:
-        handler(namespace)
+        with _hold_command_run_contract(namespace) as run_contract:
+            handler(namespace)
+            try:
+                run_contract.verify()
+            except ValueError as error:
+                raise CLIContractError(str(error)) from error
     except InvalidArgumentsError as error:
         return _fail(command, EXIT_INVALID_ARGUMENTS, error)
-    except CaptureError as error:
+    except (CaptureError, PdfAcquireError) as error:
         return _fail(command, EXIT_CAPTURE_FAILURE, error)
-    except (CLIContractError, TranslationContractError) as error:
+    except (CLIContractError, PdfExtractionError, TranslationContractError) as error:
         return _fail(command, EXIT_CONTRACT_FAILURE, error)
-    except AssemblyError as error:
+    except (AssemblyError, PdfAssemblyError) as error:
         return _fail(command, EXIT_ASSEMBLY_FAILURE, error)
-    except QAFailure as error:
+    except (QAFailure, PdfQAFailure) as error:
         return _fail(command, EXIT_QA_FAILURE, error)
 
     _emit_status(command, "ok", 0)
     return 0
+
+
+@contextmanager
+def _hold_command_run_contract(args: argparse.Namespace) -> Iterator[object]:
+    """Retain the allocator's exact workspace, run, and output-root identities."""
+    run_dir = Path(os.path.abspath(os.fspath(args.run_dir)))
+    try:
+        workspace = run_dir.parents[2]
+    except IndexError as error:
+        raise CLIContractError(
+            "run directory is not an exact allocator child"
+        ) from error
+    output_root = _command_output_root(args, run_dir)
+    output_dir = Path(
+        os.path.abspath(
+            os.fspath(
+                getattr(args, "output_dir", workspace / output_root / run_dir.name)
+            )
+        )
+    )
+    yield_started = False
+    try:
+        with hold_allocated_run_paths(
+            workspace,
+            run_dir,
+            output_dir,
+            output_root=output_root,
+        ) as contract:
+            yield_started = True
+            yield contract
+    except ValueError as error:
+        if yield_started:
+            raise
+        raise CLIContractError(str(error)) from error
+
+
+def _command_output_root(args: argparse.Namespace, run_dir: Path) -> str:
+    command = str(args.command)
+    if command in {"pdf-acquire", "pdf-extract", "pdf-review-input", "pdf-assemble", "pdf-qa"}:
+        return "translated-pdfs"
+    if command in {"capture", "extract", "assemble", "qa"}:
+        return "translated-pages"
+    # Shared stages run only after acquisition/capture. The exact source marker is
+    # checked again by the stage while the run root remains held.
+    return "translated-pdfs" if (run_dir / "source.pdf").is_file() else "translated-pages"
 
 
 def console_main() -> None:
@@ -152,6 +219,26 @@ def _build_parser() -> argparse.ArgumentParser:
     capture.add_argument("url")
     _add_run_dir(capture)
     capture.set_defaults(handler=_capture_command)
+
+    pdf_acquire = subparsers.add_parser(
+        "pdf-acquire", help="Acquire one local or public PDF."
+    )
+    pdf_acquire.add_argument("source")
+    _add_run_dir(pdf_acquire)
+    pdf_acquire.set_defaults(handler=_pdf_acquire_command)
+
+    pdf_extract = subparsers.add_parser(
+        "pdf-extract", help="Extract PDF logical blocks and translation segments."
+    )
+    _add_run_dir(pdf_extract)
+    pdf_extract.set_defaults(handler=_pdf_extract_command)
+
+    pdf_review_input = subparsers.add_parser(
+        "pdf-review-input",
+        help="Bind the finalized PDF semantic-review inputs to one digest.",
+    )
+    _add_run_dir(pdf_review_input)
+    pdf_review_input.set_defaults(handler=_pdf_review_input_command)
 
     extract = subparsers.add_parser("extract", help="Extract translation segments.")
     _add_run_dir(extract)
@@ -180,6 +267,28 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_run_dir(assemble)
     _add_output_dir(assemble)
     assemble.set_defaults(handler=_assemble_command)
+
+    pdf_assemble = subparsers.add_parser(
+        "pdf-assemble", help="Assemble a reviewed PDF into private staging."
+    )
+    _add_run_dir(pdf_assemble)
+    _add_output_dir(pdf_assemble)
+    pdf_assemble.set_defaults(handler=_pdf_assemble_command)
+
+    pdf_qa = subparsers.add_parser(
+        "pdf-qa", help="Prepare or finalize rendered PDF QA evidence."
+    )
+    pdf_qa_actions = pdf_qa.add_subparsers(
+        dest="pdf_qa_action", required=True, parser_class=_CommandArgumentParser
+    )
+    pdf_qa_prepare = pdf_qa_actions.add_parser("prepare")
+    _add_run_dir(pdf_qa_prepare)
+    _add_output_dir(pdf_qa_prepare)
+    pdf_qa_prepare.set_defaults(handler=_pdf_qa_prepare_command)
+    pdf_qa_finalize = pdf_qa_actions.add_parser("finalize")
+    _add_run_dir(pdf_qa_finalize)
+    _add_output_dir(pdf_qa_finalize)
+    pdf_qa_finalize.set_defaults(handler=_pdf_qa_finalize_command)
 
     qa = subparsers.add_parser("qa", help="Run deterministic and browser QA.")
     _add_run_dir(qa)
@@ -226,6 +335,45 @@ def _capture_command(args: argparse.Namespace) -> None:
         _write_json_atomic(args.run_dir / "capture.json", payload)
     except OSError as error:
         raise CaptureError(f"cannot write capture metadata: {error}") from error
+
+
+def _pdf_acquire_command(args: argparse.Namespace) -> None:
+    def write_metadata(record: PdfSourceRecord, path: Path) -> None:
+        _write_json_atomic(path, record.to_dict())
+
+    try:
+        acquire_pdf(
+            str(args.source),
+            args.run_dir,
+            metadata_writer=write_metadata,
+        )
+    except (CLIContractError, OSError) as error:
+        raise PdfAcquireError(str(error)) from error
+
+
+def _pdf_extract_command(args: argparse.Namespace) -> None:
+    try:
+        extract_pdf_transaction(Path(args.run_dir), extractor=extract_pdf)
+    except PdfExtractionError:
+        raise
+    except (CLIContractError, OSError, UnicodeError) as error:
+        raise CLIContractError(f"cannot extract PDF source: {error}") from error
+
+
+def _pdf_review_input_command(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir)
+    _validate_run_root(run_dir)
+    destination = run_dir / "semantic-review-input.json"
+    _reject_if_link(destination)
+    try:
+        semantic_input = build_pdf_semantic_review_input(run_dir)
+        _write_json_atomic(destination, semantic_input.to_dict())
+    except PdfSemanticReviewError as error:
+        raise CLIContractError(str(error)) from error
+    except OSError as error:
+        raise CLIContractError(
+            f"cannot write PDF semantic review input: {error}"
+        ) from error
 
 
 def _extract_command(args: argparse.Namespace) -> None:
@@ -433,6 +581,39 @@ def _assemble_command(args: argparse.Namespace) -> None:
     )
 
 
+def _pdf_assemble_command(args: argparse.Namespace) -> None:
+    _validate_run_root(args.run_dir)
+    try:
+        with hold_pdf_semantic_inputs(args.run_dir) as snapshot:
+            segments, zones, translations, glossary = _semantic_snapshot_values(snapshot)
+            review = _read_pdf_review(
+                args.run_dir / "review.json", zones, semantic_snapshot=snapshot
+            )
+            if review.unresolved_required:
+                raise PdfAssemblyError(
+                    "semantic review has unresolved required findings: "
+                    + ", ".join(review.unresolved_required)
+                )
+            assemble_pdf(
+                args.run_dir,
+                translations,
+                glossary,
+                args.output_dir,
+                semantic_snapshot=snapshot,
+            )
+            snapshot.verify()
+    except PdfSemanticReviewError as error:
+        raise PdfAssemblyError(str(error)) from error
+
+
+def _pdf_qa_prepare_command(args: argparse.Namespace) -> None:
+    prepare_pdf_qa(args.run_dir, args.output_dir)
+
+
+def _pdf_qa_finalize_command(args: argparse.Namespace) -> None:
+    finalize_pdf_output(args.run_dir, args.output_dir)
+
+
 def _qa_command(args: argparse.Namespace) -> None:
     _validate_run_root(args.run_dir)
     _reject_if_link(args.run_dir / "source.html")
@@ -483,6 +664,75 @@ def _read_segments(run_dir: Path) -> list[Segment]:
         return read_segments(path)
     except (CLIContractError, SegmentContractError, OSError, UnicodeError) as error:
         raise CLIContractError(f"cannot read segment manifest {path}: {error}") from error
+
+
+def _semantic_snapshot_values(
+    snapshot: Any,
+) -> tuple[list[Segment], list[Zone], dict[str, Translation], dict[str, str]]:
+    """Parse every PDF semantic consumer value from held exact bytes."""
+    try:
+        segments = read_segments_stream(
+            io.StringIO(snapshot.payloads["segments.jsonl"].decode("utf-8"))
+        )
+        glossary_value = json.loads(snapshot.payloads["glossary.json"].decode("utf-8"))
+        if not isinstance(glossary_value, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in glossary_value.items()
+        ):
+            raise CLIContractError("held PDF glossary must map strings to strings")
+        zones: list[Zone] = []
+        translations: dict[str, Translation] = {}
+        for relative, payload in sorted(snapshot.payloads.items()):
+            label = Path(relative)
+            if relative.startswith("zones/"):
+                value = json.loads(payload.decode("utf-8"))
+                if not isinstance(value, Mapping):
+                    raise CLIContractError(f"held PDF zone must be an object: {relative}")
+                zones.append(
+                    Zone(
+                        id=_string(value, "id", label),
+                        heading_path=_string_list(value, "heading_path", label),
+                        target_ids=_string_list(value, "target_ids", label),
+                        context_before_ids=_string_list(value, "context_before_ids", label),
+                        context_after_ids=_string_list(value, "context_after_ids", label),
+                        attempt=_integer(value, "attempt", label),
+                        expected_tokens=_string_sequence_mapping(
+                            value, "expected_tokens", label
+                        ),
+                    )
+                )
+            elif relative.startswith("translations/"):
+                for line_number, line in enumerate(
+                    payload.decode("utf-8").splitlines(), start=1
+                ):
+                    if not line.strip():
+                        continue
+                    record = Translation.from_dict(json.loads(line))
+                    if record.segment_id in translations:
+                        raise CLIContractError(
+                            f"duplicate held PDF translation ID: {record.segment_id}"
+                        )
+                    translations[record.segment_id] = record
+        if not zones:
+            raise CLIContractError("held PDF semantic snapshot contains no zones")
+        expected_ids = {segment.id for segment in segments if segment.target}
+        if set(translations) != expected_ids:
+            raise CLIContractError(
+                "held PDF translations do not exactly cover target segments"
+            )
+        return segments, zones, translations, dict(glossary_value)
+    except CLIContractError:
+        raise
+    except (
+        KeyError,
+        UnicodeError,
+        json.JSONDecodeError,
+        SegmentContractError,
+        ZoneContractError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise CLIContractError(f"cannot parse held PDF semantic inputs: {error}") from error
 
 
 def _read_zones(run_dir: Path) -> list[Zone]:
@@ -752,6 +1002,35 @@ def _detect_source_language(segments: Sequence[Segment]) -> str:
 
 def _read_review(path: Path, zones: Sequence[Zone]) -> MasterReview:
     data = _read_json_object(path)
+    return _review_from_value(data, path, zones)
+
+
+def _read_pdf_review(
+    path: Path,
+    zones: Sequence[Zone],
+    *,
+    semantic_snapshot: Any | None = None,
+) -> MasterReview:
+    data = _read_json_object(path)
+    try:
+        if semantic_snapshot is None:
+            validate_pdf_semantic_review(path.parent, data)
+        else:
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, data)
+    except PdfSemanticReviewError as error:
+        raise CLIContractError(str(error)) from error
+    return _review_from_value(
+        {key: value for key, value in data.items() if key != "semantic_input_sha256"},
+        path,
+        zones,
+    )
+
+
+def _review_from_value(
+    data: Mapping[str, Any],
+    path: Path,
+    zones: Sequence[Zone],
+) -> MasterReview:
     if set(data) != {"unresolved_required", "retries", "section_findings"}:
         raise CLIContractError(f"review fields must be exactly unresolved_required, retries, section_findings: {path}")
     retries_raw = _mapping(data, "retries", path)

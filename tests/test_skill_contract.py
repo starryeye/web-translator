@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 
 SKILL = Path("skills/web-translator/SKILL.md")
+PDF_SKILL = Path("skills/pdf-translator/SKILL.md")
 TRANSLATOR_CONTRACT = Path(
     "skills/web-translator/references/translator-contract.md"
 )
@@ -188,3 +190,240 @@ def test_skill_preserves_platform_arguments_as_single_values() -> None:
     assert "Never build or evaluate a command string" in skill
     assert '& $python -m web_translator capture $url --run-dir $workDir' in readme
     assert '"$python" -m web_translator capture "$url" --run-dir "$work_dir"' in readme
+
+
+def test_public_skills_keep_allocated_paths_lexical_and_under_exact_roots() -> None:
+    web = SKILL.read_text("utf-8")
+    pdf = PDF_SKILL.read_text("utf-8")
+
+    for text, output_root in (
+        (web, "translated-pages"),
+        (pdf, "translated-pdfs"),
+    ):
+        assert ".resolve()" not in text
+        assert "lexical_workspace()" in text
+        assert "Path.cwd().absolute()" not in text
+        assert 'workspace / ".web-translator" / "runs"' in text
+        assert f'workspace / "{output_root}"' in text
+        assert "exact child" in text
+        assert "symlink or reparse" in text
+
+
+def test_pdf_skill_is_discoverable_and_fail_closed() -> None:
+    text = PDF_SKILL.read_text("utf-8")
+    for phrase in (
+        "name: pdf-translator",
+        "local path",
+        "attached file",
+        "public HTTP(S) URL",
+        "pdf-acquire",
+        "pdf-extract",
+        "plan-zones",
+        "prepare-assignments",
+        "validate-translations",
+        "pdf-assemble",
+        "pdf-qa prepare",
+        "pdf-layout-review.json",
+        "pdf-qa finalize",
+        "50 MiB",
+        "100 pages",
+        "scans",
+        "encryption",
+        "malformed",
+        "never pass a PDF to the HTML",
+        "never report partial output as complete",
+    ):
+        assert phrase in text
+    assert not Path("skills/pdf-translator/references").exists()
+
+
+def test_pdf_skill_reuses_shared_translation_contracts_and_agents() -> None:
+    text = PDF_SKILL.read_text("utf-8")
+    for phrase in (
+        "../web-translator/references/translator-contract.md",
+        "../web-translator/references/assignment-package.md",
+        "../web-translator/references/review-rubric.md",
+        "Segment",
+        "spawn_agent",
+        'fork_turns="none"',
+        "one zone result file",
+        "followup_task",
+        "same agent",
+        "maximum of two retries",
+        "master semantic review",
+        "deterministic result validation before",
+    ):
+        assert phrase in text
+
+
+def test_pdf_skill_preserves_platform_arguments_and_stage_order() -> None:
+    text = PDF_SKILL.read_text("utf-8")
+    for phrase in (
+        '$python = (Resolve-Path ".\\.venv\\Scripts\\python.exe").Path',
+        'python="$(cd .venv/bin && pwd -P)/python"',
+        'PowerShell: `& $python`',
+        'POSIX: `"$python"`',
+        '`<source>` → `$source`',
+        '`<work-dir>` → `$workDir`',
+        '`<output-dir>` → `$outputDir`',
+        '`<source>` → `"$source"`',
+        '`<work-dir>` → `"$work_dir"`',
+        '`<output-dir>` → `"$output_dir"`',
+        "Never execute a placeholder literally",
+        "Never build or evaluate a command string",
+    ):
+        assert phrase in text
+
+    commands = (
+        "<python> -m web_translator pdf-acquire <source> --run-dir <work-dir>",
+        "<python> -m web_translator pdf-extract --run-dir <work-dir>",
+        "<python> -m web_translator plan-zones --run-dir <work-dir> --max-chars 12000 --target-zones 3",
+        "<python> -m web_translator prepare-assignments --run-dir <work-dir>",
+        "<python> -m web_translator validate-translations --run-dir <work-dir> --zone-id zone-001",
+        "<python> -m web_translator validate-translations --run-dir <work-dir>",
+        "<python> -m web_translator pdf-review-input --run-dir <work-dir>",
+        "<python> -m web_translator pdf-assemble --run-dir <work-dir> --output-dir <output-dir>",
+        "<python> -m web_translator pdf-qa prepare --run-dir <work-dir> --output-dir <output-dir>",
+        "<python> -m web_translator pdf-qa finalize --run-dir <work-dir> --output-dir <output-dir>",
+    )
+    lines = [line.strip() for line in text.splitlines()]
+    positions = [lines.index(command) for command in commands]
+    assert positions == sorted(positions)
+
+
+def test_pdf_skill_allocates_native_paths_from_strict_json() -> None:
+    text = PDF_SKILL.read_text("utf-8")
+    for phrase in (
+        "create_pdf_run_paths",
+        "json.dumps",
+        "sort_keys=True",
+        'separators=(",", ":")',
+        "sys.argv[1]",
+        "$allocationJson = & $python -c",
+        "$source",
+        "ConvertFrom-Json -ErrorAction Stop",
+        "$allocation.PSObject.Properties.Name",
+        'allocation_json=$("$python" -c',
+        '"$source"',
+        "json.loads(sys.argv[1])",
+        'set(data) != {"work_dir", "output_dir"}',
+        "os.path.isabs",
+        "os.path.isdir",
+        "os.path.lexists",
+        "malformed allocation output",
+        "Never use `eval`",
+    ):
+        assert phrase in text
+
+
+def test_pdf_skill_requires_complete_strict_visual_review() -> None:
+    text = PDF_SKILL.read_text("utf-8")
+    for phrase in (
+        "Inspect every numbered contact sheet",
+        "pages_reviewed",
+        "contact_sheets_reviewed",
+        "staged_pdf_sha256",
+        "unresolved_required",
+        '"verdict": "pass"',
+        '"evidence":',
+        "heading_hierarchy",
+        "text_legibility",
+        "table_legibility",
+        "figure_caption_pairing",
+        "footnote_placement",
+        "page_transitions",
+        "clipping_overlap",
+        "glyph_rendering",
+        "exactly the eight canonical dimensions",
+        "`pages_reviewed` is a sorted, unique integer array",
+        "`contact_sheets_reviewed` maps each filename string to a sorted, unique integer array",
+        "`unresolved_required` is a sorted, unique string array",
+        "translated.pdf",
+        "manifest.json",
+        "review-report.md",
+        "Only after `pdf-qa finalize` succeeds",
+    ):
+        assert phrase in text
+
+    schema_text = text.split("```json\n", 1)[1].split("\n```", 1)[0]
+    schema = json.loads(schema_text)
+    assert set(schema) == {
+        "schema_version",
+        "staged_pdf_sha256",
+        "pages_reviewed",
+        "contact_sheets_reviewed",
+        "findings",
+        "unresolved_required",
+    }
+    assert set(schema["findings"]) == {
+        "heading_hierarchy",
+        "text_legibility",
+        "table_legibility",
+        "figure_caption_pairing",
+        "footnote_placement",
+        "page_transitions",
+        "clipping_overlap",
+        "glyph_rendering",
+    }
+    assert schema["pages_reviewed"] == [1]
+    assert all(type(page) is int for page in schema["pages_reviewed"])
+    assert schema["contact_sheets_reviewed"] == {"contact-sheet-001.png": [1]}
+    assert all(
+        type(page) is int
+        for pages in schema["contact_sheets_reviewed"].values()
+        for page in pages
+    )
+    assert schema["unresolved_required"] == []
+    assert all(
+        set(finding) == {"verdict", "evidence"}
+        and finding["verdict"] in {"pass", "required-fix"}
+        and finding["evidence"].strip()
+        for finding in schema["findings"].values()
+    )
+
+
+def test_pdf_skill_and_spec_bind_review_render_figure_and_link_contracts() -> None:
+    skill = PDF_SKILL.read_text("utf-8")
+    spec = Path(
+        "docs/superpowers/specs/2026-08-21-pdf-translator-design.md"
+    ).read_text("utf-8")
+    readme = Path("README.md").read_text("utf-8")
+    for text in (skill, spec, readme):
+        for phrase in (
+            "36,000,000",
+            "360,000,000",
+            "64 MiB",
+            "1 GiB",
+            "pdf-review-input",
+            "semantic_input_sha256",
+            "standalone uncaptioned figure",
+            "visible label and destination",
+        ):
+            assert phrase in text
+    assert "OS-level address-space limit" in skill
+    assert "OS-level address-space limit" in spec
+
+
+def test_readme_documents_pdf_workflow_and_boundaries() -> None:
+    text = Path("README.md").read_text("utf-8")
+    for phrase in (
+        "pdf-translator",
+        "local text-selectable PDF",
+        "public HTTP(S) PDF URL",
+        "50 MiB",
+        "100 pages",
+        "scanned",
+        "encrypted",
+        "malformed",
+        "Poppler",
+        "pdftoppm",
+        "pdfinfo",
+        "brew install poppler",
+        "Noto Sans KR",
+        "PROVENANCE.json",
+        "pdf-qa prepare",
+        "pdf-qa finalize",
+        "pdf-layout-review.json",
+        "translated-pdfs",
+    ):
+        assert phrase in text

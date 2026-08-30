@@ -1,0 +1,6 @@
+{"segment_id":"seg-000001","text":"그림과 캡션","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000002","text":"래스터 및 벡터 증거는 올바른 설명 캡션과 연결된 상태를 유지해야 합니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000003","text":"그림 1. 래스터 작업 흐름 상태 패널.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000004","text":"그림 2. 벡터 검토 범위 추세.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000005","text":"래스터 패널은 이미지 보존을 검증하고 벡터 그래프는 경로 렌더링을 검증합니다. 각 캡션은 해당 그림 바로 뒤에 배치되어 추출 시 모호하지 않은 쌍을 유지합니다. 검토는 선명한 렌더링, 읽기 쉬운 레이블 및 잘림이나 겹침이 없음을 확인합니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000006","text":"1쪽","notes":null,"glossary_observations":{}}

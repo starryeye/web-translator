@@ -1,0 +1,15 @@
+{
+  "encrypted.pdf": {
+    "command": "pdf-extract",
+    "exit_code": 4
+  },
+  "image-only-scan.pdf": {
+    "command": "pdf-extract",
+    "exit_code": 4
+  },
+  "malformed.pdf": {
+    "command": "pdf-extract",
+    "exit_code": 4
+  },
+  "schema_version": "1.0"
+}

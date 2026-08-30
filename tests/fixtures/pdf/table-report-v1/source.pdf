@@ -1,0 +1,207 @@
+%PDF-1.4
+%“Œ‹ž ReportLab Generated PDF document (opensource)
+1 0 obj
+<<
+/F1 2 0 R /F2 3 0 R
+>>
+endobj
+2 0 obj
+<<
+/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
+>>
+endobj
+3 0 obj
+<<
+/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
+>>
+endobj
+4 0 obj
+<<
+/Contents 9 0 R /MediaBox [ 0 0 612 792 ] /Parent 8 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>> /Rotate 0 /Trans <<
+
+>> 
+  /Type /Page
+>>
+endobj
+5 0 obj
+<<
+/Contents 10 0 R /MediaBox [ 0 0 612 792 ] /Parent 8 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>> /Rotate 0 /Trans <<
+
+>> 
+  /Type /Page
+>>
+endobj
+6 0 obj
+<<
+/PageMode /UseNone /Pages 8 0 R /Type /Catalog
+>>
+endobj
+7 0 obj
+<<
+/Author (anonymous) /CreationDate (D:20000101000000+00'00') /Creator (anonymous) /Keywords () /ModDate (D:20000101000000+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
+  /Subject (unspecified) /Title (untitled) /Trapped /False
+>>
+endobj
+8 0 obj
+<<
+/Count 2 /Kids [ 4 0 R 5 0 R ] /Type /Pages
+>>
+endobj
+9 0 obj
+<<
+/Length 1688
+>>
+stream
+1 0 0 1 0 0 cm  BT /F1 12 Tf 14.4 TL ET
+BT /F2 18 Tf 21.6 TL ET
+BT 1 0 0 1 54 744 Tm (Translation Quality Table Report) Tj T* ET
+BT /F1 11 Tf 13.2 TL ET
+BT 1 0 0 1 54 716 Tm (First half measurements summarize deterministic acceptance outcomes for the release.) Tj T* ET
+q
+1 0 0 1 54 456 cm
+q
+.909804 .933333 .968627 rg
+n 0 204 480 -68 re f*
+0 0 0 rg
+BT /F2 10 Tf 12 TL ET
+BT 1 0 0 1 8 183 Tm (First half metrics) Tj T* ET
+BT 1 0 0 1 8 149 Tm (Measure) Tj T* ET
+BT 1 0 0 1 218 149 Tm (Observed) Tj T* ET
+BT 1 0 0 1 338 149 Tm (Required) Tj T* ET
+BT /F1 10 Tf 12 TL ET
+BT 1 0 0 1 8 115 Tm (Selectable characters) Tj T* ET
+BT 1 0 0 1 218 115 Tm (240) Tj T* ET
+BT 1 0 0 1 338 115 Tm (At least 100) Tj T* ET
+BT 1 0 0 1 8 81 Tm (Reviewed pages) Tj T* ET
+BT 1 0 0 1 218 81 Tm (1) Tj T* ET
+BT 1 0 0 1 338 81 Tm (1) Tj T* ET
+BT 1 0 0 1 8 47 Tm (Required findings) Tj T* ET
+BT 1 0 0 1 218 47 Tm (0) Tj T* ET
+BT 1 0 0 1 338 47 Tm (0) Tj T* ET
+BT 1 0 0 1 8 13 Tm (Published artifacts) Tj T* ET
+BT 1 0 0 1 218 13 Tm (3) Tj T* ET
+BT 1 0 0 1 338 13 Tm (3) Tj T* ET
+q
+1 J
+1 j
+0 0 0 RG
+1 w
+n 0 170 m 480 170 l S
+n 0 0 m 480 0 l S
+n 0 0 m 0 170 l S
+n 480 0 m 480 170 l S
+n 0 136 m 480 136 l S
+n 0 102 m 480 102 l S
+n 0 68 m 480 68 l S
+n 0 34 m 480 34 l S
+n 210 0 m 210 170 l S
+n 330 0 m 330 170 l S
+n 0 204 m 480 204 l S
+n 0 0 m 480 0 l S
+n 0 0 m 0 204 l S
+n 480 0 m 480 204 l S
+Q
+Q
+Q
+BT /F1 11 Tf 13.2 TL ET
+BT 1 0 0 1 54 420 Tm (Merged header cells retain their logical span and all body rows remain readable.) Tj T* ET
+BT 1 0 0 1 54 396 Tm (The same report structure continues on the next page without losing table evidence.) Tj T* ET
+BT /F1 9 Tf 10.8 TL ET
+BT 1 0 0 1 529.479 36 Tm (Page 1) Tj T* ET
+ 
+endstream
+endobj
+10 0 obj
+<<
+/Length 1690
+>>
+stream
+1 0 0 1 0 0 cm  BT /F1 12 Tf 14.4 TL ET
+BT /F2 18 Tf 21.6 TL ET
+BT 1 0 0 1 54 744 Tm (Translation Quality Table Report) Tj T* ET
+BT /F1 11 Tf 13.2 TL ET
+BT 1 0 0 1 54 716 Tm (Second half measurements summarize deterministic acceptance outcomes for the release.) Tj T* ET
+q
+1 0 0 1 54 456 cm
+q
+.909804 .933333 .968627 rg
+n 0 204 480 -68 re f*
+0 0 0 rg
+BT /F2 10 Tf 12 TL ET
+BT 1 0 0 1 8 183 Tm (Second half metrics) Tj T* ET
+BT 1 0 0 1 8 149 Tm (Measure) Tj T* ET
+BT 1 0 0 1 218 149 Tm (Observed) Tj T* ET
+BT 1 0 0 1 338 149 Tm (Required) Tj T* ET
+BT /F1 10 Tf 12 TL ET
+BT 1 0 0 1 8 115 Tm (Selectable characters) Tj T* ET
+BT 1 0 0 1 218 115 Tm (240) Tj T* ET
+BT 1 0 0 1 338 115 Tm (At least 100) Tj T* ET
+BT 1 0 0 1 8 81 Tm (Reviewed pages) Tj T* ET
+BT 1 0 0 1 218 81 Tm (2) Tj T* ET
+BT 1 0 0 1 338 81 Tm (2) Tj T* ET
+BT 1 0 0 1 8 47 Tm (Required findings) Tj T* ET
+BT 1 0 0 1 218 47 Tm (0) Tj T* ET
+BT 1 0 0 1 338 47 Tm (0) Tj T* ET
+BT 1 0 0 1 8 13 Tm (Published artifacts) Tj T* ET
+BT 1 0 0 1 218 13 Tm (3) Tj T* ET
+BT 1 0 0 1 338 13 Tm (3) Tj T* ET
+q
+1 J
+1 j
+0 0 0 RG
+1 w
+n 0 170 m 480 170 l S
+n 0 0 m 480 0 l S
+n 0 0 m 0 170 l S
+n 480 0 m 480 170 l S
+n 0 136 m 480 136 l S
+n 0 102 m 480 102 l S
+n 0 68 m 480 68 l S
+n 0 34 m 480 34 l S
+n 210 0 m 210 170 l S
+n 330 0 m 330 170 l S
+n 0 204 m 480 204 l S
+n 0 0 m 480 0 l S
+n 0 0 m 0 204 l S
+n 480 0 m 480 204 l S
+Q
+Q
+Q
+BT /F1 11 Tf 13.2 TL ET
+BT 1 0 0 1 54 420 Tm (Merged header cells retain their logical span and all body rows remain readable.) Tj T* ET
+BT 1 0 0 1 54 396 Tm (The same report structure continues on the next page without losing table evidence.) Tj T* ET
+BT /F1 9 Tf 10.8 TL ET
+BT 1 0 0 1 529.479 36 Tm (Page 2) Tj T* ET
+ 
+endstream
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000061 00000 n 
+0000000102 00000 n 
+0000000209 00000 n 
+0000000321 00000 n 
+0000000514 00000 n 
+0000000708 00000 n 
+0000000776 00000 n 
+0000001037 00000 n 
+0000001102 00000 n 
+0000002841 00000 n 
+trailer
+<<
+/ID 
+[<1c178198fbdfa51b25995d89d4102043><1c178198fbdfa51b25995d89d4102043>]
+% ReportLab generated PDF document -- digest (opensource)
+
+/Info 7 0 R
+/Root 6 0 R
+/Size 11
+>>
+startxref
+4583
+%%EOF

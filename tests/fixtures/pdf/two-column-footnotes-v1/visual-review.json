@@ -1,0 +1,47 @@
+{
+  "contact_sheets_reviewed": {
+    "contact-sheet-001.png": [
+      1
+    ]
+  },
+  "findings": {
+    "clipping_overlap": {
+      "evidence": "Fixture visual review passed clipping_overlap.",
+      "verdict": "pass"
+    },
+    "figure_caption_pairing": {
+      "evidence": "Fixture visual review passed figure_caption_pairing.",
+      "verdict": "pass"
+    },
+    "footnote_placement": {
+      "evidence": "Fixture visual review passed footnote_placement.",
+      "verdict": "pass"
+    },
+    "glyph_rendering": {
+      "evidence": "Fixture visual review passed glyph_rendering.",
+      "verdict": "pass"
+    },
+    "heading_hierarchy": {
+      "evidence": "Fixture visual review passed heading_hierarchy.",
+      "verdict": "pass"
+    },
+    "page_transitions": {
+      "evidence": "Fixture visual review passed page_transitions.",
+      "verdict": "pass"
+    },
+    "table_legibility": {
+      "evidence": "Fixture visual review passed table_legibility.",
+      "verdict": "pass"
+    },
+    "text_legibility": {
+      "evidence": "Fixture visual review passed text_legibility.",
+      "verdict": "pass"
+    }
+  },
+  "pages_reviewed": [
+    1
+  ],
+  "schema_version": "1.0",
+  "staged_pdf_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "unresolved_required": []
+}

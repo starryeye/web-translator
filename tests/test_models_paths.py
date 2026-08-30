@@ -1,10 +1,14 @@
 from datetime import UTC, datetime
+import io
 import json
+import os
 from pathlib import Path
 import re
+from types import SimpleNamespace
 
 import pytest
 
+import web_translator.models as models_module
 from web_translator.models import ProtectedToken, Segment, read_segments, write_segments
 from web_translator.paths import create_run_paths, validate_public_url
 
@@ -35,6 +39,24 @@ def test_segment_jsonl_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "segments.jsonl"
     write_segments(path, [segment])
     assert read_segments(path) == [segment]
+
+
+def test_segment_jsonl_stream_reader_reuses_strict_contract_without_path_reopen() -> None:
+    payload = {
+        "id": "seg-000001",
+        "locator": "pdf:page-0001:block-0001",
+        "semantic_type": "paragraph",
+        "heading_path": ["Overview"],
+        "source_text": "Source",
+        "protected": [],
+        "context_ids": [],
+        "target": True,
+    }
+    stream = io.StringIO(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    segments = models_module.read_segments_stream(stream)
+
+    assert segments == [Segment.from_dict(payload)]
 
 
 @pytest.mark.parametrize(
@@ -131,3 +153,135 @@ def test_existing_output_directory_is_not_overwritten(tmp_path: Path) -> None:
     assert (output_dir / "keep.txt").read_text(encoding="utf-8") == "existing output"
     assert paths.work_dir.is_dir()
     assert not paths.output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "linked_component", ["workspace", "runs", "output", "dangling-output"]
+)
+def test_web_run_paths_reject_linked_workspace_run_and_output_roots(
+    tmp_path: Path,
+    linked_component: str,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    workspace = tmp_path / "workspace"
+    try:
+        if linked_component == "workspace":
+            workspace.symlink_to(target, target_is_directory=True)
+        else:
+            workspace.mkdir()
+            if linked_component == "runs":
+                control = workspace / ".web-translator"
+                control.mkdir()
+                (control / "runs").symlink_to(target, target_is_directory=True)
+            elif linked_component == "output":
+                (workspace / "translated-pages").symlink_to(
+                    target, target_is_directory=True
+                )
+            else:
+                (workspace / "translated-pages").symlink_to(
+                    tmp_path / "missing-target", target_is_directory=True
+                )
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+
+    with pytest.raises(ValueError, match="link|reparse|safe directory"):
+        create_run_paths(
+            workspace,
+            "https://example.com/docs",
+            datetime(2026, 8, 10, 12, 34, 56, tzinfo=UTC),
+        )
+
+
+def test_web_run_paths_reject_windows_reparse_output_root_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    output_root = workspace / "translated-pages"
+    output_root.mkdir(parents=True)
+    real_stat = os.stat
+
+    def reparse_stat(
+        path: str | os.PathLike[str], *args: object, **kwargs: object
+    ) -> object:
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) == output_root:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_file_attributes=0x400,
+            )
+        return result
+
+    monkeypatch.setattr(os, "stat", reparse_stat)
+
+    with pytest.raises(ValueError, match="reparse"):
+        create_run_paths(
+            workspace,
+            "https://example.com/docs",
+            datetime(2026, 8, 10, 12, 34, 56, tzinfo=UTC),
+        )
+
+
+def test_web_run_paths_reject_workspace_replacement_during_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    held_workspace = tmp_path / "held-workspace"
+    run_id = "example.com-docs-20260810-123456"
+    real_mkdir = os.mkdir
+    replaced = False
+
+    def replace_workspace_then_mkdir(
+        path: str | os.PathLike[str],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replaced
+        if not replaced and Path(path).name == run_id:
+            replaced = True
+            workspace.rename(held_workspace)
+            real_mkdir(workspace)
+            real_mkdir(workspace / ".web-translator")
+            real_mkdir(workspace / ".web-translator" / "runs")
+            real_mkdir(workspace / "translated-pages")
+        if dir_fd is None:
+            real_mkdir(path, mode)
+        else:
+            real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", replace_workspace_then_mkdir)
+
+    with pytest.raises(ValueError, match="changed identity|moved"):
+        create_run_paths(
+            workspace,
+            "https://example.com/docs",
+            datetime(2026, 8, 10, 12, 34, 56, tzinfo=UTC),
+        )
+
+    assert replaced is True
+    assert not (workspace / ".web-translator" / "runs" / run_id).exists()
+
+
+def test_lexical_workspace_rejects_linked_pwd_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_translator.paths import lexical_workspace
+
+    target = tmp_path / "real-workspace"
+    target.mkdir()
+    linked = tmp_path / "linked-workspace"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+    monkeypatch.setenv("PWD", str(linked))
+
+    with pytest.raises(ValueError, match="link or reparse"):
+        lexical_workspace()

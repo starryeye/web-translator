@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "web-translator"
 version = "0.3.0"
-description = "Translate public static web pages into reviewed offline Korean HTML bundles."
+description = "Translate public webpages and PDFs into reviewed offline Korean artifacts."
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28,<0.29",
@@ -15,12 +15,17 @@ dependencies = [
     "tinycss2",
     "langdetect",
     "playwright",
+    "pdfplumber>=0.11,<0.12",
+    "pypdf>=6,<7",
+    "reportlab>=4,<5",
+    "Pillow>=11,<13",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest",
     "pytest-httpx",
+    "fonttools>=4,<5",
 ]
 
 [project.scripts]
@@ -31,6 +36,13 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+web_translator = [
+    "font_assets/*.ttf",
+    "font_assets/OFL.txt",
+    "font_assets/PROVENANCE.json",
+]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not live'"

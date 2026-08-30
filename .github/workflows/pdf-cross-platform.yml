@@ -1,0 +1,51 @@
+name: PDF cross-platform
+on: [pull_request, push]
+jobs:
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - if: runner.os == 'macOS'
+        run: brew install poppler
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $extractRoot = Join-Path $env:RUNNER_TEMP "Release-26.02.0-0"
+          python scripts/install_pinned_poppler.py --destination-root $extractRoot
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Poppler bootstrap failed with exit code $LASTEXITCODE." }
+          $popplerBin = Join-Path $extractRoot "poppler-26.02.0\Library\bin"
+          $pdfinfo = Join-Path $popplerBin "pdfinfo.exe"
+          $pdftoppm = Join-Path $popplerBin "pdftoppm.exe"
+          if (-not (Test-Path -LiteralPath $pdfinfo -PathType Leaf)) { throw "Pinned Poppler archive did not provide pdfinfo.exe." }
+          if (-not (Test-Path -LiteralPath $pdftoppm -PathType Leaf)) { throw "Pinned Poppler archive did not provide pdftoppm.exe." }
+          & $pdfinfo -v
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pdfinfo.exe failed its runtime dependency check with exit code $LASTEXITCODE." }
+          & $pdftoppm -v
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pdftoppm.exe failed its runtime dependency check with exit code $LASTEXITCODE." }
+          $popplerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build
+      - shell: bash
+        run: python -m pip install "$(find dist -name '*.whl' -print -quit)[test]"
+        if: runner.os == 'macOS'
+      - shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist -Filter *.whl | Select-Object -First 1
+          python -m pip install "$($wheel.FullName)[test]"
+        if: runner.os == 'Windows'
+      - run: >-
+          python -m pytest tests/test_pdf_pipeline.py tests/test_plugin_layout.py
+          tests/test_poppler_bootstrap.py
+          tests/test_pdf_assemble.py::test_windows_native_relative_rename_moves_to_held_destination
+          tests/test_pdf_assemble.py::test_windows_native_relative_rename_never_clobbers_existing_destination
+          tests/test_pdf_qa.py::test_windows_publishes_nonempty_qa_directory_after_releasing_descendant_handles
+          tests/test_pdf_qa.py::test_windows_nonempty_qa_directory_publication_never_clobbers_destination
+          tests/test_pdf_pipeline.py::test_windows_finalize_durably_publishes_exact_reviewed_output
+          tests/test_pdf_pipeline.py::test_windows_finalize_failure_cleanup_preserves_error_and_retries_immediately -q

@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Callable
+
+import pytest
+
+from tests.pdf_fixtures import make_text_pdf
+from web_translator.pdf_acquire import acquire_pdf
+from web_translator.pdf_extract import PdfExtractionError
+from web_translator.pdf_extract_transaction import extract_pdf_transaction
+
+
+Extractor = Callable[[Path, Path, Path, Path], object]
+
+
+def _acquired_run(tmp_path: Path) -> Path:
+    source = make_text_pdf(tmp_path / "source.pdf")
+    run_dir = tmp_path / "run"
+
+    def write_metadata(record: object, path: Path) -> None:
+        path.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True) + "\n",  # type: ignore[attr-defined]
+            encoding="utf-8",
+        )
+
+    acquire_pdf(str(source), run_dir, metadata_writer=write_metadata)
+    return run_dir
+
+
+def _write_staged_outputs(
+    _source: Path,
+    document: Path,
+    segments: Path,
+    media: Path,
+) -> None:
+    document.write_text('{"document":"staged"}\n', encoding="utf-8")
+    segments.write_text('{"segment":"staged"}\n', encoding="utf-8")
+    media.mkdir()
+    (media / "figure-0001.png").write_bytes(b"staged figure")
+
+
+def test_pdf_extract_transaction_publishes_only_complete_held_outputs(
+    tmp_path: Path,
+) -> None:
+    run_dir = _acquired_run(tmp_path)
+
+    extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert (run_dir / "document.json").read_text(encoding="utf-8") == (
+        '{"document":"staged"}\n'
+    )
+    assert (run_dir / "segments.jsonl").read_text(encoding="utf-8") == (
+        '{"segment":"staged"}\n'
+    )
+    assert (run_dir / "media" / "figure-0001.png").read_bytes() == b"staged figure"
+    assert not list(run_dir.glob(".pdf-extracting-*"))
+
+
+def test_pdf_extract_transaction_rejects_run_replacement_and_preserves_racer(
+    tmp_path: Path,
+) -> None:
+    run_dir = _acquired_run(tmp_path)
+    held_run = tmp_path / "held-run"
+
+    def replace_run(
+        source: Path,
+        document: Path,
+        segments: Path,
+        media: Path,
+    ) -> None:
+        _write_staged_outputs(source, document, segments, media)
+        run_dir.rename(held_run)
+        run_dir.mkdir()
+        (run_dir / "keep.txt").write_text("racer", encoding="utf-8")
+
+    with pytest.raises(PdfExtractionError, match="run.*changed identity"):
+        extract_pdf_transaction(run_dir, extractor=replace_run)
+
+    assert (run_dir / "keep.txt").read_text(encoding="utf-8") == "racer"
+    assert not (run_dir / "document.json").exists()
+
+
+def test_pdf_extract_transaction_rejects_source_replacement_after_held_read(
+    tmp_path: Path,
+) -> None:
+    run_dir = _acquired_run(tmp_path)
+    replacement = tmp_path / "replacement.pdf"
+    replacement.write_bytes((run_dir / "source.pdf").read_bytes() + b"\n")
+    replacement_bytes = replacement.read_bytes()
+
+    def replace_source(
+        source: Path,
+        document: Path,
+        segments: Path,
+        media: Path,
+    ) -> None:
+        _write_staged_outputs(source, document, segments, media)
+        os.replace(replacement, run_dir / "source.pdf")
+
+    with pytest.raises(PdfExtractionError, match="changed identity"):
+        extract_pdf_transaction(run_dir, extractor=replace_source)
+
+    assert (run_dir / "source.pdf").read_bytes() == replacement_bytes
+    assert not (run_dir / "document.json").exists()
+
+
+@pytest.mark.parametrize("racer_name", ["document.json", "segments.jsonl", "media"])
+def test_pdf_extract_transaction_never_clobbers_late_destination_racers(
+    tmp_path: Path,
+    racer_name: str,
+) -> None:
+    run_dir = _acquired_run(tmp_path)
+
+    def race_destination(
+        source: Path,
+        document: Path,
+        segments: Path,
+        media: Path,
+    ) -> None:
+        _write_staged_outputs(source, document, segments, media)
+        racer = run_dir / racer_name
+        if racer_name == "media":
+            racer.mkdir()
+            (racer / "keep.txt").write_text("foreign media", encoding="utf-8")
+        else:
+            racer.write_text(f"foreign {racer_name}", encoding="utf-8")
+
+    with pytest.raises(PdfExtractionError, match="already exists"):
+        extract_pdf_transaction(run_dir, extractor=race_destination)
+
+    if racer_name == "media":
+        assert (run_dir / "media" / "keep.txt").read_text(encoding="utf-8") == (
+            "foreign media"
+        )
+    else:
+        assert (run_dir / racer_name).read_text(encoding="utf-8") == (
+            f"foreign {racer_name}"
+        )
+    for name in {"document.json", "segments.jsonl", "media"} - {racer_name}:
+        assert not (run_dir / name).exists()
+
+
+def test_pdf_extract_transaction_preserves_existing_destination_set(
+    tmp_path: Path,
+) -> None:
+    run_dir = _acquired_run(tmp_path)
+    (run_dir / "document.json").write_text("old document", encoding="utf-8")
+    (run_dir / "segments.jsonl").write_text("old segments", encoding="utf-8")
+    (run_dir / "media").mkdir()
+    (run_dir / "media" / "keep.txt").write_text("old media", encoding="utf-8")
+
+    with pytest.raises(PdfExtractionError, match="already exists"):
+        extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert (run_dir / "document.json").read_text(encoding="utf-8") == "old document"
+    assert (run_dir / "segments.jsonl").read_text(encoding="utf-8") == "old segments"
+    assert (run_dir / "media" / "keep.txt").read_text(encoding="utf-8") == "old media"
+
+
+def test_pdf_extract_transaction_rejects_raced_extra_published_media_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+    real_publish = transaction_module.anchored._publish_new_file
+    injected = False
+
+    def publish_then_race(*args: object, **kwargs: object) -> object:
+        nonlocal injected
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        destination = args[2]
+        if getattr(destination, "path", None) == run_dir / "media":
+            (run_dir / "media" / "foreign.txt").write_bytes(b"foreign media racer")
+            injected = True
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_race,
+    )
+
+    with pytest.raises(PdfExtractionError, match="media.*exact|unexpected media"):
+        extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert injected
+    assert (run_dir / "media" / "foreign.txt").read_bytes() == b"foreign media racer"
+    assert not (run_dir / "media" / "figure-0001.png").exists()
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+
+
+def test_pdf_extract_transaction_rejects_late_private_media_child_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+    real_publish = transaction_module.anchored._publish_new_file
+    injected = False
+
+    def publish_then_race_private(*args: object, **kwargs: object) -> object:
+        nonlocal injected
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        source = args[0]
+        destination = args[2]
+        if (
+            not injected
+            and getattr(source, "path", None).name == "media"
+            and getattr(destination, "path", None) == run_dir / "media"
+        ):
+            (source.path / "foreign.txt").write_bytes(  # type: ignore[union-attr]
+                b"late private media racer"
+            )
+            injected = True
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_race_private,
+    )
+
+    with pytest.raises(PdfExtractionError, match="private.*media|media.*residual"):
+        extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    residuals = list(run_dir.glob(".pdf-extracting-*"))
+    assert injected
+    assert len(residuals) == 1
+    assert (residuals[0] / "media" / "foreign.txt").read_bytes() == (
+        b"late private media racer"
+    )
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+    assert not (run_dir / "media").exists()
+
+    monkeypatch.setattr(transaction_module.anchored, "_publish_new_file", real_publish)
+    extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert (run_dir / "document.json").is_file()
+    assert (run_dir / "segments.jsonl").is_file()
+    assert (run_dir / "media" / "figure-0001.png").read_bytes() == b"staged figure"
+    assert (residuals[0] / "media" / "foreign.txt").read_bytes() == (
+        b"late private media racer"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a real POSIX held-name replacement")
+def test_pdf_extract_transaction_rejects_late_private_media_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+
+    def write_two_media(
+        source: Path,
+        document: Path,
+        segments: Path,
+        media: Path,
+    ) -> None:
+        _write_staged_outputs(source, document, segments, media)
+        (media / "figure-0002.png").write_bytes(b"second owned figure")
+
+    real_publish = transaction_module.anchored._publish_new_file
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(b"foreign same-name replacement")
+
+    def publish_then_replace_remaining(*args: object, **kwargs: object) -> object:
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        source = args[0]
+        destination = args[2]
+        if (
+            getattr(source, "path", None).name == "media"
+            and getattr(destination, "path", None) == run_dir / "media"
+            and args[1] == "figure-0001.png"
+        ):
+            os.replace(replacement, source.path / "figure-0002.png")  # type: ignore[union-attr]
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_replace_remaining,
+    )
+
+    with pytest.raises(PdfExtractionError, match="changed identity"):
+        extract_pdf_transaction(run_dir, extractor=write_two_media)
+
+    residuals = list(run_dir.glob(".pdf-extracting-*"))
+    assert len(residuals) == 1
+    assert (residuals[0] / "media" / "figure-0002.png").read_bytes() == (
+        b"foreign same-name replacement"
+    )
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+    assert not (run_dir / "media").exists()

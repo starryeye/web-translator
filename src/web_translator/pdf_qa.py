@@ -1,0 +1,3108 @@
+"""Fail-closed automated QA preparation for staged translated PDFs."""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import hashlib
+import io
+import json
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import sys
+from typing import Any
+
+import pdfplumber
+from PIL import Image
+from pypdf import PdfReader
+from pypdf.generic import ArrayObject
+
+import web_translator.pdf_assemble as assembly
+from web_translator.models import (
+    Segment,
+    SegmentContractError,
+    Translation,
+    read_segments_stream,
+)
+from web_translator.pdf_flowables import PdfAssemblyError, PdfAssemblyLayout
+from web_translator.pdf_media import (
+    PdfMediaError,
+    build_contact_sheets,
+    render_pdf_pages,
+)
+from web_translator.pdf_models import (
+    PdfContractError,
+    PdfDocument,
+    PdfLayoutReview,
+    PdfSourceRecord,
+)
+from web_translator.pdf_review import (
+    PdfSemanticInputSnapshot,
+    PdfSemanticReviewError,
+    hold_pdf_semantic_inputs,
+    validate_pdf_semantic_review,
+    validate_pdf_semantic_review_snapshot,
+)
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_HANGUL = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_TOKEN = re.compile(r"⟦WT:\d{6}⟧")
+_PAGE_NAME = re.compile(r"page-(\d{3})\.png\Z")
+_RAW_PAGE_NAME = re.compile(r"page-\d+\.png\Z")
+_CONTACT_NAME = re.compile(r"contact-sheet-(\d{3})\.png\Z")
+_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS = os.name == "nt"
+_FINAL_OUTPUT_NAMES = ("manifest.json", "review-report.md", "translated.pdf")
+_REVIEW_DIMENSIONS = {
+    "semantic_fidelity",
+    "qualification_preservation",
+    "naturalness",
+    "terminology",
+    "boundary_consistency",
+    "protected_content",
+}
+_VISUAL_DIMENSIONS = {
+    "heading_hierarchy",
+    "text_legibility",
+    "table_legibility",
+    "figure_caption_pairing",
+    "footnote_placement",
+    "page_transitions",
+    "clipping_overlap",
+    "glyph_rendering",
+}
+
+
+class PdfQAFailure(RuntimeError):
+    """The staged PDF or its immutable run evidence failed automated QA."""
+
+
+class _PdfPublicationRolledBack(PdfQAFailure):
+    """A failed post-publication check restored the output to private staging."""
+
+    def __init__(self, message: str, private_name: str) -> None:
+        super().__init__(message)
+        self.private_name = private_name
+
+
+class _PdfPublicationRollbackFailed(PdfQAFailure):
+    """A failed post-publication check could not restore private staging."""
+
+
+@dataclass(frozen=True, slots=True)
+class PdfQAFinding:
+    code: str
+    evidence: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"code": self.code, "evidence": self.evidence}
+
+
+@dataclass(frozen=True, slots=True)
+class PdfQAResult:
+    schema_version: str
+    staged_pdf_sha256: str
+    findings: tuple[PdfQAFinding, ...]
+    rendered_pages: tuple[Path, ...]
+    rendered_page_hashes: dict[str, str]
+    contact_sheet_pages: dict[str, list[int]]
+    contact_sheet_hashes: dict[str, str]
+    metrics: dict[str, int]
+    passed: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contact_sheet_hashes": dict(self.contact_sheet_hashes),
+            "contact_sheet_pages": {
+                name: list(pages) for name, pages in self.contact_sheet_pages.items()
+            },
+            "findings": [finding.to_dict() for finding in self.findings],
+            "metrics": dict(self.metrics),
+            "passed": self.passed,
+            "rendered_page_hashes": dict(self.rendered_page_hashes),
+            "schema_version": self.schema_version,
+            "staged_pdf_sha256": self.staged_pdf_sha256,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, value: object, qa_pages_dir: Path
+    ) -> PdfQAResult:
+        fields = {
+            "contact_sheet_hashes",
+            "contact_sheet_pages",
+            "findings",
+            "metrics",
+            "passed",
+            "rendered_page_hashes",
+            "schema_version",
+            "staged_pdf_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise PdfQAFailure("pdf-qa fields must be exactly " + ", ".join(sorted(fields)))
+        if value["schema_version"] != "1.0":
+            raise PdfQAFailure("pdf-qa schema_version must be '1.0'")
+        staged_hash = _qa_hash(value["staged_pdf_sha256"], "staged_pdf_sha256")
+        if type(value["passed"]) is not bool:
+            raise PdfQAFailure("pdf-qa passed must be a boolean")
+        raw_findings = value["findings"]
+        if not isinstance(raw_findings, list):
+            raise PdfQAFailure("pdf-qa findings must be an array")
+        findings: list[PdfQAFinding] = []
+        for index, item in enumerate(raw_findings):
+            if not isinstance(item, Mapping) or set(item) != {"code", "evidence"}:
+                raise PdfQAFailure(f"pdf-qa findings[{index}] fields must be exactly code, evidence")
+            code = item["code"]
+            evidence = item["evidence"]
+            if not isinstance(code, str) or not code or not isinstance(evidence, str) or not evidence.strip():
+                raise PdfQAFailure(f"pdf-qa findings[{index}] must contain nonempty strings")
+            findings.append(PdfQAFinding(code, evidence))
+        if [item.code for item in findings] != sorted({item.code for item in findings}):
+            raise PdfQAFailure("pdf-qa finding codes must be sorted and unique")
+        page_hashes = _qa_hash_mapping(
+            value["rendered_page_hashes"], _PAGE_NAME, "rendered_page_hashes"
+        )
+        expected_page_names = [
+            f"page-{number:03d}.png" for number in range(1, len(page_hashes) + 1)
+        ]
+        if list(page_hashes) != expected_page_names:
+            raise PdfQAFailure("pdf-qa rendered page coverage must be exact and sequential")
+        contact_hashes = _qa_hash_mapping(
+            value["contact_sheet_hashes"], _CONTACT_NAME, "contact_sheet_hashes"
+        )
+        expected_contact_names = [
+            f"contact-sheet-{number:03d}.png"
+            for number in range(1, math.ceil(len(page_hashes) / 12) + 1)
+        ]
+        if list(contact_hashes) != expected_contact_names:
+            raise PdfQAFailure(
+                "pdf-qa contact-sheet names must be exact and sequential"
+            )
+        raw_contacts = value["contact_sheet_pages"]
+        if not isinstance(raw_contacts, Mapping) or list(raw_contacts) != list(contact_hashes):
+            raise PdfQAFailure("pdf-qa contact-sheet hashes and coverage must match exactly")
+        contacts: dict[str, list[int]] = {}
+        for name, raw_pages in raw_contacts.items():
+            if not isinstance(name, str) or not isinstance(raw_pages, list):
+                raise PdfQAFailure("pdf-qa contact-sheet coverage is malformed")
+            if any(type(page) is not int or page <= 0 for page in raw_pages):
+                raise PdfQAFailure("pdf-qa contact-sheet coverage must use positive integers")
+            contacts[name] = list(raw_pages)
+        covered = [page for pages in contacts.values() for page in pages]
+        if covered != list(range(1, len(page_hashes) + 1)) or any(
+            len(pages) > 12 for pages in contacts.values()
+        ):
+            raise PdfQAFailure("pdf-qa contact-sheet coverage must cover every page exactly once")
+        metric_fields = {
+            "contact_sheet_count",
+            "embedded_font_count",
+            "figure_count",
+            "link_count",
+            "output_page_count",
+            "rendered_page_count",
+            "translated_block_count",
+        }
+        raw_metrics = value["metrics"]
+        if not isinstance(raw_metrics, Mapping) or set(raw_metrics) != metric_fields:
+            raise PdfQAFailure("pdf-qa metrics fields are not exact")
+        if any(type(item) is not int or item < 0 for item in raw_metrics.values()):
+            raise PdfQAFailure("pdf-qa metrics must be nonnegative integers")
+        metrics = dict(raw_metrics)  # type: ignore[arg-type]
+        if (
+            metrics["rendered_page_count"] != len(page_hashes)
+            or metrics["output_page_count"] != len(page_hashes)
+            or metrics["contact_sheet_count"] != len(contacts)
+        ):
+            raise PdfQAFailure("pdf-qa metrics disagree with page/contact coverage")
+        qa_pages_dir = Path(qa_pages_dir)
+        return cls(
+            schema_version="1.0",
+            staged_pdf_sha256=staged_hash,
+            findings=tuple(findings),
+            rendered_pages=tuple(qa_pages_dir / name for name in page_hashes),
+            rendered_page_hashes=page_hashes,
+            contact_sheet_pages=contacts,
+            contact_sheet_hashes=contact_hashes,
+            metrics=metrics,
+            passed=value["passed"],  # type: ignore[arg-type]
+        )
+
+
+def read_pdf_layout_review(
+    review_path: Path, qa_path: Path
+) -> PdfLayoutReview:
+    """Read strict visual-review evidence and cross-check all QA coverage."""
+    review_path = Path(review_path)
+    qa_path = Path(qa_path)
+    qa = _pdf_qa_from_value(
+        _strict_json_path(qa_path, "automated PDF QA"),
+        qa_path.parent / "qa-pages",
+    )
+    return _pdf_layout_review_from_values(
+        _strict_json_path(review_path, "PDF layout review"), qa
+    )
+
+
+def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
+    """Publish exactly the reviewed PDF and its reports by one atomic rename."""
+    from web_translator.pdf_report import (
+        build_pdf_report_evidence,
+        write_pdf_manifest,
+        write_pdf_review_report,
+    )
+
+    run_dir = Path(run_dir)
+    output_dir = Path(output_dir)
+    run_anchor: assembly._DirectoryAnchor | None = None
+    staged_anchor: assembly._DirectoryAnchor | None = None
+    output_parent_anchor: assembly._DirectoryAnchor | None = None
+    opened: dict[str, assembly._OpenedFile] = {}
+    final_files: dict[str, assembly._OpenedFile] = {}
+    staged_pdf: assembly._OpenedFile | None = None
+    completed = False
+    publication_rolled_back = False
+    semantic_context: Any | None = None
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None
+    try:
+        run_anchor = assembly._open_directory_anchor(run_dir, "run")
+        semantic_context = hold_pdf_semantic_inputs(run_anchor)
+        semantic_snapshot = semantic_context.__enter__()
+        _validate_locations(run_anchor, output_dir)
+        staged_anchor = assembly._open_existing_child_directory(
+            run_anchor, "staged-output", "staged PDF output"
+        )
+        names = assembly._anchored_directory_names(staged_anchor)
+        if names != ["translated.pdf"]:
+            raise PdfQAFailure(
+                "staged PDF output must contain exactly translated.pdf before finalization"
+            )
+        staged_pdf = assembly._open_anchored_input_file(
+            staged_anchor, "translated.pdf", "staged translated PDF"
+        )
+        final_files["translated.pdf"] = staged_pdf
+        for name, label in (
+            ("source.pdf", "PDF source"),
+            ("source.json", "PDF source record"),
+            ("document.json", "PDF document"),
+            ("segments.jsonl", "PDF segments"),
+            ("glossary.json", "PDF glossary"),
+            ("review.json", "semantic review"),
+            ("layout.json", "PDF layout"),
+            ("pdf-qa.json", "automated PDF QA"),
+            ("pdf-layout-review.json", "PDF layout review"),
+        ):
+            opened[name] = assembly._open_anchored_input_file(run_anchor, name, label)
+        assembly._verify_anchored_evidence(run_anchor, opened)
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"translated.pdf": staged_pdf}
+        )
+        snapshot_bytes = {
+            name: assembly._read_opened_bytes(
+                item, run_dir / name, f"PDF report evidence {name}"
+            )
+            for name, item in opened.items()
+        }
+        snapshot_hashes = {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in snapshot_bytes.items()
+        }
+        zone_bytes = {
+            Path(relative).name: payload
+            for relative, payload in semantic_snapshot.payloads.items()
+            if relative.startswith("zones/")
+        }
+        qa = _pdf_qa_from_value(
+            _strict_json_text(
+                _snapshot_utf8(snapshot_bytes["pdf-qa.json"], "automated PDF QA"),
+                "automated PDF QA",
+            ),
+            run_dir / "qa-pages",
+        )
+        review = _pdf_layout_review_from_values(
+            _strict_json_text(
+                _snapshot_utf8(
+                    snapshot_bytes["pdf-layout-review.json"], "PDF layout review"
+                ),
+                "PDF layout review",
+            ),
+            qa,
+        )
+        layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        source_value = _strict_json_mapping(
+            snapshot_bytes["source.json"], "PDF source record"
+        )
+        document_value = _strict_json_mapping(
+            snapshot_bytes["document.json"], "PDF document"
+        )
+        semantic_value = _strict_json_mapping(
+            snapshot_bytes["review.json"], "semantic review"
+        )
+        try:
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, semantic_value)
+        except PdfSemanticReviewError as error:
+            raise PdfQAFailure(str(error)) from error
+        zone_values = {
+            Path(name).stem: _strict_json_mapping(payload, f"PDF zone {name}")
+            for name, payload in zone_bytes.items()
+        }
+        report_evidence = build_pdf_report_evidence(
+            source_pdf=snapshot_bytes["source.pdf"],
+            source_value=source_value,
+            document_value=document_value,
+            segments_text=_snapshot_utf8(
+                semantic_snapshot.payloads["segments.jsonl"], "PDF segments"
+            ),
+            glossary_value=_snapshot_glossary(semantic_snapshot),
+            review_value=semantic_value,
+            zone_values=zone_values,
+            layout=layout,
+            qa=qa,
+            visual_review=review,
+        )
+        if layout.reserved_output_dir != str(output_dir):
+            raise PdfQAFailure(
+                "layout reserved output directory does not match the request"
+            )
+        if not qa.passed:
+            raise PdfQAFailure("automated PDF QA did not pass")
+        if review.unresolved_required:
+            raise PdfQAFailure(
+                "PDF layout review has unresolved required findings: "
+                + ", ".join(review.unresolved_required)
+            )
+        pdf_bytes = assembly._read_opened_bytes(
+            staged_pdf,
+            run_dir / "staged-output" / "translated.pdf",
+            "staged translated PDF",
+        )
+        staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if (
+            staged_hash != qa.staged_pdf_sha256
+            or staged_hash != review.staged_pdf_sha256
+            or staged_hash != layout.staged_pdf_sha256
+        ):
+            raise PdfQAFailure(
+                "staged PDF hash does not match current automated, visual, and layout evidence"
+            )
+        _verify_pdf_qa_artifacts(run_anchor, qa)
+        manifest_file = assembly._create_anchored_binary_file(
+            staged_anchor, "manifest.json"
+        )
+        final_files["manifest.json"] = manifest_file
+        manifest = write_pdf_manifest(
+            run_dir, manifest_file.stream, evidence=report_evidence
+        )
+        assembly._finalize_opened_file(manifest_file, "final PDF manifest")
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"manifest.json": manifest_file}
+        )
+        review_file = assembly._create_anchored_binary_file(
+            staged_anchor, "review-report.md"
+        )
+        final_files["review-report.md"] = review_file
+        write_pdf_review_report(manifest, review_file.stream)
+        assembly._finalize_opened_file(review_file, "final PDF review report")
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"review-report.md": review_file}
+        )
+        names = assembly._anchored_directory_names(staged_anchor)
+        if names != list(_FINAL_OUTPUT_NAMES):
+            raise PdfQAFailure(
+                "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
+            )
+        final_hashes = _final_file_hashes(staged_anchor, final_files)
+        final_identities = {
+            name: item.identity for name, item in final_files.items()
+        }
+        _verify_report_evidence_snapshot(run_anchor, opened, snapshot_hashes)
+        semantic_snapshot.verify()
+        assembly._verify_anchored_evidence(
+            staged_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
+        _fsync_final_files(staged_anchor, final_files, final_hashes)
+        if _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS:
+            for item in final_files.values():
+                assembly._close_opened_file(item)
+        output_parent_anchor = _ensure_output_parent(output_dir)
+        _validate_locations(run_anchor, output_dir)
+        _publish_final_directory_no_clobber(
+            run_anchor,
+            staged_anchor,
+            output_parent_anchor,
+            output_dir.name,
+            final_identities,
+            final_hashes,
+        )
+        completed = True
+        return output_dir
+    except _PdfPublicationRolledBack:
+        publication_rolled_back = True
+        raise
+    except _PdfPublicationRollbackFailed:
+        publication_rolled_back = True
+        raise
+    except PdfQAFailure:
+        raise
+    except (PdfAssemblyError, PdfContractError, PdfSemanticReviewError) as error:
+        raise PdfQAFailure(str(error)) from error
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+    finally:
+        if not completed and not publication_rolled_back:
+            for name in ("manifest.json", "review-report.md"):
+                assembly._close_opened_file(final_files.get(name))
+                item = final_files.get(name)
+                if staged_anchor is not None and item is not None:
+                    _remove_owned_qa_record(
+                        staged_anchor,
+                        name,
+                        assembly._PublishedFile(item.identity),
+                    )
+        assembly._close_opened_file(staged_pdf)
+        for item in opened.values():
+            assembly._close_opened_file(item)
+        for item in final_files.values():
+            assembly._close_opened_file(item)
+        if staged_anchor is not None:
+            staged_anchor.close()
+        if output_parent_anchor is not None:
+            output_parent_anchor.close()
+        if semantic_context is not None:
+            semantic_context.__exit__(None, None, None)
+        if run_anchor is not None:
+            run_anchor.close()
+
+
+def _pdf_qa_from_value(value: object, qa_pages_dir: Path) -> PdfQAResult:
+    try:
+        return PdfQAResult.from_dict(value, qa_pages_dir)
+    except PdfQAFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        raise PdfQAFailure(f"invalid automated PDF QA: {error}") from error
+
+
+def _pdf_layout_review_from_values(
+    value: object, qa: PdfQAResult
+) -> PdfLayoutReview:
+    try:
+        review = PdfLayoutReview.from_dict(value)  # type: ignore[arg-type]
+    except (PdfContractError, TypeError, ValueError) as error:
+        if "pages_reviewed" in str(error):
+            raise PdfQAFailure(
+                f"invalid PDF layout review page coverage: {error}"
+            ) from error
+        if "contact_sheets_reviewed" in str(error):
+            raise PdfQAFailure(
+                f"invalid PDF layout review contact-sheet coverage: {error}"
+            ) from error
+        raise PdfQAFailure(f"invalid PDF layout review: {error}") from error
+    expected_pages = list(range(1, len(qa.rendered_page_hashes) + 1))
+    if review.pages_reviewed != expected_pages:
+        raise PdfQAFailure(
+            "PDF layout review page coverage must exactly match automated QA"
+        )
+    if review.contact_sheets_reviewed != qa.contact_sheet_pages:
+        raise PdfQAFailure(
+            "PDF layout review contact-sheet coverage must exactly match automated QA"
+        )
+    if set(review.findings) != _VISUAL_DIMENSIONS:
+        raise PdfQAFailure(
+            "PDF layout review visual dimensions must contain exactly the eight canonical dimensions"
+        )
+    expected_unresolved = sorted(
+        dimension
+        for dimension, finding in review.findings.items()
+        if finding["verdict"] == "required-fix"
+    )
+    if review.unresolved_required != expected_unresolved:
+        raise PdfQAFailure(
+            "PDF layout review unresolved_required must exactly match required-fix findings"
+        )
+    if review.staged_pdf_sha256 != qa.staged_pdf_sha256:
+        raise PdfQAFailure(
+            "PDF layout review staged PDF hash does not match automated QA"
+        )
+    return review
+
+
+def _strict_json_path(path: Path, label: str) -> object:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise PdfQAFailure(f"cannot read {label} {path}: {error}") from error
+    return _strict_json_text(text, label)
+
+
+def _strict_json_text(text: str, label: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise PdfQAFailure(f"{label} contains duplicate JSON field: {key}")
+            result[key] = item
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=unique_object)
+    except PdfQAFailure:
+        raise
+    except json.JSONDecodeError as error:
+        raise PdfQAFailure(f"cannot read {label}: {error}") from error
+
+
+def _snapshot_utf8(payload: bytes, label: str) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError as error:
+        raise PdfQAFailure(f"cannot decode {label}: {error}") from error
+
+
+def _strict_json_mapping(payload: bytes, label: str) -> Mapping[str, Any]:
+    value = _strict_json_text(_snapshot_utf8(payload, label), label)
+    if not isinstance(value, Mapping):
+        raise PdfQAFailure(f"{label} must be a JSON object")
+    return value
+
+
+def _verify_report_evidence_snapshot(
+    anchor: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    assembly._verify_anchored_evidence(anchor, opened)
+    for name, item in opened.items():
+        payload = assembly._read_opened_bytes(
+            item, anchor.path / name, f"PDF report evidence {name}"
+        )
+        if hashlib.sha256(payload).hexdigest() != expected_hashes[name]:
+            raise PdfQAFailure(f"PDF report evidence content changed: {name}")
+
+
+def _verify_pdf_qa_artifacts(
+    run_anchor: assembly._DirectoryAnchor, qa: PdfQAResult
+) -> None:
+    pages = assembly._open_existing_child_directory(
+        run_anchor, "qa-pages", "rendered PDF QA pages"
+    )
+    opened: dict[str, assembly._OpenedFile] = {}
+    expected = {**qa.rendered_page_hashes, **qa.contact_sheet_hashes}
+    try:
+        names = sorted(path.name for path in pages.current_path().iterdir())
+        if names != sorted(expected):
+            raise PdfQAFailure(
+                "rendered PDF QA artifacts do not exactly match recorded coverage"
+            )
+        for name, digest in expected.items():
+            item = assembly._open_anchored_input_file(
+                pages, name, "rendered PDF QA artifact"
+            )
+            opened[name] = item
+            payload = assembly._read_opened_bytes(
+                item, pages.path / name, "rendered PDF QA artifact"
+            )
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise PdfQAFailure(f"rendered PDF QA artifact hash changed: {name}")
+        assembly._verify_anchored_evidence(pages, opened)
+    finally:
+        for item in opened.values():
+            assembly._close_opened_file(item)
+        pages.close()
+
+
+def _ensure_output_parent(output_dir: Path) -> assembly._DirectoryAnchor:
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        assembly._reject_linked_ancestors(output_dir)
+        metadata = output_dir.parent.lstat()
+    except (PdfAssemblyError, OSError) as error:
+        raise PdfQAFailure(f"cannot prepare final PDF output parent: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode) or assembly._is_reparse_stat(metadata):
+        raise PdfQAFailure(
+            f"final PDF output parent is not a safe directory: {output_dir.parent}"
+        )
+    parent: assembly._DirectoryAnchor | None = None
+    try:
+        parent = assembly._open_directory_anchor(
+            output_dir.parent, "final PDF output parent"
+        )
+        assembly._require_anchored_name_absent(parent, output_dir.name)
+        return parent
+    except PdfAssemblyError as error:
+        if parent is not None:
+            parent.close()
+        raise PdfQAFailure(str(error)) from error
+
+
+def _publish_final_directory_no_clobber(
+    source_parent: assembly._DirectoryAnchor,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    destination = destination_parent.path / destination_name
+    publication_handle: int | None = None
+    try:
+        _require_anchored_directory_identity(
+            source_parent,
+            "staged-output",
+            source.identity,
+            "final PDF publication source",
+        )
+        _verify_final_artifact_snapshot(
+            source,
+            expected_identities,
+            expected_hashes,
+        )
+        destination_parent.verify_visible()
+        publication_handle = _rename_anchored_directory_no_replace(
+            source_parent,
+            "staged-output",
+            source.identity,
+            destination_parent,
+            destination_name,
+            retain_windows_handle=True,
+        )
+        try:
+            _require_anchored_directory_identity(
+                destination_parent,
+                destination_name,
+                source.identity,
+                "published final PDF output",
+            )
+            destination_parent.verify_visible()
+            published = assembly._open_existing_child_directory(
+                destination_parent,
+                destination_name,
+                "published final PDF output",
+            )
+            try:
+                if published.identity != source.identity:
+                    raise PdfQAFailure(
+                        "published final PDF artifacts changed directory identity"
+                    )
+                _verify_final_artifact_snapshot(
+                    published,
+                    expected_identities,
+                    expected_hashes,
+                )
+            finally:
+                published.close()
+        except (PdfQAFailure, PdfAssemblyError) as error:
+            try:
+                private_name = _rollback_final_directory(
+                    destination_parent,
+                    destination_name,
+                    source,
+                    source_parent,
+                    windows_source_handle=publication_handle,
+                )
+            except (
+                AttributeError,
+                NotImplementedError,
+                OSError,
+                PdfAssemblyError,
+                PdfQAFailure,
+            ) as rollback_error:
+                message = (
+                    str(error)
+                    if isinstance(error, PdfQAFailure)
+                    else f"cannot publish final PDF output: {error}"
+                )
+                raise _PdfPublicationRollbackFailed(
+                    f"{message}; publication rollback failed: {rollback_error}"
+                ) from error
+            message = (
+                str(error)
+                if isinstance(error, PdfQAFailure)
+                else f"cannot publish final PDF output: {error}"
+            )
+            raise _PdfPublicationRolledBack(message, private_name) from error
+    except FileExistsError as error:
+        raise PdfQAFailure(f"reserved final output already exists: {destination}") from error
+    except PdfQAFailure:
+        raise
+    except (AttributeError, NotImplementedError, OSError, PdfAssemblyError) as error:
+        if getattr(error, "winerror", None) in {80, 183}:
+            raise PdfQAFailure(
+                f"reserved final output already exists: {destination}"
+            ) from error
+        raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
+    finally:
+        if publication_handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(publication_handle)
+
+
+def _rename_anchored_directory_no_replace(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source_identity: tuple[int, int],
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+    *,
+    retain_windows_handle: bool = False,
+) -> int | None:
+    source_handle: int | None = None
+    keep_source_handle = False
+    try:
+        if (
+            source_parent.descriptor is not None
+            and destination_parent.descriptor is not None
+        ):
+            _posix_rename_directory_no_replace(
+                source_parent.descriptor,
+                source_name,
+                destination_parent.descriptor,
+                destination_name,
+            )
+        elif assembly._IS_WINDOWS:
+            source_handle = assembly._windows_nt_create_relative(
+                assembly._windows_anchor_handle(source_parent),
+                source_name,
+                desired_access=0x00010000 | 0x00000080 | 0x00100000,
+                create_disposition=1,
+                create_options=0x00000001 | 0x00000020 | 0x00200000,
+                file_attributes=0,
+            )
+            if (
+                assembly._windows_file_identity(
+                    source_handle, require_regular=False
+                )
+                != source_identity
+            ):
+                raise PdfQAFailure("final PDF publication source changed identity")
+            assembly._windows_rename_open_file(
+                source_handle,
+                assembly._windows_anchor_handle(destination_parent),
+                destination_name,
+            )
+            if retain_windows_handle:
+                keep_source_handle = True
+                return source_handle
+        else:
+            raise PdfQAFailure(
+                "safe atomic no-clobber PDF directory rename is unavailable"
+            )
+        return None
+    finally:
+        if source_handle is not None and not keep_source_handle:
+            assembly.pdf_acquire_module._close_windows_handle(source_handle)
+
+
+def _rollback_final_directory(
+    public_parent: assembly._DirectoryAnchor,
+    public_name: str,
+    source: assembly._DirectoryAnchor,
+    private_parent: assembly._DirectoryAnchor,
+    *,
+    windows_source_handle: int | None = None,
+) -> str:
+    private_parent.verify_visible()
+    candidates = ["staged-output"] + [
+        f".pdf-final-rollback-{os.urandom(16).hex()}" for _ in range(100)
+    ]
+    for private_name in candidates:
+        try:
+            _require_anchored_directory_identity(
+                public_parent,
+                public_name,
+                source.identity,
+                "failed published final PDF output",
+            )
+            if windows_source_handle is not None:
+                assembly._windows_rename_open_file(
+                    windows_source_handle,
+                    assembly._windows_anchor_handle(private_parent),
+                    private_name,
+                )
+            else:
+                _rename_anchored_directory_no_replace(
+                    public_parent,
+                    public_name,
+                    source.identity,
+                    private_parent,
+                    private_name,
+                )
+            return private_name
+        except FileExistsError:
+            continue
+    raise PdfQAFailure("cannot reserve private PDF publication rollback directory")
+
+
+def _remove_owned_qa_record(
+    directory: assembly._DirectoryAnchor,
+    name: str,
+    published: assembly._PublishedFile | None,
+) -> None:
+    if published is None:
+        return
+    if assembly._IS_WINDOWS:
+        handle: int | None = None
+        try:
+            handle = assembly._windows_open_relative_file(
+                assembly._windows_anchor_handle(directory),
+                name,
+            )
+            if (
+                assembly._windows_file_identity(handle, require_regular=True)
+                != published.identity
+            ):
+                return
+            assembly._windows_delete_open_file(handle)
+        except FileNotFoundError:
+            return
+        except (PdfAssemblyError, NotImplementedError, OSError) as error:
+            raise PdfQAFailure(
+                f"cannot remove exact owned final report {name}: {error}"
+            ) from error
+        finally:
+            if handle is not None:
+                assembly.pdf_acquire_module._close_windows_handle(handle)
+        return
+    if directory.descriptor is None:
+        return
+
+    private_name: str | None = None
+    for _ in range(100):
+        candidate = f".pdf-qa-cleanup-{os.urandom(16).hex()}"
+        try:
+            _posix_rename_directory_no_replace(
+                directory.descriptor,
+                name,
+                directory.descriptor,
+                candidate,
+            )
+            private_name = candidate
+            break
+        except FileNotFoundError:
+            return
+        except FileExistsError:
+            continue
+        except (AttributeError, NotImplementedError, OSError):
+            return
+    if private_name is None:
+        return
+
+    descriptor: int | None = None
+    moved_identity: tuple[int, int] | None = None
+    try:
+        descriptor = os.open(
+            private_name,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory.descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or assembly._is_reparse_stat(metadata):
+            return
+        moved_identity = (metadata.st_dev, metadata.st_ino)
+        if moved_identity != published.identity:
+            return
+        os.unlink(private_name, dir_fd=directory.descriptor)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != moved_identity:
+            raise PdfQAFailure("moved PDF QA cleanup handle changed identity")
+    except (AttributeError, NotImplementedError, OSError, PdfQAFailure):
+        return
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if moved_identity != published.identity:
+            try:
+                _posix_rename_directory_no_replace(
+                    directory.descriptor,
+                    private_name,
+                    directory.descriptor,
+                    name,
+                )
+            except (
+                AttributeError,
+                FileExistsError,
+                FileNotFoundError,
+                NotImplementedError,
+                OSError,
+            ):
+                pass
+
+
+def _posix_rename_directory_no_replace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        operation = getattr(library, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        operation = getattr(library, "renameat2", None)
+        flags = 0x00000001  # RENAME_NOREPLACE
+    else:
+        operation = None
+        flags = 0
+    if operation is None:
+        raise NotImplementedError(
+            f"atomic no-replace directory rename is unavailable on {sys.platform}"
+        )
+    operation.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    operation.restype = ctypes.c_int
+    result = operation(
+        source_fd,
+        os.fsencode(source_name),
+        destination_fd,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _fsync_final_files(
+    staged_output: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    try:
+        _verify_opened_final_files(staged_output, opened, expected_hashes)
+        for name in _FINAL_OUTPUT_NAMES:
+            _flush_anchored_final_file(
+                staged_output,
+                name,
+                opened[name].identity,
+            )
+        if not assembly._IS_WINDOWS:
+            if staged_output.descriptor is None:
+                raise PdfQAFailure(
+                    "anchored final PDF directory fsync is unavailable"
+                )
+            os.fsync(staged_output.descriptor)
+        staged_output.verify_visible()
+        _verify_opened_final_files(staged_output, opened, expected_hashes)
+    except PdfQAFailure:
+        raise
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"cannot fsync final PDF output: {error}") from error
+    except OSError as error:
+        raise PdfQAFailure(f"cannot fsync final PDF output: {error}") from error
+
+
+def _flush_anchored_final_file(
+    directory: assembly._DirectoryAnchor,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    descriptor: int | None = None
+    windows_handle: int | None = None
+    try:
+        if assembly._IS_WINDOWS:
+            windows_handle = assembly._windows_nt_create_relative(
+                assembly._windows_anchor_handle(directory),
+                name,
+                desired_access=0x40000000 | 0x00000080 | 0x00100000,
+                create_disposition=1,
+                create_options=0x00000020 | 0x00000040 | 0x00200000,
+                file_attributes=0,
+            )
+            identity = assembly._windows_file_identity(
+                windows_handle,
+                require_regular=True,
+            )
+            if identity != expected_identity:
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity before flush: {name}"
+                )
+            _windows_flush_file_buffers(windows_handle)
+            if (
+                assembly._windows_file_identity(
+                    windows_handle,
+                    require_regular=True,
+                )
+                != expected_identity
+            ):
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity during flush: {name}"
+                )
+        else:
+            if directory.descriptor is None:
+                raise PdfQAFailure(
+                    "anchored final PDF file fsync is unavailable"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory.descriptor,
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or assembly._is_reparse_stat(metadata)
+                or (metadata.st_dev, metadata.st_ino) != expected_identity
+            ):
+                raise PdfQAFailure(
+                    f"final PDF artifact changed identity before flush: {name}"
+                )
+            os.fsync(descriptor)
+        assembly._verify_anchored_input_identity(
+            directory,
+            name,
+            expected_identity,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if windows_handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(windows_handle)
+
+
+def _windows_flush_file_buffers(handle: int) -> None:
+    if not assembly._IS_WINDOWS:
+        raise PdfQAFailure("Windows final PDF flush is unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        flush = ctypes.WinDLL("kernel32", use_last_error=True).FlushFileBuffers
+        flush.argtypes = (wintypes.HANDLE,)
+        flush.restype = wintypes.BOOL
+        if not flush(wintypes.HANDLE(handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, OSError) as error:
+        raise PdfQAFailure(
+            f"cannot flush Windows final PDF artifact: {error}"
+        ) from error
+
+
+def _final_file_hashes(
+    directory: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+) -> dict[str, str]:
+    if sorted(opened) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifacts must contain exactly the reviewed three-file transaction"
+        )
+    assembly._verify_anchored_evidence(directory, opened)
+    result = {
+        name: hashlib.sha256(
+            assembly._read_opened_bytes(
+                opened[name],
+                directory.path / name,
+                "final PDF artifact",
+            )
+        ).hexdigest()
+        for name in _FINAL_OUTPUT_NAMES
+    }
+    assembly._verify_anchored_evidence(directory, opened)
+    return result
+
+
+def _verify_opened_final_files(
+    directory: assembly._DirectoryAnchor,
+    opened: Mapping[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    if sorted(expected_hashes) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifact snapshot must cover exactly three files"
+        )
+    try:
+        visible_names = _anchored_directory_names(directory)
+    except (OSError, PdfAssemblyError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect final PDF artifacts: {error}"
+        ) from error
+    if visible_names != list(_FINAL_OUTPUT_NAMES) or sorted(opened) != list(
+        _FINAL_OUTPUT_NAMES
+    ):
+        raise PdfQAFailure(
+            "final PDF artifacts do not exactly match the reviewed transaction"
+        )
+    actual_hashes = _final_file_hashes(directory, opened)
+    for name in _FINAL_OUTPUT_NAMES:
+        if actual_hashes[name] != expected_hashes[name]:
+            raise PdfQAFailure(
+                f"final PDF artifacts changed content: {name}"
+            )
+
+
+def _verify_final_artifact_snapshot(
+    directory: assembly._DirectoryAnchor,
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    if sorted(expected_identities) != list(_FINAL_OUTPUT_NAMES):
+        raise PdfQAFailure(
+            "final PDF artifact identity snapshot must cover exactly three files"
+        )
+    opened: dict[str, assembly._OpenedFile] = {}
+    try:
+        for name in _FINAL_OUTPUT_NAMES:
+            opened[name] = assembly._open_anchored_input_file(
+                directory,
+                name,
+                "final PDF artifact",
+            )
+            if opened[name].identity != expected_identities[name]:
+                raise PdfQAFailure(
+                    f"final PDF artifacts changed identity: {name}"
+                )
+        _verify_opened_final_files(directory, opened, expected_hashes)
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(
+            f"cannot verify final PDF artifacts: {error}"
+        ) from error
+    finally:
+        for item in opened.values():
+            assembly._close_opened_file(item)
+
+
+@dataclass(slots=True)
+class _PriorEvidence:
+    pages: assembly._DirectoryAnchor
+    record: assembly._OpenedFile
+    page_files: dict[str, assembly._OpenedFile]
+    pages_moved: bool = False
+    record_moved: bool = False
+
+
+def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
+    """Validate staged output and atomically publish rendered QA evidence."""
+    run_dir = Path(run_dir)
+    output_dir = Path(output_dir)
+    run_anchor: assembly._DirectoryAnchor | None = None
+    staging_anchor: assembly._DirectoryAnchor | None = None
+    staged_output_anchor: assembly._DirectoryAnchor | None = None
+    qa_pages_anchor: assembly._DirectoryAnchor | None = None
+    opened: dict[str, assembly._OpenedFile] = {}
+    qa_artifacts: dict[str, assembly._OpenedFile] = {}
+    staged_pdf: assembly._OpenedFile | None = None
+    render_input: assembly._OpenedFile | None = None
+    render_input_candidate: assembly._PublishedFile | None = None
+    qa_json: assembly._OpenedFile | None = None
+    qa_pages_publication_attempted = False
+    published_json: assembly._PublishedFile | None = None
+    json_publication_candidate: assembly._PublishedFile | None = None
+    prior: _PriorEvidence | None = None
+    qa_artifact_identities: dict[str, tuple[int, int]] = {}
+    qa_artifact_hashes: dict[str, str] = {}
+    completed = False
+    temporary_name: str | None = None
+    semantic_context: Any | None = None
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None
+    try:
+        run_anchor = assembly._open_directory_anchor(run_dir, "run")
+        semantic_context = hold_pdf_semantic_inputs(run_anchor)
+        semantic_snapshot = semantic_context.__enter__()
+        _validate_locations(run_anchor, output_dir)
+        prior = _open_prior_evidence(run_anchor)
+        for name, label in (
+            ("source.pdf", "PDF source"),
+            ("source.json", "PDF source record"),
+            ("document.json", "PDF document"),
+            ("segments.jsonl", "PDF segments"),
+            ("glossary.json", "PDF glossary"),
+            ("review.json", "semantic review"),
+            ("layout.json", "PDF layout"),
+        ):
+            opened[name] = assembly._open_anchored_input_file(run_anchor, name, label)
+        staged_output_anchor = assembly._open_existing_child_directory(
+            run_anchor, "staged-output", "staged PDF output"
+        )
+        staged_pdf = assembly._open_anchored_input_file(
+            staged_output_anchor, "translated.pdf", "staged translated PDF"
+        )
+        assembly._verify_anchored_evidence(run_anchor, opened)
+        document = _document(opened["document.json"], run_dir / "document.json")
+        source = _source(opened["source.json"], run_dir / "source.json")
+        segments = _snapshot_segments(semantic_snapshot)
+        glossary = _snapshot_glossary(semantic_snapshot)
+        layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        translations, translation_zone_ids = _snapshot_translations(semantic_snapshot)
+        review = _review(
+            opened["review.json"],
+            run_dir / "review.json",
+            translation_zone_ids,
+            semantic_snapshot=semantic_snapshot,
+        )
+        _validate_source(document, source, opened["source.pdf"])
+        normalized = _validate_contracts(
+            document, segments, translations, glossary, review, layout, output_dir
+        )
+        pdf_bytes = assembly._read_opened_bytes(
+            staged_pdf,
+            run_dir / "staged-output" / "translated.pdf",
+            "staged translated PDF",
+        )
+        staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if layout.staged_pdf_sha256 != staged_hash:
+            raise PdfQAFailure("layout staged PDF hash does not match translated.pdf")
+        structure = _validate_pdf_structure(pdf_bytes, document, layout, normalized)
+        _validate_figure_media(run_anchor, document, pdf_bytes)
+
+        temporary_name, staging_anchor = assembly._create_unique_child_directory(
+            run_anchor, ".pdf-qa-preparing-", "PDF QA preparation"
+        )
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
+        render_input = assembly._create_anchored_binary_file(
+            staging_anchor, "render-input.pdf"
+        )
+        render_input_candidate = assembly._PublishedFile(render_input.identity)
+        render_input.stream.write(pdf_bytes)
+        assembly._finalize_opened_file(render_input, "held PDF QA render input")
+        render_input.stream.close()
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        assembly._verify_anchored_evidence(
+            staging_anchor, {"render-input.pdf": render_input}
+        )
+        qa_pages_anchor = assembly._create_child_directory(
+            staging_anchor, "qa-pages", "rendered PDF QA pages"
+        )
+        raw_pages = render_pdf_pages(
+            staging_anchor.current_path() / "render-input.pdf",
+            qa_pages_anchor.current_path(),
+            dpi=144,
+            name_width=3,
+            existing_destination_identity=qa_pages_anchor.identity,
+        )
+        qa_pages_anchor.verify_visible()
+        raw_pages = [qa_pages_anchor.current_path() / path.name for path in raw_pages]
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
+        assembly._verify_anchored_evidence(
+            staging_anchor, {"render-input.pdf": render_input}
+        )
+        assembly._remove_owned_file(
+            staging_anchor, "render-input.pdf", render_input_candidate
+        )
+        for path in raw_pages:
+            qa_artifacts[path.name] = assembly._open_anchored_input_file(
+                qa_pages_anchor,
+                path.name,
+                "rendered PDF QA page",
+            )
+        if len(raw_pages) != structure["page_count"]:
+            raise PdfQAFailure("Poppler did not render every staged PDF page")
+        _validate_rendered_pages(
+            raw_pages,
+            structure["page_count"],
+            layout,
+            normalized,
+            structure["page_sizes"],
+        )
+        contacts = build_contact_sheets(raw_pages, qa_pages_anchor.current_path())
+        _validate_contact_coverage(contacts, structure["page_count"])
+        for name in contacts:
+            qa_artifacts[name] = assembly._open_anchored_input_file(
+                qa_pages_anchor,
+                name,
+                "PDF QA contact sheet",
+            )
+        assembly._verify_anchored_evidence(qa_pages_anchor, qa_artifacts)
+        page_hashes = {
+            path.name: hashlib.sha256(
+                assembly._read_opened_bytes(
+                    qa_artifacts[path.name],
+                    qa_pages_anchor.path / path.name,
+                    "rendered PDF QA page",
+                )
+            ).hexdigest()
+            for path in raw_pages
+        }
+        contact_hashes = {
+            name: hashlib.sha256(
+                assembly._read_opened_bytes(
+                    qa_artifacts[name],
+                    qa_pages_anchor.path / name,
+                    "PDF QA contact sheet",
+                )
+            ).hexdigest()
+            for name in contacts
+        }
+        qa_artifact_hashes = {**page_hashes, **contact_hashes}
+        qa_artifact_identities = {
+            name: item.identity for name, item in qa_artifacts.items()
+        }
+        findings = tuple(
+            PdfQAFinding(code, evidence)
+            for code, evidence in sorted(
+                {
+                    "contract.coverage": f"Validated {len(normalized)} translated blocks.",
+                    "contract.review": "Semantic review has no unresolved required finding.",
+                    "layout.evidence": f"Validated {len(layout.flowables)} tracked flowables.",
+                    "render.contact_sheets": f"Covered {structure['page_count']} rendered pages exactly once.",
+                    "structure.fonts": "Embedded Regular and Bold Korean fonts have Unicode maps.",
+                    "structure.links": f"Validated {structure['link_count']} PDF link annotations.",
+                    "structure.pages": f"Reopened {structure['page_count']} unencrypted pages.",
+                    "structure.text": f"Validated selectable text for {len(normalized)} translated blocks.",
+                }.items()
+            )
+        )
+        result = PdfQAResult(
+            schema_version="1.0",
+            staged_pdf_sha256=staged_hash,
+            findings=findings,
+            rendered_pages=tuple(run_dir / "qa-pages" / path.name for path in raw_pages),
+            rendered_page_hashes=page_hashes,
+            contact_sheet_pages=contacts,
+            contact_sheet_hashes=contact_hashes,
+            metrics={
+                "contact_sheet_count": len(contacts),
+                "embedded_font_count": structure["embedded_font_count"],
+                "figure_count": sum(block.kind == "figure" for block in document.blocks),
+                "link_count": structure["link_count"],
+                "output_page_count": structure["page_count"],
+                "rendered_page_count": len(raw_pages),
+                "translated_block_count": len(normalized),
+            },
+            passed=True,
+        )
+        result = PdfQAResult.from_dict(result.to_dict(), run_dir / "qa-pages")
+        qa_json = assembly._create_anchored_binary_file(staging_anchor, "pdf-qa.json")
+        json_publication_candidate = assembly._PublishedFile(qa_json.identity)
+        qa_json.stream.write(
+            (
+                json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+        )
+        assembly._finalize_opened_file(qa_json, "PDF QA record")
+        qa_json.stream.close()
+        assembly._verify_anchored_evidence(qa_pages_anchor, qa_artifacts)
+        if prior is not None:
+            _move_prior_evidence_to_staging(run_anchor, staging_anchor, prior)
+        assembly._verify_anchored_evidence(
+            staged_output_anchor, {"translated.pdf": staged_pdf}
+        )
+        _verify_staged_pdf_content(
+            staged_pdf,
+            staged_hash,
+            run_dir / "staged-output" / "translated.pdf",
+        )
+        qa_pages_publication_attempted = True
+        published_qa_pages_anchor = _publish_qa_artifact_directory(
+            staging_anchor,
+            "qa-pages",
+            qa_pages_anchor,
+            run_anchor,
+            "qa-pages",
+            qa_artifacts,
+            qa_artifact_hashes,
+            release_descendant_handles=(
+                _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS
+            ),
+        )
+        qa_pages_anchor.close()
+        qa_pages_anchor = published_qa_pages_anchor
+        published_json = assembly._publish_new_file(
+            staging_anchor, "pdf-qa.json", run_anchor, "pdf-qa.json"
+        )
+        _verify_qa_artifact_snapshot(
+            qa_pages_anchor,
+            qa_artifacts,
+            qa_artifact_identities,
+            qa_artifact_hashes,
+        )
+        semantic_snapshot.verify()
+        completed = True
+        if prior is not None:
+            _discard_prior_evidence(staging_anchor, prior)
+        return result
+    except PdfQAFailure:
+        raise
+    except (
+        PdfAssemblyError,
+        PdfContractError,
+        PdfMediaError,
+        PdfSemanticReviewError,
+    ) as error:
+        raise PdfQAFailure(str(error)) from error
+    except (OSError, ValueError, TypeError) as error:
+        raise PdfQAFailure(f"cannot prepare PDF QA evidence: {error}") from error
+    finally:
+        if run_anchor is not None and not completed:
+            # A Windows directory cannot be moved while any descendant handle
+            # remains open.  The post-publication snapshot deliberately keeps
+            # those handles open until the JSON record publishes; release them
+            # before exact held-directory rollback/quarantine on failure.
+            for artifact in qa_artifacts.values():
+                assembly._close_opened_file(artifact)
+            _remove_owned_qa_record(
+                run_anchor,
+                "pdf-qa.json",
+                published_json or json_publication_candidate,
+            )
+            if qa_pages_publication_attempted:
+                _remove_qa_pages(
+                    run_anchor,
+                    "qa-pages",
+                    qa_pages_anchor,
+                    quarantine_parent=run_anchor,
+                )
+            if prior is not None and staging_anchor is not None:
+                _restore_prior_evidence(run_anchor, staging_anchor, prior)
+        for file in [
+            qa_json,
+            render_input,
+            staged_pdf,
+            *opened.values(),
+            *qa_artifacts.values(),
+        ]:
+            assembly._close_opened_file(file)
+        assembly._close_published_file(published_json)
+        if prior is not None:
+            for item in prior.page_files.values():
+                assembly._close_opened_file(item)
+            assembly._close_opened_file(prior.record)
+            prior.pages.close()
+        if staging_anchor is not None and not completed:
+            _remove_qa_pages(
+                staging_anchor,
+                "qa-pages",
+                qa_pages_anchor,
+                quarantine_parent=run_anchor,
+            )
+        if qa_pages_anchor is not None:
+            qa_pages_anchor.close()
+        if staged_output_anchor is not None:
+            staged_output_anchor.close()
+        if staging_anchor is not None:
+            assembly._remove_owned_file(
+                staging_anchor,
+                "render-input.pdf",
+                render_input_candidate,
+            )
+            _remove_owned_qa_record(
+                staging_anchor,
+                "pdf-qa.json",
+                published_json or json_publication_candidate,
+            )
+            if temporary_name is not None:
+                assembly._remove_owned_directory(
+                    run_anchor,
+                    temporary_name,
+                    staging_anchor.identity,
+                    child=staging_anchor,
+                )
+            staging_anchor.close()
+        if semantic_context is not None:
+            semantic_context.__exit__(None, None, None)
+        if run_anchor is not None:
+            run_anchor.close()
+
+
+def _verify_staged_pdf_content(
+    opened: assembly._OpenedFile,
+    expected_sha256: str,
+    path: Path,
+) -> None:
+    stream = opened.stream
+    try:
+        original_position = stream.tell()
+    except (OSError, ValueError, TypeError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect staged translated PDF content {path}: {error}"
+        ) from error
+    try:
+        stream.seek(0)
+        digest = hashlib.sha256()
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not isinstance(chunk, bytes):
+                raise TypeError("held staged PDF stream did not return bytes")
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise PdfQAFailure(
+                f"staged translated PDF content changed: {path}"
+            )
+    except PdfQAFailure:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise PdfQAFailure(
+            f"cannot read staged translated PDF content {path}: {error}"
+        ) from error
+    finally:
+        try:
+            stream.seek(original_position)
+        except (OSError, ValueError, TypeError) as error:
+            raise PdfQAFailure(
+                f"cannot restore staged translated PDF stream {path}: {error}"
+            ) from error
+
+
+def _validate_locations(run_anchor: assembly._DirectoryAnchor, output_dir: Path) -> None:
+    assembly._reject_linked_ancestors(output_dir)
+    run_resolved = run_anchor.current_path().resolve(strict=True)
+    output_resolved = output_dir.resolve(strict=False)
+    if output_resolved == run_resolved or run_resolved in output_resolved.parents:
+        raise PdfQAFailure("reserved final output directory must be outside the run")
+    if output_dir.exists() or output_dir.is_symlink():
+        raise PdfQAFailure(f"reserved final output already exists: {output_dir}")
+    present: set[str] = set()
+    for name in ("qa-pages", "pdf-qa.json"):
+        path = run_anchor.path / name
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if name == "qa-pages":
+            safe = stat.S_ISDIR(metadata.st_mode) and not assembly._is_reparse_stat(metadata)
+        else:
+            safe = stat.S_ISREG(metadata.st_mode) and not assembly._is_reparse_stat(metadata)
+        if not safe:
+            raise PdfQAFailure(f"unsafe prior PDF QA evidence: {name}")
+        present.add(name)
+    if present not in (set(), {"qa-pages", "pdf-qa.json"}):
+        raise PdfQAFailure("prior PDF QA evidence must be a complete coherent set")
+
+
+def _open_prior_evidence(
+    run_anchor: assembly._DirectoryAnchor,
+) -> _PriorEvidence | None:
+    try:
+        assembly._require_anchored_name_absent(run_anchor, "qa-pages")
+        assembly._require_anchored_name_absent(run_anchor, "pdf-qa.json")
+        return None
+    except PdfAssemblyError:
+        pass
+    pages = assembly._open_existing_child_directory(
+        run_anchor, "qa-pages", "prior rendered PDF QA pages"
+    )
+    record: assembly._OpenedFile | None = None
+    files: dict[str, assembly._OpenedFile] = {}
+    try:
+        record = assembly._open_anchored_input_file(
+            run_anchor, "pdf-qa.json", "prior PDF QA record"
+        )
+        names = sorted(path.name for path in pages.current_path().iterdir())
+        if not names or not any(_PAGE_NAME.fullmatch(name) for name in names):
+            raise PdfQAFailure("prior qa-pages has no rendered pages")
+        if any(
+            _PAGE_NAME.fullmatch(name) is None
+            and _CONTACT_NAME.fullmatch(name) is None
+            for name in names
+        ):
+            raise PdfQAFailure("prior qa-pages contains unrelated or unsafe entries")
+        for name in names:
+            files[name] = assembly._open_anchored_input_file(
+                pages, name, "prior rendered PDF QA artifact"
+            )
+        assembly._verify_anchored_evidence(pages, files)
+        assembly._verify_anchored_evidence(
+            run_anchor, {"pdf-qa.json": record}
+        )
+        return _PriorEvidence(pages=pages, record=record, page_files=files)
+    except BaseException:
+        for item in files.values():
+            assembly._close_opened_file(item)
+        assembly._close_opened_file(record)
+        pages.close()
+        raise
+
+
+def _json(opened: assembly._OpenedFile, path: Path, label: str) -> Mapping[str, Any]:
+    try:
+        value = json.loads(assembly._read_opened_utf8(opened, path, label))
+    except (json.JSONDecodeError, UnicodeError, OSError) as error:
+        raise PdfQAFailure(f"cannot read {label}: {error}") from error
+    if not isinstance(value, Mapping):
+        raise PdfQAFailure(f"{label} must be a JSON object")
+    return value
+
+
+def _document(opened: assembly._OpenedFile, path: Path) -> PdfDocument:
+    return PdfDocument.from_dict(_json(opened, path, "PDF document"))
+
+
+def _source(opened: assembly._OpenedFile, path: Path) -> PdfSourceRecord:
+    return PdfSourceRecord.from_dict(_json(opened, path, "PDF source record"))
+
+
+def _segments(opened: assembly._OpenedFile, path: Path) -> list[Segment]:
+    return read_segments_stream(
+        io.StringIO(assembly._read_opened_utf8(opened, path, "PDF segments"))
+    )
+
+
+def _snapshot_segments(snapshot: PdfSemanticInputSnapshot) -> list[Segment]:
+    try:
+        return read_segments_stream(
+            io.StringIO(snapshot.payloads["segments.jsonl"].decode("utf-8"))
+        )
+    except (KeyError, UnicodeError, SegmentContractError) as error:
+        raise PdfQAFailure(f"invalid held PDF segments: {error}") from error
+
+
+def _snapshot_glossary(snapshot: PdfSemanticInputSnapshot) -> dict[str, str]:
+    try:
+        value = json.loads(snapshot.payloads["glossary.json"].decode("utf-8"))
+    except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+        raise PdfQAFailure(f"invalid held PDF glossary: {error}") from error
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise PdfQAFailure("held PDF glossary must map strings to strings")
+    return dict(value)
+
+
+def _snapshot_translations(
+    snapshot: PdfSemanticInputSnapshot,
+) -> tuple[dict[str, Translation], set[str]]:
+    result: dict[str, Translation] = {}
+    zone_ids: set[str] = set()
+    for relative, payload in sorted(snapshot.payloads.items()):
+        if not relative.startswith("translations/"):
+            continue
+        zone_ids.add(Path(relative).stem)
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeError as error:
+            raise PdfQAFailure(
+                f"invalid held PDF translation {relative}: {error}"
+            ) from error
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                record = Translation.from_dict(json.loads(line))
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                raise PdfQAFailure(
+                    f"invalid held PDF translation {relative}:{line_number}: {error}"
+                ) from error
+            if record.segment_id in result:
+                raise PdfQAFailure(
+                    f"duplicate held PDF translation ID: {record.segment_id}"
+                )
+            result[record.segment_id] = record
+    return result, zone_ids
+
+
+def _glossary(opened: assembly._OpenedFile, path: Path) -> dict[str, str]:
+    value = _json(opened, path, "PDF glossary")
+    if any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
+        raise PdfQAFailure("PDF glossary must map strings to strings")
+    return dict(value)  # type: ignore[arg-type]
+
+
+def _review(
+    opened: assembly._OpenedFile,
+    path: Path,
+    expected_zone_ids: set[str],
+    *,
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None,
+) -> Mapping[str, Any]:
+    value = _json(opened, path, "semantic review")
+    try:
+        if semantic_snapshot is None:
+            validate_pdf_semantic_review(path.parent, value)
+        else:
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, value)
+    except PdfSemanticReviewError as error:
+        raise PdfQAFailure(str(error)) from error
+    if set(value) != {
+        "semantic_input_sha256",
+        "retries",
+        "section_findings",
+        "unresolved_required",
+    }:
+        raise PdfQAFailure("semantic review fields are not exact")
+    unresolved = value["unresolved_required"]
+    if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
+        raise PdfQAFailure("semantic review unresolved_required must be a string array")
+    findings = value["section_findings"]
+    if not isinstance(findings, Mapping) or not findings:
+        raise PdfQAFailure("semantic review must cover every zone")
+    retries = value["retries"]
+    if not isinstance(retries, Mapping) or any(
+        not isinstance(zone_id, str)
+        or type(attempts) is not int
+        or not 0 <= attempts <= 2
+        for zone_id, attempts in retries.items()
+    ):
+        raise PdfQAFailure(
+            "semantic review retries must map zones to integers from 0 through 2"
+        )
+    if set(retries) != expected_zone_ids or set(findings) != expected_zone_ids:
+        raise PdfQAFailure(
+            "semantic review findings and retries must exactly cover translation zones"
+        )
+    expected_unresolved: list[str] = []
+    for zone_id, records in findings.items():
+        if not isinstance(zone_id, str) or not isinstance(records, list):
+            raise PdfQAFailure("semantic review findings are malformed")
+        dimensions: set[str] = set()
+        for record in records:
+            if not isinstance(record, Mapping) or set(record) != {"dimension", "verdict", "evidence"}:
+                raise PdfQAFailure("semantic review finding fields are not exact")
+            dimension = record["dimension"]
+            verdict = record["verdict"]
+            evidence = record["evidence"]
+            if dimension not in _REVIEW_DIMENSIONS or dimension in dimensions:
+                raise PdfQAFailure("semantic review dimensions are incomplete or duplicated")
+            if verdict not in {"pass", "required-fix"} or not isinstance(evidence, str) or not evidence.strip():
+                raise PdfQAFailure("semantic review finding is invalid")
+            dimensions.add(str(dimension))
+            if verdict == "required-fix":
+                expected_unresolved.append(f"{zone_id}:{dimension}")
+        if dimensions != _REVIEW_DIMENSIONS:
+            raise PdfQAFailure("semantic review dimensions are incomplete or duplicated")
+    if list(unresolved) != sorted(expected_unresolved):
+        raise PdfQAFailure("semantic review unresolved required findings disagree")
+    if unresolved:
+        raise PdfQAFailure("semantic review has unresolved required findings")
+    return value
+
+
+def _layout(opened: assembly._OpenedFile, path: Path) -> PdfAssemblyLayout:
+    try:
+        return PdfAssemblyLayout.from_dict(_json(opened, path, "PDF layout"))
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"invalid PDF layout: {error}") from error
+
+
+def _read_translations(
+    run_anchor: assembly._DirectoryAnchor,
+) -> tuple[dict[str, Translation], set[str]]:
+    directory = assembly._open_existing_child_directory(
+        run_anchor, "translations", "PDF translations"
+    )
+    opened: list[assembly._OpenedFile] = []
+    try:
+        names = sorted(path.name for path in directory.current_path().iterdir())
+        if not names or any(re.fullmatch(r"zone-\d{3}\.jsonl", name) is None for name in names):
+            raise PdfQAFailure("PDF translations must contain only zone-NNN.jsonl files")
+        result: dict[str, Translation] = {}
+        for name in names:
+            item = assembly._open_anchored_input_file(directory, name, "PDF translation")
+            opened.append(item)
+            text = assembly._read_opened_utf8(item, directory.path / name, "PDF translation")
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = Translation.from_dict(json.loads(line))
+                except (json.JSONDecodeError, ValueError, TypeError) as error:
+                    raise PdfQAFailure(f"invalid PDF translation {name}:{line_number}: {error}") from error
+                if record.segment_id in result:
+                    raise PdfQAFailure(f"duplicate PDF translation ID: {record.segment_id}")
+                result[record.segment_id] = record
+        assembly._verify_anchored_evidence(
+            directory, {name: item for name, item in zip(names, opened, strict=True)}
+        )
+        return result, {Path(name).stem for name in names}
+    finally:
+        for item in opened:
+            assembly._close_opened_file(item)
+        directory.close()
+
+
+def _validate_source(
+    document: PdfDocument,
+    source: PdfSourceRecord,
+    source_pdf: assembly._OpenedFile,
+) -> None:
+    payload = assembly._read_opened_bytes(source_pdf, Path("source.pdf"), "PDF source")
+    if source.sha256 != hashlib.sha256(payload).hexdigest():
+        raise PdfQAFailure("source PDF hash does not match source.json")
+    if source.byte_length != len(payload) or source.sha256 != document.source_sha256:
+        raise PdfQAFailure("source/document PDF evidence does not agree")
+
+
+def _validate_contracts(
+    document: PdfDocument,
+    segments: Sequence[Segment],
+    translations: Mapping[str, Translation],
+    glossary: Mapping[str, str],
+    review: Mapping[str, Any],
+    layout: PdfAssemblyLayout,
+    output_dir: Path,
+) -> list[tuple[Any, Segment, str]]:
+    del review
+    try:
+        normalized = assembly._normalize_pdf_translations(
+            document, segments, translations, glossary
+        )
+        assembly._validate_rich_relationships(document)
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"PDF contract QA failed: {error}") from error
+    for _block, segment, _text in normalized:
+        expected = Counter(token.token for token in segment.protected)
+        actual = Counter(_TOKEN.findall(translations[segment.id].text))
+        if expected != actual:
+            raise PdfQAFailure(f"protected-token multiset changed for {segment.id}")
+    if layout.reserved_output_dir != str(output_dir):
+        raise PdfQAFailure("layout reserved output directory does not match the request")
+    visible_ids = {
+        block.id
+        for block in document.blocks
+        if block.kind not in {"header", "footer", "page-number"}
+    }
+    emitted_ids = {item.block_id for item in layout.flowables}
+    if not visible_ids.issubset(emitted_ids):
+        raise PdfQAFailure("layout does not cover every required PDF block")
+    return normalized
+
+
+def _validate_figure_media(
+    run_anchor: assembly._DirectoryAnchor,
+    document: PdfDocument,
+    pdf_bytes: bytes,
+) -> None:
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    if not figures:
+        return
+    directory = assembly._open_existing_child_directory(
+        run_anchor, "media", "PDF figure media"
+    )
+    opened: dict[str, assembly._OpenedFile] = {}
+    try:
+        expected: Counter[tuple[tuple[int, int], str, str]] = Counter()
+        for figure in figures:
+            if figure.media_path is None:
+                raise PdfQAFailure(f"figure media is missing for {figure.id}")
+            name = Path(figure.media_path).name
+            if Path(figure.media_path).parts != ("media", name):
+                raise PdfQAFailure(f"unsafe figure media path for {figure.id}")
+            if name in opened:
+                raise PdfQAFailure("figure media paths must be unique")
+            item = assembly._open_anchored_input_file(
+                directory, name, f"figure media for {figure.id}"
+            )
+            opened[name] = item
+            payload = assembly._read_opened_bytes(
+                item, directory.path / name, f"figure media for {figure.id}"
+            )
+            try:
+                with Image.open(io.BytesIO(payload)) as image:
+                    image.load()
+                    if image.format != "PNG":
+                        raise PdfQAFailure(f"figure media is not PNG: {figure.id}")
+                    normalized = image.convert("RGB")
+                    signature = (
+                        normalized.size,
+                        normalized.mode,
+                        hashlib.sha256(normalized.tobytes()).hexdigest(),
+                    )
+            except PdfQAFailure:
+                raise
+            except (OSError, ValueError) as error:
+                raise PdfQAFailure(f"cannot read figure media for {figure.id}: {error}") from error
+            expected[signature] += 1
+        assembly._verify_anchored_evidence(directory, opened)
+        actual: Counter[tuple[tuple[int, int], str, str]] = Counter()
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+        for page in reader.pages:
+            for embedded in page.images:
+                image = embedded.image.convert("RGB")
+                actual[
+                    (
+                        image.size,
+                        image.mode,
+                        hashlib.sha256(image.tobytes()).hexdigest(),
+                    )
+                ] += 1
+        missing = expected - actual
+        if missing:
+            raise PdfQAFailure(
+                "figure media does not match embedded staged PDF image evidence"
+            )
+    except PdfQAFailure:
+        raise
+    except Exception as error:
+        raise PdfQAFailure(f"cannot validate figure media: {error}") from error
+    finally:
+        for item in opened.values():
+            assembly._close_opened_file(item)
+        directory.close()
+
+
+def _validate_pdf_structure(
+    pdf_bytes: bytes,
+    document: PdfDocument,
+    layout: PdfAssemblyLayout,
+    normalized: Sequence[tuple[Any, Segment, str]],
+) -> dict[str, Any]:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+    except Exception as error:
+        raise PdfQAFailure(f"cannot reopen staged translated PDF: {error}") from error
+    if reader.is_encrypted:
+        raise PdfQAFailure("staged translated PDF must not be encrypted")
+    if not reader.pages:
+        raise PdfQAFailure("staged translated PDF has no pages")
+    font_faces: set[str] = set()
+    link_count = 0
+    validated_font_programs: set[str] = set()
+    page_sizes: list[tuple[float, float]] = []
+    link_annotations: list[
+        tuple[int, tuple[float, float, float, float], str | None, object | None]
+    ] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_box = page.mediabox
+        page_sizes.append(
+            (
+                float(page_box.right) - float(page_box.left),
+                float(page_box.top) - float(page_box.bottom),
+            )
+        )
+        try:
+            contents = page.get_contents()
+            if contents is None or not contents.get_data():
+                raise PdfQAFailure(f"page {page_number} has no valid content stream")
+            resources = page["/Resources"].get_object()
+            font_resources = resources.get("/Font")
+            fonts = {} if font_resources is None else font_resources.get_object()
+        except PdfQAFailure:
+            raise
+        except Exception as error:
+            raise PdfQAFailure(f"page {page_number} has invalid resources or streams: {error}") from error
+        for font_reference in fonts.values():
+            font = font_reference.get_object()
+            base = str(font.get("/BaseFont", ""))
+            if "NotoSansCJKKR-Regular" in base:
+                font_faces.add("Regular")
+            if "NotoSansCJKKR-Bold" in base:
+                font_faces.add("Bold")
+            if "NotoSansCJKKR" in base:
+                unicode_map = font.get("/ToUnicode")
+                if unicode_map is None or not unicode_map.get_object().get_data():
+                    raise PdfQAFailure(f"embedded Korean font {base} is missing /ToUnicode")
+                _require_embedded_font(font, base, validated_font_programs)
+        annotations = page.get("/Annots", [])
+        for reference in annotations:
+            annotation = reference.get_object()
+            if annotation.get("/Subtype") != "/Link":
+                continue
+            link_count += 1
+            rectangle = _annotation_rectangle(annotation.get("/Rect"))
+            action = annotation.get("/A")
+            destination = annotation.get("/Dest")
+            if action is not None:
+                action = action.get_object()
+                if action.get("/S") != "/URI" or not isinstance(action.get("/URI"), str):
+                    raise PdfQAFailure("external PDF link has an invalid URI action")
+                uri = str(action["/URI"])
+                try:
+                    assembly._safe_uri(uri, f"page-{page_number}")
+                except PdfAssemblyError as error:
+                    raise PdfQAFailure(str(error)) from error
+                link_annotations.append((page_number, rectangle, uri, None))
+            elif destination is None or not _valid_destination(reader, destination):
+                raise PdfQAFailure(
+                    "internal PDF link does not resolve to an output destination"
+                )
+            else:
+                link_annotations.append(
+                    (page_number, rectangle, None, destination)
+                )
+    if font_faces != {"Regular", "Bold"}:
+        missing = sorted({"Regular", "Bold"} - font_faces)
+        raise PdfQAFailure("missing embedded Korean font face: " + ", ".join(missing))
+    if any(item.page_number > len(reader.pages) for item in layout.flowables):
+        raise PdfQAFailure("layout refers to a nonexistent output page")
+    for item in layout.flowables:
+        page = reader.pages[item.page_number - 1]
+        page_box = page.mediabox
+        page_width = float(page_box.right) - float(page_box.left)
+        page_height = float(page_box.top) - float(page_box.bottom)
+        for name, box in (("frame", item.frame), ("bounds", item.bounds)):
+            x, y, width, height = box
+            if (
+                x < -1e-6
+                or y < -1e-6
+                or x + width > page_width + 1e-6
+                or y + height > page_height + 1e-6
+            ):
+                raise PdfQAFailure(
+                    f"layout {name} falls outside PDF page bounds for {item.block_id}"
+                )
+    layout_by_block: dict[str, list[Any]] = {}
+    for item in layout.flowables:
+        layout_by_block.setdefault(item.block_id, []).append(item)
+    structured_blocks = {
+        link.source_block_id
+        for link in layout.links
+        if link.reconstructed and link.source_block_id is not None
+    }
+    expected_links = [
+        (link.source_block_id, link.uri, link.destination)
+        for link in layout.links
+        if link.reconstructed and link.source_block_id is not None
+    ]
+    expected_links.extend(
+        (block.id, block.uri, block.destination)
+        for block in document.blocks
+        if block.id not in structured_blocks
+        and (block.uri is not None or block.destination is not None)
+    )
+    remaining_annotations = set(range(len(link_annotations)))
+    for source_block_id, expected_uri, expected_destination in expected_links:
+        assert source_block_id is not None
+        source_items = layout_by_block.get(source_block_id, [])
+        source_matches: list[int] = []
+        for index in sorted(remaining_annotations):
+            page_number, rectangle, _uri, _destination = link_annotations[index]
+            if any(
+                page_number == item.page_number
+                and _rectangle_intersects_bounds(rectangle, item.bounds)
+                for item in source_items
+            ):
+                source_matches.append(index)
+        if expected_uri is not None:
+            matches = [
+                index
+                for index in source_matches
+                if link_annotations[index][2] == expected_uri
+            ]
+            if not matches:
+                raise PdfQAFailure(
+                    "required external URI annotation is missing for block "
+                    f"{source_block_id}"
+                )
+        else:
+            assert expected_destination is not None
+            target_items = layout_by_block.get(expected_destination, [])
+            matches = [
+                index
+                for index in source_matches
+                if link_annotations[index][3] is not None
+                and target_items
+                and _destination_matches_layout(
+                    reader,
+                    link_annotations[index][3],
+                    target_items[0],
+                )
+            ]
+            if not matches:
+                if any(link_annotations[index][3] is not None for index in source_matches):
+                    raise PdfQAFailure(
+                        "internal PDF link does not resolve to its expected output "
+                        f"destination for block {source_block_id}"
+                    )
+                raise PdfQAFailure(
+                    f"required internal link annotation is missing for block {source_block_id}"
+                )
+        remaining_annotations.remove(matches[0])
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            block_text: dict[str, list[str]] = {}
+            for item in layout.flowables:
+                page = pdf.pages[item.page_number - 1]
+                x, y, width, height = item.bounds
+                crop = (
+                    max(0.0, x - 1.0),
+                    max(0.0, page.height - (y + height) - 1.0),
+                    min(page.width, x + width + 1.0),
+                    min(page.height, page.height - y + 1.0),
+                )
+                extracted = page.crop(crop, strict=False).extract_text(
+                    x_tolerance=3,
+                    y_tolerance=3,
+                )
+                block_text.setdefault(item.block_id, []).append(extracted or "")
+    except Exception as error:
+        raise PdfQAFailure(f"cannot extract selectable text from staged PDF: {error}") from error
+    if any(character in text for character in ("\ufffd", "\x00", "\u25a1")):
+        raise PdfQAFailure("rendered PDF contains glyph replacement boxes")
+    for block, segment, translated in normalized:
+        expected = _normalize_text(translated)
+        selected = _normalize_text("\n".join(block_text.get(block.id, [])))
+        if expected not in selected:
+            raise PdfQAFailure(
+                f"translated block is not selectable in the staged PDF: {segment.id}"
+            )
+        if _HANGUL.search(translated) and _HANGUL.search(selected) is None:
+            raise PdfQAFailure(f"translated Korean block is unreadable: {block.id}")
+    return {
+        "embedded_font_count": len(font_faces),
+        "link_count": link_count,
+        "page_count": len(reader.pages),
+        "page_sizes": tuple(page_sizes),
+    }
+
+
+def _require_embedded_font(
+    font: Mapping[str, Any],
+    base: str,
+    validated_programs: set[str],
+) -> None:
+    descendants = font.get("/DescendantFonts", [])
+    candidates = [item.get_object() for item in descendants] or [font]
+    for candidate in candidates:
+        descriptor = candidate.get("/FontDescriptor")
+        if descriptor is None:
+            continue
+        font_file = descriptor.get_object().get("/FontFile2")
+        if font_file is None:
+            continue
+        try:
+            payload = font_file.get_object().get_data()
+        except Exception as error:
+            raise PdfQAFailure(
+                f"embedded Korean font {base} has an unreadable font program"
+            ) from error
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest not in validated_programs:
+            _validate_true_type_program(payload, base)
+            validated_programs.add(digest)
+        return
+    raise PdfQAFailure(f"Korean font {base} is not embedded")
+
+
+def _validate_true_type_program(payload: bytes, base: str) -> None:
+    failure = f"embedded Korean font {base} has an invalid TrueType font program"
+    if len(payload) < 12 or payload[:4] != b"\x00\x01\x00\x00":
+        raise PdfQAFailure(failure)
+    table_count = struct.unpack_from(">H", payload, 4)[0]
+    if table_count == 0 or table_count > 4096 or len(payload) < 12 + 16 * table_count:
+        raise PdfQAFailure(failure)
+    tables: dict[bytes, tuple[int, int, int]] = {}
+    for index in range(table_count):
+        offset = 12 + index * 16
+        tag, checksum, table_offset, table_length = struct.unpack_from(
+            ">4sIII", payload, offset
+        )
+        if (
+            tag in tables
+            or table_length == 0
+            or table_offset < 12 + 16 * table_count
+            or table_offset + table_length > len(payload)
+        ):
+            raise PdfQAFailure(failure)
+        table_data = bytearray(payload[table_offset : table_offset + table_length])
+        if tag == b"head" and len(table_data) >= 12:
+            table_data[8:12] = b"\x00\x00\x00\x00"
+        table_data.extend(b"\x00" * (-len(table_data) % 4))
+        words = struct.unpack(f">{len(table_data) // 4}I", table_data)
+        if sum(words) & 0xFFFFFFFF != checksum:
+            raise PdfQAFailure(failure)
+        tables[tag] = (table_offset, table_length, checksum)
+    required = {b"cmap", b"glyf", b"head", b"loca", b"maxp", b"name"}
+    if not required.issubset(tables):
+        raise PdfQAFailure(failure)
+    head_offset, head_length, _head_checksum = tables[b"head"]
+    maxp_offset, maxp_length, _maxp_checksum = tables[b"maxp"]
+    cmap_offset, cmap_length, _cmap_checksum = tables[b"cmap"]
+    if (
+        head_length < 16
+        or payload[head_offset + 12 : head_offset + 16] != b"_\x0f<\xf5"
+        or maxp_length < 6
+        or struct.unpack_from(">H", payload, maxp_offset + 4)[0] == 0
+        or cmap_length < 4
+        or struct.unpack_from(">H", payload, cmap_offset)[0] != 0
+    ):
+        raise PdfQAFailure(failure)
+
+
+def _annotation_rectangle(value: object) -> tuple[float, float, float, float]:
+    if not isinstance(value, (ArrayObject, list)) or len(value) != 4:
+        raise PdfQAFailure("PDF link annotation has an invalid rectangle")
+    try:
+        left, bottom, right, top = (float(item) for item in value)
+    except (TypeError, ValueError) as error:
+        raise PdfQAFailure("PDF link annotation has an invalid rectangle") from error
+    if (
+        not all(math.isfinite(item) for item in (left, bottom, right, top))
+        or right <= left
+        or top <= bottom
+    ):
+        raise PdfQAFailure("PDF link annotation has an invalid rectangle")
+    return left, bottom, right, top
+
+
+def _rectangle_intersects_bounds(
+    rectangle: tuple[float, float, float, float],
+    bounds: tuple[float, float, float, float],
+) -> bool:
+    left, bottom, right, top = rectangle
+    x, y, width, height = bounds
+    return (
+        min(right, x + width) - max(left, x) > 1e-6
+        and min(top, y + height) - max(bottom, y) > 1e-6
+    )
+
+
+def _valid_destination(reader: PdfReader, destination: object) -> bool:
+    value = destination.get_object() if hasattr(destination, "get_object") else destination
+    if isinstance(value, str):
+        return value in reader.named_destinations
+    if isinstance(value, (ArrayObject, list)) and value:
+        try:
+            return reader.get_page_number(value[0].get_object()) >= 0
+        except Exception:
+            return False
+    return False
+
+
+def _destination_matches_layout(
+    reader: PdfReader,
+    destination: object,
+    target: Any,
+) -> bool:
+    value = destination.get_object() if hasattr(destination, "get_object") else destination
+    if isinstance(value, str):
+        value = reader.named_destinations.get(value)
+        if value is None:
+            return False
+    if hasattr(value, "dest_array"):
+        value = value.dest_array
+    if not isinstance(value, (ArrayObject, list)) or len(value) < 2:
+        return False
+    try:
+        page_number = reader.get_page_number(value[0].get_object()) + 1
+    except Exception:
+        return False
+    if page_number != target.page_number or str(value[1]) != "/XYZ":
+        return False
+    if len(value) < 4:
+        return False
+    try:
+        left = float(value[2])
+        top = float(value[3])
+    except (TypeError, ValueError):
+        return False
+    expected_left = target.bounds[0]
+    expected_top = target.bounds[1] + target.bounds[3]
+    return (
+        math.isfinite(left)
+        and math.isfinite(top)
+        and abs(left - expected_left) <= 1.0
+        and abs(top - expected_top) <= 1.0
+    )
+
+
+def _validate_rendered_pages(
+    pages: Sequence[Path],
+    page_count: int,
+    layout: PdfAssemblyLayout,
+    normalized: Sequence[tuple[Any, Segment, str]],
+    page_sizes: Sequence[tuple[float, float]],
+) -> None:
+    if [path.name for path in pages] != [
+        f"page-{number:03d}.png" for number in range(1, page_count + 1)
+    ]:
+        raise PdfQAFailure("rendered page names or coverage are not exact")
+    korean_block_ids = {
+        block.id for block, _segment, translated in normalized if _HANGUL.search(translated)
+    }
+    korean_flowables: dict[int, list[Any]] = {}
+    for item in layout.flowables:
+        if item.block_id in korean_block_ids:
+            korean_flowables.setdefault(item.page_number, []).append(item)
+    for page_number, path in enumerate(pages, start=1):
+        try:
+            with Image.open(path) as image:
+                image.load()
+                if image.width <= 0 or image.height <= 0:
+                    raise PdfQAFailure(f"rendered page {page_number} has invalid dimensions")
+                extrema = image.convert("L").getextrema()
+                if extrema == (255, 255):
+                    raise PdfQAFailure(f"unintended blank output page: {page_number}")
+                page_width, page_height = page_sizes[page_number - 1]
+                for item in korean_flowables.get(page_number, []):
+                    crop = _rendered_flowable_crop(
+                        image,
+                        item.bounds,
+                        page_width,
+                        page_height,
+                    )
+                    try:
+                        crop_extrema = crop.getextrema()
+                        if crop_extrema[1] - crop_extrema[0] < 24:
+                            raise PdfQAFailure(
+                                "rendered Korean block has no visible glyph evidence: "
+                                f"{item.block_id}"
+                            )
+                        if _looks_like_replacement_boxes(crop):
+                            raise PdfQAFailure(
+                                "rendered Korean block contains known tofu replacement boxes: "
+                                f"{item.block_id}"
+                            )
+                    finally:
+                        crop.close()
+        except PdfQAFailure:
+            raise
+        except (OSError, ValueError) as error:
+            raise PdfQAFailure(f"cannot inspect rendered page {page_number}: {error}") from error
+
+
+def _rendered_flowable_crop(
+    image: Image.Image,
+    bounds: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+) -> Image.Image:
+    x, y, width, height = bounds
+    scale_x = image.width / page_width
+    scale_y = image.height / page_height
+    left = max(0, math.floor((x - 1.0) * scale_x))
+    top = max(0, math.floor((page_height - y - height - 1.0) * scale_y))
+    right = min(image.width, math.ceil((x + width + 1.0) * scale_x))
+    bottom = min(image.height, math.ceil((page_height - y + 1.0) * scale_y))
+    if right <= left or bottom <= top:
+        raise PdfQAFailure("rendered Korean block has invalid raster bounds")
+    return image.crop((left, top, right, bottom)).convert("L")
+
+
+def _looks_like_replacement_boxes(image: Image.Image) -> bool:
+    width, height = image.size
+    pixels = list(image.tobytes())
+    background = Counter(pixels).most_common(1)[0][0]
+    mask = bytearray(abs(value - background) >= 48 for value in pixels)
+    visited = bytearray(width * height)
+    components: list[tuple[int, int, int, int, int, int]] = []
+    for start, ink in enumerate(mask):
+        if not ink or visited[start]:
+            continue
+        queue: deque[int] = deque([start])
+        visited[start] = 1
+        min_x = max_x = start % width
+        min_y = max_y = start // width
+        points: list[int] = []
+        while queue:
+            point = queue.popleft()
+            points.append(point)
+            point_x = point % width
+            point_y = point // width
+            min_x = min(min_x, point_x)
+            max_x = max(max_x, point_x)
+            min_y = min(min_y, point_y)
+            max_y = max(max_y, point_y)
+            for neighbor_y in range(max(0, point_y - 1), min(height, point_y + 2)):
+                for neighbor_x in range(max(0, point_x - 1), min(width, point_x + 2)):
+                    neighbor = neighbor_y * width + neighbor_x
+                    if mask[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        queue.append(neighbor)
+        component_width = max_x - min_x + 1
+        component_height = max_y - min_y + 1
+        if component_width < 5 or component_height < 5:
+            continue
+        border_pixels = sum(
+            point % width in {min_x, max_x}
+            or point // width in {min_y, max_y}
+            for point in points
+        )
+        perimeter = 2 * component_width + 2 * component_height - 4
+        components.append(
+            (
+                component_width,
+                component_height,
+                len(points),
+                border_pixels,
+                perimeter,
+                max(0, (component_width - 2) * (component_height - 2)),
+            )
+        )
+    boxes = [
+        component
+        for component in components
+        if component[3] / component[4] >= 0.75
+        and component[2] - component[3] <= max(2, round(component[5] * 0.1))
+    ]
+    if len(boxes) < 3 or len(boxes) != len(components):
+        return False
+    widths = [component[0] for component in boxes]
+    heights = [component[1] for component in boxes]
+    return max(widths) - min(widths) <= 1 and max(heights) - min(heights) <= 1
+
+
+def _validate_contact_coverage(mapping: Mapping[str, list[int]], page_count: int) -> None:
+    expected_names = [
+        f"contact-sheet-{number:03d}.png"
+        for number in range(1, math.ceil(page_count / 12) + 1)
+    ]
+    if list(mapping) != expected_names:
+        raise PdfQAFailure("contact-sheet names are not deterministic")
+    covered = [page for pages in mapping.values() for page in pages]
+    if covered != list(range(1, page_count + 1)) or any(len(pages) > 12 for pages in mapping.values()):
+        raise PdfQAFailure("contact sheets do not cover every page exactly once")
+
+
+def _move_prior_evidence_to_staging(
+    run_anchor: assembly._DirectoryAnchor,
+    staging_anchor: assembly._DirectoryAnchor,
+    prior: _PriorEvidence,
+) -> None:
+    _move_directory(
+        run_anchor,
+        "qa-pages",
+        prior.pages,
+        staging_anchor,
+        "prior-qa-pages",
+    )
+    prior.pages_moved = True
+    _move_file(
+        run_anchor,
+        "pdf-qa.json",
+        prior.record.identity,
+        staging_anchor,
+        "prior-pdf-qa.json",
+    )
+    prior.record_moved = True
+
+
+def _restore_prior_evidence(
+    run_anchor: assembly._DirectoryAnchor,
+    staging_anchor: assembly._DirectoryAnchor,
+    prior: _PriorEvidence,
+) -> None:
+    if prior.record_moved:
+        try:
+            assembly._require_anchored_name_absent(run_anchor, "pdf-qa.json")
+            _move_file(
+                staging_anchor,
+                "prior-pdf-qa.json",
+                prior.record.identity,
+                run_anchor,
+                "pdf-qa.json",
+            )
+            prior.record_moved = False
+        except (PdfAssemblyError, PdfQAFailure):
+            pass
+    if prior.pages_moved:
+        try:
+            assembly._require_anchored_name_absent(run_anchor, "qa-pages")
+            _move_directory(
+                staging_anchor,
+                "prior-qa-pages",
+                prior.pages,
+                run_anchor,
+                "qa-pages",
+            )
+            prior.pages_moved = False
+        except (PdfAssemblyError, PdfQAFailure):
+            pass
+
+
+def _discard_prior_evidence(
+    staging_anchor: assembly._DirectoryAnchor,
+    prior: _PriorEvidence,
+) -> None:
+    if prior.record_moved:
+        assembly._remove_owned_file(
+            staging_anchor,
+            "prior-pdf-qa.json",
+            assembly._PublishedFile(prior.record.identity),
+        )
+        prior.record_moved = False
+    if prior.pages_moved:
+        for name, item in prior.page_files.items():
+            assembly._remove_owned_file(
+                prior.pages, name, assembly._PublishedFile(item.identity)
+            )
+        assembly._remove_owned_directory(
+            staging_anchor,
+            "prior-qa-pages",
+            prior.pages.identity,
+            child=prior.pages,
+        )
+        prior.pages_moved = False
+
+
+def _move_file(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source_identity: tuple[int, int],
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+) -> None:
+    handle: int | None = None
+    try:
+        if source_parent.descriptor is not None and destination_parent.descriptor is not None:
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent.descriptor,
+                dst_dir_fd=destination_parent.descriptor,
+            )
+        elif os.name == "nt":
+            handle = assembly._windows_open_relative_file(
+                assembly._windows_anchor_handle(source_parent), source_name
+            )
+            if assembly._windows_file_identity(handle, require_regular=True) != source_identity:
+                raise PdfQAFailure("prior PDF QA record changed identity")
+            assembly._windows_rename_open_file(
+                handle,
+                assembly._windows_anchor_handle(destination_parent),
+                destination_name,
+            )
+        else:
+            raise PdfQAFailure("safe anchored PDF QA record move is unavailable")
+        assembly._verify_anchored_input_identity(
+            destination_parent, destination_name, source_identity
+        )
+    except FileExistsError as error:
+        raise PdfQAFailure(
+            f"PDF QA regeneration destination already exists: {destination_name}"
+        ) from error
+    except (NotImplementedError, OSError) as error:
+        raise PdfQAFailure(f"cannot move prior PDF QA record: {error}") from error
+    finally:
+        if handle is not None:
+            assembly.pdf_acquire_module._close_windows_handle(handle)
+
+
+def _move_directory(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+) -> None:
+    try:
+        if source_parent.descriptor is not None and destination_parent.descriptor is not None:
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent.descriptor,
+                dst_dir_fd=destination_parent.descriptor,
+            )
+        elif os.name == "nt":
+            assembly._windows_rename_open_file(
+                assembly._windows_anchor_handle(source),
+                assembly._windows_anchor_handle(destination_parent),
+                destination_name,
+            )
+        else:
+            raise PdfQAFailure("safe anchored PDF QA directory move is unavailable")
+        result = assembly._anchored_entry_stat(destination_parent, destination_name)
+        if (
+            not stat.S_ISDIR(result.st_mode)
+            or assembly._is_reparse_stat(result)
+            or (result.st_dev, result.st_ino) != source.identity
+        ):
+            raise PdfQAFailure("prior PDF QA directory changed identity")
+    except FileExistsError as error:
+        raise PdfQAFailure(
+            f"PDF QA regeneration destination already exists: {destination_name}"
+        ) from error
+    except (NotImplementedError, OSError) as error:
+        raise PdfQAFailure(f"cannot move prior PDF QA directory: {error}") from error
+
+
+def _publish_new_directory(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+) -> None:
+    try:
+        _require_anchored_directory_identity(
+            source_parent,
+            source_name,
+            source.identity,
+            "PDF QA publication source",
+        )
+        if source_parent.descriptor is not None and destination_parent.descriptor is not None:
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent.descriptor,
+                dst_dir_fd=destination_parent.descriptor,
+            )
+        elif os.name == "nt":
+            assembly._windows_rename_open_file(
+                assembly._windows_anchor_handle(source),
+                assembly._windows_anchor_handle(destination_parent),
+                destination_name,
+            )
+        else:
+            raise PdfQAFailure("safe anchored QA directory publication is unavailable")
+        try:
+            _require_anchored_directory_identity(
+                destination_parent,
+                destination_name,
+                source.identity,
+                "published PDF QA directory",
+            )
+        except PdfQAFailure:
+            _quarantine_raced_directory(
+                source_parent,
+                destination_parent,
+                destination_name,
+            )
+            raise
+        destination_parent.verify_visible()
+    except FileExistsError as error:
+        raise PdfQAFailure(f"PDF QA destination already exists: {destination_name}") from error
+    except (NotImplementedError, OSError) as error:
+        raise PdfQAFailure(f"cannot publish PDF QA directory: {error}") from error
+
+
+def _publish_qa_artifact_directory(
+    source_parent: assembly._DirectoryAnchor,
+    source_name: str,
+    source: assembly._DirectoryAnchor,
+    destination_parent: assembly._DirectoryAnchor,
+    destination_name: str,
+    artifacts: dict[str, assembly._OpenedFile],
+    expected_hashes: Mapping[str, str],
+    *,
+    release_descendant_handles: bool,
+) -> assembly._DirectoryAnchor:
+    """Publish rendered QA evidence without trusting the Windows close window."""
+    if not release_descendant_handles:
+        _publish_new_directory(
+            source_parent,
+            source_name,
+            source,
+            destination_parent,
+            destination_name,
+        )
+        published: assembly._DirectoryAnchor | None = None
+        try:
+            published = assembly._open_existing_child_directory(
+                destination_parent,
+                destination_name,
+                "published PDF QA pages",
+            )
+            if published.identity != source.identity:
+                raise PdfQAFailure(
+                    "rendered PDF QA artifacts changed directory identity during publication"
+                )
+            _verify_qa_artifact_snapshot(
+                published,
+                artifacts,
+                {name: item.identity for name, item in artifacts.items()},
+                expected_hashes,
+            )
+            return published
+        except BaseException:
+            if published is not None:
+                published.close()
+            raise
+
+    expected_names = sorted(expected_hashes)
+    if sorted(artifacts) != expected_names:
+        raise PdfQAFailure(
+            "rendered PDF QA artifacts do not exactly match the publication snapshot"
+        )
+    expected_identities = {
+        name: artifacts[name].identity for name in expected_names
+    }
+    _verify_qa_artifact_snapshot(
+        source,
+        artifacts,
+        expected_identities,
+        expected_hashes,
+    )
+    for item in artifacts.values():
+        assembly._close_opened_file(item)
+    _publish_new_directory(
+        source_parent,
+        source_name,
+        source,
+        destination_parent,
+        destination_name,
+    )
+
+    published: assembly._DirectoryAnchor | None = None
+    reopened: dict[str, assembly._OpenedFile] = {}
+    keep_published = False
+    try:
+        published = assembly._open_existing_child_directory(
+            destination_parent,
+            destination_name,
+            "published PDF QA pages",
+        )
+        if published.identity != source.identity:
+            raise PdfQAFailure(
+                "rendered PDF QA artifacts changed directory identity during publication"
+            )
+        for name in expected_names:
+            reopened[name] = assembly._open_anchored_input_file(
+                published,
+                name,
+                "published rendered PDF QA artifact",
+            )
+        _verify_qa_artifact_snapshot(
+            published,
+            reopened,
+            expected_identities,
+            expected_hashes,
+        )
+        artifacts.clear()
+        artifacts.update(reopened)
+        keep_published = True
+        return published
+    except PdfQAFailure:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise
+    except PdfAssemblyError as error:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise PdfQAFailure(
+            f"rendered PDF QA artifacts changed during publication: {error}"
+        ) from error
+    except BaseException:
+        for item in reopened.values():
+            assembly._close_opened_file(item)
+        raise
+    finally:
+        if published is not None and not keep_published:
+            published.close()
+
+
+def _verify_qa_artifact_snapshot(
+    directory: assembly._DirectoryAnchor,
+    artifacts: Mapping[str, assembly._OpenedFile],
+    expected_identities: Mapping[str, tuple[int, int]],
+    expected_hashes: Mapping[str, str],
+) -> None:
+    expected_names = sorted(expected_hashes)
+    try:
+        visible_names = _anchored_directory_names(directory)
+    except (OSError, PdfAssemblyError) as error:
+        raise PdfQAFailure(
+            f"cannot inspect rendered PDF QA artifacts: {error}"
+        ) from error
+    if visible_names != expected_names or sorted(artifacts) != expected_names:
+        raise PdfQAFailure(
+            "rendered PDF QA artifacts do not exactly match the publication snapshot"
+        )
+    try:
+        assembly._verify_anchored_evidence(directory, artifacts)
+        for name in expected_names:
+            item = artifacts[name]
+            if item.identity != expected_identities[name]:
+                raise PdfQAFailure(
+                    f"rendered PDF QA artifacts changed identity: {name}"
+                )
+            payload = assembly._read_opened_bytes(
+                item,
+                directory.path / name,
+                "rendered PDF QA publication artifact",
+            )
+            if hashlib.sha256(payload).hexdigest() != expected_hashes[name]:
+                raise PdfQAFailure(
+                    f"rendered PDF QA artifacts changed content: {name}"
+                )
+        assembly._verify_anchored_evidence(directory, artifacts)
+    except PdfQAFailure:
+        raise
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(
+            f"rendered PDF QA artifacts changed during publication: {error}"
+        ) from error
+
+
+def _anchored_directory_names(
+    directory: assembly._DirectoryAnchor,
+) -> list[str]:
+    try:
+        if directory.descriptor is not None:
+            return sorted(os.listdir(directory.descriptor))
+        if assembly._IS_WINDOWS:
+            return sorted(
+                _windows_directory_names(
+                    assembly._windows_anchor_handle(directory)
+                )
+            )
+        raise PdfAssemblyError(
+            f"safe anchored directory enumeration is unavailable: {directory.path}"
+        )
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate anchored directory {directory.path}: {error}"
+        ) from error
+
+
+def _windows_directory_names(directory_handle: int) -> list[str]:
+    if not assembly._IS_WINDOWS:
+        raise PdfAssemblyError("Windows anchored directory enumeration is unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("status_or_pointer", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            )
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        query_directory = ntdll.NtQueryDirectoryFile
+        query_directory.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            ctypes.POINTER(IoStatusBlock),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int32,
+            wintypes.BOOLEAN,
+            wintypes.LPVOID,
+            wintypes.BOOLEAN,
+        )
+        query_directory.restype = ctypes.c_int32
+        to_dos_error = ntdll.RtlNtStatusToDosError
+        to_dos_error.argtypes = (ctypes.c_int32,)
+        to_dos_error.restype = wintypes.ULONG
+
+        names: list[str] = []
+        restart_scan = True
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            status_block = IoStatusBlock()
+            status = int(
+                query_directory(
+                    wintypes.HANDLE(directory_handle),
+                    wintypes.HANDLE(),
+                    None,
+                    None,
+                    ctypes.byref(status_block),
+                    buffer,
+                    len(buffer),
+                    12,  # FileNamesInformation
+                    False,
+                    None,
+                    restart_scan,
+                )
+            )
+            status_value = ctypes.c_uint32(status).value
+            if status_value == 0x80000006:  # STATUS_NO_MORE_FILES
+                break
+            if status < 0:
+                raise ctypes.WinError(int(to_dos_error(status)))
+
+            used = int(status_block.information)
+            offset = 0
+            while offset < used:
+                if used - offset < 12:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned a truncated record"
+                    )
+                next_offset = int.from_bytes(
+                    buffer.raw[offset : offset + 4],
+                    "little",
+                )
+                name_length = int.from_bytes(
+                    buffer.raw[offset + 8 : offset + 12],
+                    "little",
+                )
+                name_start = offset + 12
+                name_end = name_start + name_length
+                if name_length % 2 or name_end > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid name"
+                    )
+                name = buffer.raw[name_start:name_end].decode("utf-16-le")
+                if name not in {".", ".."}:
+                    names.append(name)
+                if next_offset == 0:
+                    break
+                if next_offset < 12 or offset + next_offset > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid offset"
+                    )
+                offset += next_offset
+            restart_scan = False
+        return names
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate Windows anchored directory: {error}"
+        ) from error
+
+
+def _require_anchored_directory_identity(
+    parent: assembly._DirectoryAnchor,
+    name: str,
+    expected: tuple[int, int],
+    context: str,
+) -> None:
+    try:
+        result = assembly._anchored_entry_stat(parent, name)
+    except PdfAssemblyError as error:
+        raise PdfQAFailure(f"{context} changed identity") from error
+    if (
+        not stat.S_ISDIR(result.st_mode)
+        or assembly._is_reparse_stat(result)
+        or (result.st_dev, result.st_ino) != expected
+    ):
+        raise PdfQAFailure(f"{context} changed identity")
+
+
+def _quarantine_raced_directory(
+    staging_parent: assembly._DirectoryAnchor,
+    public_parent: assembly._DirectoryAnchor,
+    public_name: str,
+) -> None:
+    quarantine_name = f".pdf-qa-raced-{os.urandom(16).hex()}"
+    raced_anchor: assembly._DirectoryAnchor | None = None
+    try:
+        if staging_parent.descriptor is not None and public_parent.descriptor is not None:
+            os.rename(
+                public_name,
+                quarantine_name,
+                src_dir_fd=public_parent.descriptor,
+                dst_dir_fd=staging_parent.descriptor,
+            )
+        elif os.name == "nt":
+            raced_anchor = assembly._open_existing_child_directory(
+                public_parent,
+                public_name,
+                "raced published PDF QA directory",
+            )
+            assembly._windows_rename_open_file(
+                assembly._windows_anchor_handle(raced_anchor),
+                assembly._windows_anchor_handle(staging_parent),
+                quarantine_name,
+            )
+    except (PdfAssemblyError, NotImplementedError, OSError):
+        return
+    finally:
+        if raced_anchor is not None:
+            raced_anchor.close()
+
+
+def _remove_qa_pages(
+    run_anchor: assembly._DirectoryAnchor,
+    name: str,
+    pages_anchor: assembly._DirectoryAnchor | None,
+    *,
+    quarantine_parent: assembly._DirectoryAnchor | None,
+) -> None:
+    if pages_anchor is None:
+        return
+    try:
+        if run_anchor.descriptor is not None:
+            if quarantine_parent is None or quarantine_parent.descriptor is None:
+                return
+            quarantine_name = f".pdf-qa-raced-{os.urandom(16).hex()}"
+            os.rename(
+                name,
+                quarantine_name,
+                src_dir_fd=run_anchor.descriptor,
+                dst_dir_fd=quarantine_parent.descriptor,
+            )
+            _require_anchored_directory_identity(
+                quarantine_parent,
+                quarantine_name,
+                pages_anchor.identity,
+                "privately moved failed PDF QA render directory",
+            )
+            try:
+                os.rmdir(quarantine_name, dir_fd=quarantine_parent.descriptor)
+            except OSError:
+                pass
+            return
+        if os.name != "nt":
+            return
+        _require_anchored_directory_identity(
+            run_anchor,
+            name,
+            pages_anchor.identity,
+            "failed PDF QA render directory",
+        )
+        try:
+            assembly._windows_delete_open_file(
+                assembly._windows_anchor_handle(pages_anchor)
+            )
+        except (OSError, PdfAssemblyError):
+            pass
+        try:
+            _require_anchored_directory_identity(
+                run_anchor,
+                name,
+                pages_anchor.identity,
+                "failed PDF QA render directory",
+            )
+        except (PdfAssemblyError, PdfQAFailure):
+            return
+        if quarantine_parent is not None:
+            _move_directory(
+                run_anchor,
+                name,
+                pages_anchor,
+                quarantine_parent,
+                f".pdf-qa-raced-{os.urandom(16).hex()}",
+            )
+    except (OSError, PdfAssemblyError, PdfQAFailure):
+        return
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _qa_hash(value: object, context: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise PdfQAFailure(f"pdf-qa {context} must be lowercase SHA-256")
+    return value
+
+
+def _qa_hash_mapping(
+    value: object,
+    name_pattern: re.Pattern[str],
+    context: str,
+) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise PdfQAFailure(f"pdf-qa {context} must be an object")
+    result: dict[str, str] = {}
+    for name, digest in value.items():
+        if not isinstance(name, str) or name_pattern.fullmatch(name) is None:
+            raise PdfQAFailure(f"pdf-qa {context} has an invalid artifact name")
+        result[name] = _qa_hash(digest, f"{context}[{name!r}]")
+    if list(result) != sorted(result):
+        raise PdfQAFailure(f"pdf-qa {context} must be sorted")
+    return result
+
+
+__all__ = ["PdfQAFailure", "PdfQAFinding", "PdfQAResult", "prepare_pdf_qa"]

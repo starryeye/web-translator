@@ -1,0 +1,5 @@
+*.pdf binary
+src/web_translator/font_assets/OFL.txt -text
+tests/fixtures/pdf/**/*.json text eol=lf
+tests/fixtures/pdf/**/*.jsonl text eol=lf
+tests/fixtures/pdf/**/*.txt text eol=lf
