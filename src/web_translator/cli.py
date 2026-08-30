@@ -594,7 +594,13 @@ def _pdf_assemble_command(args: argparse.Namespace) -> None:
                     "semantic review has unresolved required findings: "
                     + ", ".join(review.unresolved_required)
                 )
-            assemble_pdf(args.run_dir, translations, glossary, args.output_dir)
+            assemble_pdf(
+                args.run_dir,
+                translations,
+                glossary,
+                args.output_dir,
+                semantic_snapshot=snapshot,
+            )
             snapshot.verify()
     except PdfSemanticReviewError as error:
         raise PdfAssemblyError(str(error)) from error

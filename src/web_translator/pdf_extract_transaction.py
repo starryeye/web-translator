@@ -155,7 +155,7 @@ def extract_pdf_transaction(
             raise PdfExtractionError(
                 f"PDF extraction destination already exists: {run_dir / 'media'}"
             ) from error
-        for name in media_names:
+        for index, name in enumerate(media_names):
             try:
                 published_media_files[name] = anchored._publish_new_file(
                     staged_media_anchor,
@@ -168,6 +168,31 @@ def extract_pdf_transaction(
                     f"PDF extraction media destination already exists: "
                     f"{run_dir / 'media' / name}"
                 ) from error
+            # POSIX publication creates a no-clobber hard link while Windows
+            # moves the held source handle.  Remove only the exact owned
+            # private link so both platforms expose the same residual-set
+            # contract before accepting the transaction.
+            anchored._remove_owned_file(
+                staged_media_anchor,
+                name,
+                anchored._PublishedFile(staged_media_files[name].identity),
+            )
+            remaining_names = media_names[index + 1 :]
+            if (
+                anchored._anchored_directory_names(staged_media_anchor)
+                != remaining_names
+            ):
+                raise PdfExtractionError(
+                    "private staged PDF media has an unexpected residual child set: "
+                    f"{staged_media_anchor.path}"
+                )
+            anchored._verify_anchored_evidence(
+                staged_media_anchor,
+                {
+                    remaining: staged_media_files[remaining]
+                    for remaining in remaining_names
+                },
+            )
 
         run_anchor.verify_visible()
         anchored._verify_anchored_evidence(run_anchor, source_files)
@@ -183,6 +208,11 @@ def extract_pdf_transaction(
         if anchored._anchored_directory_names(published_media_anchor) != media_names:
             raise PdfExtractionError(
                 "published PDF media child set does not exactly match held artifacts"
+            )
+        if anchored._anchored_directory_names(staged_media_anchor) != []:
+            raise PdfExtractionError(
+                "private staged PDF media has unexpected residual evidence: "
+                f"{staged_media_anchor.path}"
             )
         completed = True
     except PdfExtractionError:

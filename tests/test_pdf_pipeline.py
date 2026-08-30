@@ -680,6 +680,51 @@ def test_windows_finalize_durably_publishes_exact_reviewed_output(
     assert not (prepared_pdf_run.run_dir / "staged-output").exists()
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="requires real Windows held report handles and delete disposition",
+)
+def test_windows_finalize_failure_cleanup_preserves_error_and_retries_immediately(
+    prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real native cleanup removes only owned reports and leaves a retryable stage."""
+    real_write = pdf_report_module.write_pdf_review_report
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected Windows report failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_report_module, "write_pdf_review_report", fail_once)
+
+    with pytest.raises(PdfQAFailure, match="injected Windows report failure"):
+        finalize_pdf_output(
+            prepared_pdf_run.run_dir,
+            prepared_pdf_run.output_dir,
+        )
+
+    staging = prepared_pdf_run.run_dir / "staged-output"
+    assert sorted(path.name for path in staging.iterdir()) == ["translated.pdf"]
+    assert not prepared_pdf_run.output_dir.exists()
+
+    finalized = finalize_pdf_output(
+        prepared_pdf_run.run_dir,
+        prepared_pdf_run.output_dir,
+    )
+
+    assert finalized == prepared_pdf_run.output_dir
+    assert sorted(path.name for path in finalized.iterdir()) == [
+        "manifest.json",
+        "review-report.md",
+        "translated.pdf",
+    ]
+    assert calls == 2
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
 def test_fsync_final_files_uses_anchored_read_descriptors(
     tmp_path: Path,

@@ -195,6 +195,8 @@ def assemble_pdf(
     translations: Mapping[str, Translation],
     glossary: Mapping[str, str],
     output_dir: Path,
+    *,
+    semantic_snapshot: Any | None = None,
 ) -> Path:
     """Create only ``run_dir/staged-output/translated.pdf`` and strict layout evidence."""
     run_dir = Path(run_dir)
@@ -216,11 +218,13 @@ def assemble_pdf(
     try:
         run_anchor = _open_directory_anchor(run_dir, "run")
         _validate_destinations(run_anchor, output_dir)
-        for name, context in (
+        evidence_names = [
             ("document.json", "PDF document"),
             ("source.json", "PDF source record"),
-            ("segments.jsonl", "PDF segment manifest"),
-        ):
+        ]
+        if semantic_snapshot is None:
+            evidence_names.append(("segments.jsonl", "PDF segment manifest"))
+        for name, context in evidence_names:
             evidence_files[name] = _open_anchored_input_file(
                 run_anchor,
                 name,
@@ -237,15 +241,35 @@ def assemble_pdf(
         )
         if source.sha256 != document.source_sha256:
             raise PdfAssemblyError("source.json SHA-256 does not match document.json")
-        segments = _read_pdf_segments(
-            evidence_files["segments.jsonl"],
-            run_dir / "segments.jsonl",
-        )
+        if semantic_snapshot is None:
+            segments = _read_pdf_segments(
+                evidence_files["segments.jsonl"],
+                run_dir / "segments.jsonl",
+            )
+            consumed_translations = translations
+            consumed_glossary = glossary
+        else:
+            (
+                segments,
+                consumed_translations,
+                consumed_glossary,
+            ) = _semantic_snapshot_assembly_values(
+                semantic_snapshot,
+                run_anchor,
+            )
+            if dict(translations) != consumed_translations:
+                raise PdfAssemblyError(
+                    "held PDF translations disagree with assembly arguments"
+                )
+            if dict(glossary) != consumed_glossary:
+                raise PdfAssemblyError(
+                    "held PDF glossary disagrees with assembly arguments"
+                )
         ordered = _normalize_pdf_translations(
             document,
             segments,
-            translations,
-            glossary,
+            consumed_translations,
+            consumed_glossary,
         )
         document = replace(
             document,
@@ -339,6 +363,8 @@ def assemble_pdf(
         temporary_anchor.verify_visible()
 
         _verify_anchored_evidence(run_anchor, evidence_files)
+        if semantic_snapshot is not None:
+            _verify_semantic_snapshot(semantic_snapshot, run_anchor)
         staging_anchor = _create_child_directory(
             run_anchor,
             "staged-output",
@@ -475,6 +501,78 @@ def _read_pdf_segments(opened: _OpenedFile, path: Path) -> list[Segment]:
         return read_segments_stream(io.StringIO(text))
     except (OSError, UnicodeError, SegmentContractError, ValueError) as error:
         raise PdfAssemblyError(f"cannot read PDF segment manifest {path}: {error}") from error
+
+
+def _semantic_snapshot_assembly_values(
+    snapshot: Any,
+    run_anchor: _DirectoryAnchor,
+) -> tuple[list[Segment], dict[str, Translation], dict[str, str]]:
+    """Parse assembly inputs only from the already-held reviewed byte snapshot."""
+    _verify_semantic_snapshot(snapshot, run_anchor)
+    try:
+        payloads = snapshot.payloads
+        segments_payload = payloads["segments.jsonl"]
+        glossary_payload = payloads["glossary.json"]
+        if not isinstance(segments_payload, bytes) or not isinstance(
+            glossary_payload, bytes
+        ):
+            raise TypeError("held semantic payloads must be bytes")
+        segments = read_segments_stream(
+            io.StringIO(segments_payload.decode("utf-8"))
+        )
+        glossary_value = json.loads(glossary_payload.decode("utf-8"))
+        if not isinstance(glossary_value, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in glossary_value.items()
+        ):
+            raise PdfAssemblyError("held PDF glossary must map strings to strings")
+        translations: dict[str, Translation] = {}
+        for relative, payload in sorted(payloads.items()):
+            if not relative.startswith("translations/"):
+                continue
+            if not isinstance(payload, bytes):
+                raise TypeError("held semantic payloads must be bytes")
+            for line_number, line in enumerate(
+                payload.decode("utf-8").splitlines(), start=1
+            ):
+                if not line.strip():
+                    continue
+                record = Translation.from_dict(json.loads(line))
+                if record.segment_id in translations:
+                    raise PdfAssemblyError(
+                        f"duplicate held PDF translation ID: {record.segment_id}"
+                    )
+                translations[record.segment_id] = record
+        return segments, translations, dict(glossary_value)
+    except PdfAssemblyError:
+        raise
+    except (
+        AttributeError,
+        KeyError,
+        UnicodeError,
+        json.JSONDecodeError,
+        SegmentContractError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise PdfAssemblyError(f"invalid held PDF semantic inputs: {error}") from error
+
+
+def _verify_semantic_snapshot(
+    snapshot: Any,
+    run_anchor: _DirectoryAnchor,
+) -> None:
+    try:
+        snapshot_anchor = snapshot.run_anchor
+        if snapshot_anchor.identity != run_anchor.identity:
+            raise PdfAssemblyError(
+                "held PDF semantic snapshot belongs to a different run directory"
+            )
+        snapshot.verify()
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise PdfAssemblyError(f"invalid held PDF semantic inputs: {error}") from error
 
 
 def _read_opened_utf8(
@@ -2879,6 +2977,7 @@ def _windows_nt_create_relative(
         raise PdfAssemblyError("Windows anchored relative open is unavailable")
     handle_value: int | None = None
     output_handle: object | None = None
+    succeeded = False
     try:
         import ctypes
         from ctypes import wintypes
@@ -2971,6 +3070,7 @@ def _windows_nt_create_relative(
         if output_handle.value is None:
             raise PdfAssemblyError("Windows anchored relative open returned no handle")
         handle_value = int(output_handle.value)
+        succeeded = True
         return handle_value
     except PdfAssemblyError:
         raise
@@ -2983,7 +3083,7 @@ def _windows_nt_create_relative(
             f"safe Windows anchored relative open unavailable for {name}: {error}"
         ) from error
     finally:
-        if sys.exc_info()[0] is not None:
+        if not succeeded:
             candidate = handle_value
             if candidate is None and output_handle is not None:
                 raw_candidate = getattr(output_handle, "value", None)

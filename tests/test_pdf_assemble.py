@@ -1896,6 +1896,59 @@ def test_windows_nt_create_passes_relative_root_name_and_create_contract(
     }
 
 
+def test_windows_nt_relative_open_survives_caller_exception_unwinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful child handle belongs to the caller, not ambient exception state."""
+    import ctypes
+
+    closed: list[int] = []
+
+    class FakeCall:
+        def __init__(self, operation: object) -> None:
+            self.operation = operation
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+
+        def __call__(self, *args: object) -> object:
+            return self.operation(*args)  # type: ignore[operator]
+
+    def successful_create(output_handle: object, *_args: object) -> int:
+        output_handle._obj.value = 606  # type: ignore[attr-defined]
+        return 0
+
+    class FakeNtdll:
+        NtCreateFile = FakeCall(successful_create)
+
+    monkeypatch.setattr(pdf_assemble_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeNtdll(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pdf_assemble_module.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    try:
+        raise RuntimeError("caller's original failure")
+    except RuntimeError:
+        handle = pdf_assemble_module._windows_nt_create_relative(
+            41,
+            "manifest.json",
+            desired_access=0x00100080,
+            create_disposition=1,
+            create_options=0x00200060,
+            file_attributes=0,
+        )
+
+    assert handle == 606
+    assert closed == []
+
+
 def test_windows_nt_relative_open_preserves_missing_entry_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import web_translator.cli as cli_module
+import web_translator.pdf_assemble as pdf_assemble_module
 from web_translator.cli import (
     CLIContractError,
     _build_manifest_provenance,
@@ -210,6 +211,93 @@ def test_pdf_assemble_cli_requires_review_and_stages_without_publishing(
         "command": "pdf-assemble",
         "exit_code": 0,
         "status": "ok",
+    }
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX rename proves a held-review/path swap without invalid Windows injection",
+)
+def test_pdf_assemble_cli_rejects_segments_swap_restore_before_publication(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, final_output = _pdf_cli_paths(tmp_path)
+    _write_pdf_assembly_cli_run(run_dir)
+    segments_path = run_dir / "segments.jsonl"
+    held_path = run_dir / "held-reviewed-segments.jsonl"
+    original = segments_path.read_bytes()
+    raced_record = json.loads(original.decode("utf-8"))
+    raced_record["source_text"] = "Raced source body consumed by assembly"
+    raced = (json.dumps(raced_record, ensure_ascii=False) + "\n").encode("utf-8")
+    real_assemble = cli_module.assemble_pdf
+    real_normalize = pdf_assemble_module._normalize_pdf_translations
+    consumed_source_texts: list[str] = []
+
+    def capture_normalization(
+        document: object,
+        segments: object,
+        translations: object,
+        glossary: object,
+    ) -> object:
+        consumed_source_texts.extend(
+            segment.source_text for segment in segments  # type: ignore[union-attr]
+        )
+        return real_normalize(
+            document, segments, translations, glossary  # type: ignore[arg-type]
+        )
+
+    def swap_restore_around_assembly(
+        run: Path,
+        translations: object,
+        glossary: object,
+        output: Path,
+        *,
+        semantic_snapshot: object | None = None,
+    ) -> Path:
+        segments_path.rename(held_path)
+        segments_path.write_bytes(raced)
+        try:
+            if semantic_snapshot is None:
+                return real_assemble(
+                    run,
+                    translations,  # type: ignore[arg-type]
+                    glossary,  # type: ignore[arg-type]
+                    output,
+                )
+            return real_assemble(
+                run,
+                translations,  # type: ignore[arg-type]
+                glossary,  # type: ignore[arg-type]
+                output,
+                semantic_snapshot=semantic_snapshot,
+            )
+        finally:
+            segments_path.unlink(missing_ok=True)
+            held_path.rename(segments_path)
+
+    monkeypatch.setattr(
+        pdf_assemble_module,
+        "_normalize_pdf_translations",
+        capture_normalization,
+    )
+    monkeypatch.setattr(cli_module, "assemble_pdf", swap_restore_around_assembly)
+
+    exit_code = main(
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
+    )
+
+    assert exit_code == cli_module.EXIT_ASSEMBLY_FAILURE, (
+        f"assembly consumed swapped segments: {consumed_source_texts}"
+    )
+    assert segments_path.read_bytes() == original
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "pdf-assemble",
+        "exit_code": cli_module.EXIT_ASSEMBLY_FAILURE,
+        "status": "error",
     }
 
 

@@ -193,3 +193,112 @@ def test_pdf_extract_transaction_rejects_raced_extra_published_media_child(
     assert not (run_dir / "media" / "figure-0001.png").exists()
     assert not (run_dir / "document.json").exists()
     assert not (run_dir / "segments.jsonl").exists()
+
+
+def test_pdf_extract_transaction_rejects_late_private_media_child_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+    real_publish = transaction_module.anchored._publish_new_file
+    injected = False
+
+    def publish_then_race_private(*args: object, **kwargs: object) -> object:
+        nonlocal injected
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        source = args[0]
+        destination = args[2]
+        if (
+            not injected
+            and getattr(source, "path", None).name == "media"
+            and getattr(destination, "path", None) == run_dir / "media"
+        ):
+            (source.path / "foreign.txt").write_bytes(  # type: ignore[union-attr]
+                b"late private media racer"
+            )
+            injected = True
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_race_private,
+    )
+
+    with pytest.raises(PdfExtractionError, match="private.*media|media.*residual"):
+        extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    residuals = list(run_dir.glob(".pdf-extracting-*"))
+    assert injected
+    assert len(residuals) == 1
+    assert (residuals[0] / "media" / "foreign.txt").read_bytes() == (
+        b"late private media racer"
+    )
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+    assert not (run_dir / "media").exists()
+
+    monkeypatch.setattr(transaction_module.anchored, "_publish_new_file", real_publish)
+    extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert (run_dir / "document.json").is_file()
+    assert (run_dir / "segments.jsonl").is_file()
+    assert (run_dir / "media" / "figure-0001.png").read_bytes() == b"staged figure"
+    assert (residuals[0] / "media" / "foreign.txt").read_bytes() == (
+        b"late private media racer"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a real POSIX held-name replacement")
+def test_pdf_extract_transaction_rejects_late_private_media_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+
+    def write_two_media(
+        source: Path,
+        document: Path,
+        segments: Path,
+        media: Path,
+    ) -> None:
+        _write_staged_outputs(source, document, segments, media)
+        (media / "figure-0002.png").write_bytes(b"second owned figure")
+
+    real_publish = transaction_module.anchored._publish_new_file
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(b"foreign same-name replacement")
+
+    def publish_then_replace_remaining(*args: object, **kwargs: object) -> object:
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        source = args[0]
+        destination = args[2]
+        if (
+            getattr(source, "path", None).name == "media"
+            and getattr(destination, "path", None) == run_dir / "media"
+            and args[1] == "figure-0001.png"
+        ):
+            os.replace(replacement, source.path / "figure-0002.png")  # type: ignore[union-attr]
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_replace_remaining,
+    )
+
+    with pytest.raises(PdfExtractionError, match="changed identity"):
+        extract_pdf_transaction(run_dir, extractor=write_two_media)
+
+    residuals = list(run_dir.glob(".pdf-extracting-*"))
+    assert len(residuals) == 1
+    assert (residuals[0] / "media" / "figure-0002.png").read_bytes() == (
+        b"foreign same-name replacement"
+    )
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()
+    assert not (run_dir / "media").exists()
