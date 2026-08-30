@@ -5,10 +5,12 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from collections.abc import Iterator
 
 import httpx
 
@@ -58,6 +60,119 @@ def create_pdf_run_paths(workspace: Path, source_label: str, now: datetime) -> R
     return _allocate_run_paths(
         Path(workspace), base_run_id, Path("translated-pdfs")
     )
+
+
+def lexical_workspace() -> Path:
+    """Return the shell's lexical cwd only after rejecting link/reparse evidence."""
+    raw = os.environ.get("PWD") if os.name != "nt" else None
+    workspace = Path(raw) if raw else Path.cwd()
+    if not workspace.is_absolute():
+        raise ValueError("workspace cwd must be an absolute lexical path")
+    import web_translator.pdf_assemble as anchored
+
+    try:
+        handle = anchored._open_directory_anchor(workspace, "workspace")
+        try:
+            current = os.stat(".")
+            if handle.identity != (current.st_dev, current.st_ino):
+                raise ValueError("lexical workspace does not identify the current directory")
+        finally:
+            handle.close()
+    except anchored.PdfAssemblyError as error:
+        raise ValueError(f"workspace cwd is a link or reparse point: {error}") from error
+    return workspace
+
+
+@dataclass(slots=True)
+class HeldAllocatedRunPaths:
+    workspace: object
+    control: object
+    runs: object
+    run: object
+    outputs: object
+    output_name: str
+
+    def verify(self) -> None:
+        import web_translator.pdf_assemble as anchored
+
+        try:
+            self.workspace.verify_visible()
+            self.control.verify_visible()
+            self.runs.verify_visible()
+            self.run.verify_visible()
+            self.outputs.verify_visible()
+        except anchored.PdfAssemblyError as error:
+            raise ValueError(f"workspace or allocated roots changed identity: {error}") from error
+
+
+@contextmanager
+def hold_allocated_run_paths(
+    workspace: Path,
+    work_dir: Path,
+    output_dir: Path,
+    *,
+    output_root: str,
+) -> Iterator[HeldAllocatedRunPaths]:
+    """Prove and retain one exact allocator run/output relationship."""
+    workspace = Path(os.path.abspath(os.fspath(workspace)))
+    work_dir = Path(os.path.abspath(os.fspath(work_dir)))
+    output_dir = Path(os.path.abspath(os.fspath(output_dir)))
+    expected_run_root = workspace / ".web-translator" / "runs"
+    expected_output_root = workspace / output_root
+    if (
+        work_dir.parent != expected_run_root
+        or output_dir.parent != expected_output_root
+    ):
+        raise ValueError("allocated paths are not exact children of intended roots")
+    if work_dir.name != output_dir.name:
+        raise ValueError("allocated work and output paths must use the same run ID")
+    import web_translator.pdf_assemble as anchored
+
+    workspace_anchor = control_anchor = runs_anchor = run_anchor = outputs_anchor = None
+    yield_started = False
+    try:
+        workspace_anchor = anchored._open_directory_anchor(workspace, "workspace")
+        control_anchor = anchored._open_existing_child_directory(
+            workspace_anchor, ".web-translator", "run control"
+        )
+        runs_anchor = anchored._open_existing_child_directory(
+            control_anchor, "runs", "run root"
+        )
+        run_anchor = anchored._open_existing_child_directory(
+            runs_anchor, work_dir.name, "run"
+        )
+        outputs_anchor = anchored._open_existing_child_directory(
+            workspace_anchor, output_root, "output root"
+        )
+        contract = HeldAllocatedRunPaths(
+            workspace_anchor,
+            control_anchor,
+            runs_anchor,
+            run_anchor,
+            outputs_anchor,
+            output_dir.name,
+        )
+        contract.verify()
+        yield_started = True
+        yield contract
+    except ValueError:
+        if yield_started:
+            raise
+        raise
+    except anchored.PdfAssemblyError as error:
+        if yield_started:
+            raise
+        raise ValueError(f"cannot hold exact allocated run paths: {error}") from error
+    finally:
+        for anchor in (
+            outputs_anchor,
+            run_anchor,
+            runs_anchor,
+            control_anchor,
+            workspace_anchor,
+        ):
+            if anchor is not None:
+                anchor.close()
 
 
 def _allocate_run_paths(workspace: Path, base_run_id: str, output_root: Path) -> RunPaths:

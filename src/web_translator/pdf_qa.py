@@ -23,7 +23,12 @@ from pypdf import PdfReader
 from pypdf.generic import ArrayObject
 
 import web_translator.pdf_assemble as assembly
-from web_translator.models import Segment, Translation, read_segments_stream
+from web_translator.models import (
+    Segment,
+    SegmentContractError,
+    Translation,
+    read_segments_stream,
+)
 from web_translator.pdf_flowables import PdfAssemblyError, PdfAssemblyLayout
 from web_translator.pdf_media import (
     PdfMediaError,
@@ -37,8 +42,11 @@ from web_translator.pdf_models import (
     PdfSourceRecord,
 )
 from web_translator.pdf_review import (
+    PdfSemanticInputSnapshot,
     PdfSemanticReviewError,
+    hold_pdf_semantic_inputs,
     validate_pdf_semantic_review,
+    validate_pdf_semantic_review_snapshot,
 )
 
 
@@ -252,21 +260,23 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     run_anchor: assembly._DirectoryAnchor | None = None
     staged_anchor: assembly._DirectoryAnchor | None = None
-    zone_anchor: assembly._DirectoryAnchor | None = None
     output_parent_anchor: assembly._DirectoryAnchor | None = None
     opened: dict[str, assembly._OpenedFile] = {}
-    zone_opened: dict[str, assembly._OpenedFile] = {}
     final_files: dict[str, assembly._OpenedFile] = {}
     staged_pdf: assembly._OpenedFile | None = None
     completed = False
     publication_rolled_back = False
+    semantic_context: Any | None = None
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None
     try:
         run_anchor = assembly._open_directory_anchor(run_dir, "run")
+        semantic_context = hold_pdf_semantic_inputs(run_anchor)
+        semantic_snapshot = semantic_context.__enter__()
         _validate_locations(run_anchor, output_dir)
         staged_anchor = assembly._open_existing_child_directory(
             run_anchor, "staged-output", "staged PDF output"
         )
-        names = sorted(path.name for path in staged_anchor.current_path().iterdir())
+        names = assembly._anchored_directory_names(staged_anchor)
         if names != ["translated.pdf"]:
             raise PdfQAFailure(
                 "staged PDF output must contain exactly translated.pdf before finalization"
@@ -301,28 +311,10 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             name: hashlib.sha256(payload).hexdigest()
             for name, payload in snapshot_bytes.items()
         }
-        zone_anchor = assembly._open_existing_child_directory(
-            run_anchor, "zones", "PDF zones"
-        )
-        zone_names = sorted(path.name for path in zone_anchor.current_path().iterdir())
-        if not zone_names or any(
-            re.fullmatch(r"zone-\d{3}\.json", name) is None for name in zone_names
-        ):
-            raise PdfQAFailure("PDF zones must contain only zone-NNN.json files")
-        for name in zone_names:
-            zone_opened[name] = assembly._open_anchored_input_file(
-                zone_anchor, name, "PDF zone"
-            )
-        assembly._verify_anchored_evidence(zone_anchor, zone_opened)
         zone_bytes = {
-            name: assembly._read_opened_bytes(
-                item, zone_anchor.path / name, f"PDF zone {name}"
-            )
-            for name, item in zone_opened.items()
-        }
-        zone_hashes = {
-            name: hashlib.sha256(payload).hexdigest()
-            for name, payload in zone_bytes.items()
+            Path(relative).name: payload
+            for relative, payload in semantic_snapshot.payloads.items()
+            if relative.startswith("zones/")
         }
         qa = _pdf_qa_from_value(
             _strict_json_text(
@@ -347,14 +339,11 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         document_value = _strict_json_mapping(
             snapshot_bytes["document.json"], "PDF document"
         )
-        glossary_value = _strict_json_mapping(
-            snapshot_bytes["glossary.json"], "PDF glossary"
-        )
         semantic_value = _strict_json_mapping(
             snapshot_bytes["review.json"], "semantic review"
         )
         try:
-            validate_pdf_semantic_review(run_dir, semantic_value)
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, semantic_value)
         except PdfSemanticReviewError as error:
             raise PdfQAFailure(str(error)) from error
         zone_values = {
@@ -366,9 +355,9 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             source_value=source_value,
             document_value=document_value,
             segments_text=_snapshot_utf8(
-                snapshot_bytes["segments.jsonl"], "PDF segments"
+                semantic_snapshot.payloads["segments.jsonl"], "PDF segments"
             ),
-            glossary_value=glossary_value,
+            glossary_value=_snapshot_glossary(semantic_snapshot),
             review_value=semantic_value,
             zone_values=zone_values,
             layout=layout,
@@ -421,7 +410,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         assembly._verify_anchored_evidence(
             staged_anchor, {"review-report.md": review_file}
         )
-        names = sorted(path.name for path in staged_anchor.current_path().iterdir())
+        names = assembly._anchored_directory_names(staged_anchor)
         if names != list(_FINAL_OUTPUT_NAMES):
             raise PdfQAFailure(
                 "staged final output must contain exactly translated.pdf, manifest.json, and review-report.md"
@@ -431,9 +420,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             name: item.identity for name, item in final_files.items()
         }
         _verify_report_evidence_snapshot(run_anchor, opened, snapshot_hashes)
-        _verify_report_evidence_snapshot(zone_anchor, zone_opened, zone_hashes)
-        if sorted(path.name for path in zone_anchor.current_path().iterdir()) != zone_names:
-            raise PdfQAFailure("PDF zone evidence entries changed during finalization")
+        semantic_snapshot.verify()
         assembly._verify_anchored_evidence(
             staged_anchor, {"translated.pdf": staged_pdf}
         )
@@ -466,7 +453,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         raise
     except PdfQAFailure:
         raise
-    except (PdfAssemblyError, PdfContractError) as error:
+    except (PdfAssemblyError, PdfContractError, PdfSemanticReviewError) as error:
         raise PdfQAFailure(str(error)) from error
     except (OSError, UnicodeError, ValueError, TypeError) as error:
         raise PdfQAFailure(f"cannot publish final PDF output: {error}") from error
@@ -484,16 +471,14 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
         assembly._close_opened_file(staged_pdf)
         for item in opened.values():
             assembly._close_opened_file(item)
-        for item in zone_opened.values():
-            assembly._close_opened_file(item)
         for item in final_files.values():
             assembly._close_opened_file(item)
-        if zone_anchor is not None:
-            zone_anchor.close()
         if staged_anchor is not None:
             staged_anchor.close()
         if output_parent_anchor is not None:
             output_parent_anchor.close()
+        if semantic_context is not None:
+            semantic_context.__exit__(None, None, None)
         if run_anchor is not None:
             run_anchor.close()
 
@@ -864,7 +849,27 @@ def _remove_owned_qa_record(
     if published is None:
         return
     if assembly._IS_WINDOWS:
-        assembly._remove_owned_file(directory, name, published)
+        handle: int | None = None
+        try:
+            handle = assembly._windows_open_relative_file(
+                assembly._windows_anchor_handle(directory),
+                name,
+            )
+            if (
+                assembly._windows_file_identity(handle, require_regular=True)
+                != published.identity
+            ):
+                return
+            assembly._windows_delete_open_file(handle)
+        except FileNotFoundError:
+            return
+        except (PdfAssemblyError, NotImplementedError, OSError) as error:
+            raise PdfQAFailure(
+                f"cannot remove exact owned final report {name}: {error}"
+            ) from error
+        finally:
+            if handle is not None:
+                assembly.pdf_acquire_module._close_windows_handle(handle)
         return
     if directory.descriptor is None:
         return
@@ -1213,8 +1218,12 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
     qa_artifact_hashes: dict[str, str] = {}
     completed = False
     temporary_name: str | None = None
+    semantic_context: Any | None = None
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None
     try:
         run_anchor = assembly._open_directory_anchor(run_dir, "run")
+        semantic_context = hold_pdf_semantic_inputs(run_anchor)
+        semantic_snapshot = semantic_context.__enter__()
         _validate_locations(run_anchor, output_dir)
         prior = _open_prior_evidence(run_anchor)
         for name, label in (
@@ -1236,14 +1245,15 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         assembly._verify_anchored_evidence(run_anchor, opened)
         document = _document(opened["document.json"], run_dir / "document.json")
         source = _source(opened["source.json"], run_dir / "source.json")
-        segments = _segments(opened["segments.jsonl"], run_dir / "segments.jsonl")
-        glossary = _glossary(opened["glossary.json"], run_dir / "glossary.json")
+        segments = _snapshot_segments(semantic_snapshot)
+        glossary = _snapshot_glossary(semantic_snapshot)
         layout = _layout(opened["layout.json"], run_dir / "layout.json")
-        translations, translation_zone_ids = _read_translations(run_anchor)
+        translations, translation_zone_ids = _snapshot_translations(semantic_snapshot)
         review = _review(
             opened["review.json"],
             run_dir / "review.json",
             translation_zone_ids,
+            semantic_snapshot=semantic_snapshot,
         )
         _validate_source(document, source, opened["source.pdf"])
         normalized = _validate_contracts(
@@ -1438,13 +1448,19 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             qa_artifact_identities,
             qa_artifact_hashes,
         )
+        semantic_snapshot.verify()
         completed = True
         if prior is not None:
             _discard_prior_evidence(staging_anchor, prior)
         return result
     except PdfQAFailure:
         raise
-    except (PdfAssemblyError, PdfContractError, PdfMediaError) as error:
+    except (
+        PdfAssemblyError,
+        PdfContractError,
+        PdfMediaError,
+        PdfSemanticReviewError,
+    ) as error:
         raise PdfQAFailure(str(error)) from error
     except (OSError, ValueError, TypeError) as error:
         raise PdfQAFailure(f"cannot prepare PDF QA evidence: {error}") from error
@@ -1514,6 +1530,8 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                     child=staging_anchor,
                 )
             staging_anchor.close()
+        if semantic_context is not None:
+            semantic_context.__exit__(None, None, None)
         if run_anchor is not None:
             run_anchor.close()
 
@@ -1653,6 +1671,60 @@ def _segments(opened: assembly._OpenedFile, path: Path) -> list[Segment]:
     )
 
 
+def _snapshot_segments(snapshot: PdfSemanticInputSnapshot) -> list[Segment]:
+    try:
+        return read_segments_stream(
+            io.StringIO(snapshot.payloads["segments.jsonl"].decode("utf-8"))
+        )
+    except (KeyError, UnicodeError, SegmentContractError) as error:
+        raise PdfQAFailure(f"invalid held PDF segments: {error}") from error
+
+
+def _snapshot_glossary(snapshot: PdfSemanticInputSnapshot) -> dict[str, str]:
+    try:
+        value = json.loads(snapshot.payloads["glossary.json"].decode("utf-8"))
+    except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+        raise PdfQAFailure(f"invalid held PDF glossary: {error}") from error
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) or not isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise PdfQAFailure("held PDF glossary must map strings to strings")
+    return dict(value)
+
+
+def _snapshot_translations(
+    snapshot: PdfSemanticInputSnapshot,
+) -> tuple[dict[str, Translation], set[str]]:
+    result: dict[str, Translation] = {}
+    zone_ids: set[str] = set()
+    for relative, payload in sorted(snapshot.payloads.items()):
+        if not relative.startswith("translations/"):
+            continue
+        zone_ids.add(Path(relative).stem)
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeError as error:
+            raise PdfQAFailure(
+                f"invalid held PDF translation {relative}: {error}"
+            ) from error
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                record = Translation.from_dict(json.loads(line))
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                raise PdfQAFailure(
+                    f"invalid held PDF translation {relative}:{line_number}: {error}"
+                ) from error
+            if record.segment_id in result:
+                raise PdfQAFailure(
+                    f"duplicate held PDF translation ID: {record.segment_id}"
+                )
+            result[record.segment_id] = record
+    return result, zone_ids
+
+
 def _glossary(opened: assembly._OpenedFile, path: Path) -> dict[str, str]:
     value = _json(opened, path, "PDF glossary")
     if any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
@@ -1664,10 +1736,15 @@ def _review(
     opened: assembly._OpenedFile,
     path: Path,
     expected_zone_ids: set[str],
+    *,
+    semantic_snapshot: PdfSemanticInputSnapshot | None = None,
 ) -> Mapping[str, Any]:
     value = _json(opened, path, "semantic review")
     try:
-        validate_pdf_semantic_review(path.parent, value)
+        if semantic_snapshot is None:
+            validate_pdf_semantic_review(path.parent, value)
+        else:
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, value)
     except PdfSemanticReviewError as error:
         raise PdfQAFailure(str(error)) from error
     if set(value) != {
@@ -1992,12 +2069,12 @@ def _validate_pdf_structure(
         layout_by_block.setdefault(item.block_id, []).append(item)
     structured_blocks = {
         link.source_block_id
-        for link in document.links
+        for link in layout.links
         if link.reconstructed and link.source_block_id is not None
     }
     expected_links = [
         (link.source_block_id, link.uri, link.destination)
-        for link in document.links
+        for link in layout.links
         if link.reconstructed and link.source_block_id is not None
     ]
     expected_links.extend(

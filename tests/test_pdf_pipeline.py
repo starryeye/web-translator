@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from pypdf import PdfReader
 
+import web_translator.pdf_assemble as pdf_assemble_module
 import web_translator.pdf_qa as pdf_qa_module
 import web_translator.pdf_report as pdf_report_module
 import web_translator.network as network_module
@@ -46,6 +47,14 @@ _PRESERVED_ACRONYM = re.compile(
     r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])"
 )
 _LATIN_ALPHABET = re.compile(r"[A-Za-z]")
+
+
+def _pdf_cli_paths(tmp_path: Path, run_id: str = "run") -> tuple[Path, Path]:
+    run_dir = tmp_path / ".web-translator" / "runs" / run_id
+    output_dir = tmp_path / "translated-pdfs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    return run_dir, output_dir
 _SEMANTIC_ORACLE = {
     "technical-document-v1": {
         "Deterministic Systems Review": "결정론적 시스템 검토",
@@ -467,8 +476,10 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     """Every committed accepted source reaches reviewed public PDF output."""
     fixture_dir = PDF_FIXTURE_ROOT / fixture_name
     expected = json.loads((fixture_dir / "expected.json").read_text(encoding="utf-8"))
-    run_dir = tmp_path / "작업 공간" / fixture_name / "run"
-    output_dir = tmp_path / "작업 공간" / fixture_name / "final"
+    run_dir, output_dir = _pdf_cli_paths(
+        tmp_path / "작업 공간" / fixture_name,
+        fixture_name,
+    )
 
     assert main(["pdf-acquire", str(fixture_dir / source_relative), "--run-dir", str(run_dir)]) == 0
     assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 0
@@ -542,8 +553,7 @@ def test_committed_pdf_rejections_never_publish_final_output(
     tmp_path: Path, filename: str
 ) -> None:
     fixture_dir = PDF_FIXTURE_ROOT / pdf_fixtures.PDF_REJECTION_FIXTURE
-    run_dir = tmp_path / "run"
-    output_dir = tmp_path / "final"
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
 
     acquire = main(["pdf-acquire", str(fixture_dir / filename), "--run-dir", str(run_dir)])
     if acquire == 0:
@@ -573,7 +583,7 @@ def test_http_pdf_acquire_and_extract_uses_real_transport(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(network_module, "_resolve_public_addresses", lambda host, port: ["127.0.0.1"])
-    run_dir = tmp_path / "http-run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path, "http-run")
     url = f"http://fixture.example:{server.server_port}/source.pdf"
     try:
         assert main(["pdf-acquire", url, "--run-dir", str(run_dir)]) == 0
@@ -596,8 +606,7 @@ def test_cli_limit_rejections_never_publish_final_output(
     tmp_path: Path, builder: object, stage: str, expected_exit: int
 ) -> None:
     source = builder(tmp_path / "input.pdf")  # type: ignore[operator]
-    run_dir = tmp_path / "run"
-    output_dir = tmp_path / "final"
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
     acquire = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
     result = acquire if stage == "pdf-acquire" else main(["pdf-extract", "--run-dir", str(run_dir)])
     assert result == expected_exit
@@ -611,10 +620,10 @@ def test_cli_ambiguous_extraction_rejections_never_publish(
     tmp_path: Path, builder: object
 ) -> None:
     source = builder(tmp_path / "input.pdf")  # type: ignore[operator]
-    run_dir = tmp_path / "run"
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
-    assert not (tmp_path / "final").exists()
+    assert not output_dir.exists()
 
 
 def test_cli_pdf_qa_finalize_rejects_stale_review_and_collision(
@@ -634,11 +643,11 @@ def test_cli_pdf_extract_rejects_missing_poppler_without_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(pdf_media_module, "find_poppler", lambda: (_ for _ in ()).throw(PdfMediaError("missing pdfinfo and pdftoppm")))
-    run_dir = tmp_path / "run"
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
     source = PDF_FIXTURE_ROOT / "figures-captions-v1" / "source.pdf"
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     assert main(["pdf-extract", "--run-dir", str(run_dir)]) == 4
-    assert not (tmp_path / "final").exists()
+    assert not output_dir.exists()
 
 
 @pytest.fixture
@@ -1319,11 +1328,31 @@ def test_finalize_preserves_foreign_reports_when_staging_is_replaced(
 
     def write_then_replace_staging(*args: object, **kwargs: object) -> object:
         manifest = real_write(*args, **kwargs)
-        staging.rename(held_staging)
-        staging.mkdir()
-        (staging / "manifest.json").write_bytes(b"foreign manifest")
-        (staging / "review-report.md").write_bytes(b"foreign review")
+        if os.name != "nt":
+            staging.rename(held_staging)
+            staging.mkdir()
+            (staging / "manifest.json").write_bytes(b"foreign manifest")
+            (staging / "review-report.md").write_bytes(b"foreign review")
         return manifest
+
+    if os.name == "nt":
+        real_verify = pdf_assemble_module._DirectoryAnchor.verify_visible
+
+        def inject_held_staging_identity_change(anchor: object) -> None:
+            if (
+                getattr(anchor, "path", None) == staging
+                and (staging / "manifest.json").exists()
+            ):
+                raise pdf_assemble_module.PdfAssemblyError(
+                    "staged output directory changed identity"
+                )
+            real_verify(anchor)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            pdf_assemble_module._DirectoryAnchor,
+            "verify_visible",
+            inject_held_staging_identity_change,
+        )
 
     monkeypatch.setattr(
         pdf_report_module,
@@ -1334,8 +1363,11 @@ def test_finalize_preserves_foreign_reports_when_staging_is_replaced(
     with pytest.raises(PdfQAFailure, match="staged.*changed identity"):
         finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
 
-    assert (staging / "manifest.json").read_bytes() == b"foreign manifest"
-    assert (staging / "review-report.md").read_bytes() == b"foreign review"
+    if os.name == "nt":
+        assert sorted(path.name for path in staging.iterdir()) == ["translated.pdf"]
+    else:
+        assert (staging / "manifest.json").read_bytes() == b"foreign manifest"
+        assert (staging / "review-report.md").read_bytes() == b"foreign review"
     assert not prepared_pdf_run.output_dir.exists()
 
 
@@ -1360,15 +1392,39 @@ def test_finalize_rejects_report_name_replacement_and_preserves_racer(
 
     def write_then_replace_name(*args: object, **kwargs: object) -> object:
         result = real_write(*args, **kwargs)
-        os.replace(foreign, report_path)
+        if os.name != "nt":
+            os.replace(foreign, report_path)
         return result
+
+    if os.name == "nt":
+        real_verify = pdf_assemble_module._verify_anchored_input_identity
+
+        def inject_held_report_identity_change(
+            directory: object,
+            name: str,
+            expected: tuple[int, int],
+        ) -> None:
+            if name == report_name:
+                raise pdf_assemble_module.PdfAssemblyError(
+                    f"anchored input changed identity: {report_name}"
+                )
+            real_verify(directory, name, expected)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            pdf_assemble_module,
+            "_verify_anchored_input_identity",
+            inject_held_report_identity_change,
+        )
 
     monkeypatch.setattr(pdf_report_module, writer_name, write_then_replace_name)
 
     with pytest.raises(PdfQAFailure, match="changed identity"):
         finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
 
-    assert report_path.read_bytes() == f"foreign {report_name}".encode()
+    if os.name == "nt":
+        assert not report_path.exists()
+    else:
+        assert report_path.read_bytes() == f"foreign {report_name}".encode()
     assert not prepared_pdf_run.output_dir.exists()
 
 
@@ -1399,14 +1455,35 @@ def test_finalize_rejects_report_evidence_mutated_during_manifest_write(
 
 def test_finalize_rejects_linked_report_evidence(
     prepared_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     segments = prepared_pdf_run.run_dir / "segments.jsonl"
     moved = prepared_pdf_run.run_dir / "held-segments.jsonl"
-    segments.rename(moved)
-    try:
-        segments.symlink_to(moved)
-    except OSError as error:
-        pytest.skip(f"file symlinks unavailable: {error}")
+    if os.name == "nt":
+        real_verify = pdf_assemble_module._verify_anchored_input_identity
+
+        def inject_held_segments_identity_change(
+            directory: object,
+            name: str,
+            expected: tuple[int, int],
+        ) -> None:
+            if name == "segments.jsonl":
+                raise pdf_assemble_module.PdfAssemblyError(
+                    "anchored input changed identity: segments.jsonl"
+                )
+            real_verify(directory, name, expected)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            pdf_assemble_module,
+            "_verify_anchored_input_identity",
+            inject_held_segments_identity_change,
+        )
+    else:
+        segments.rename(moved)
+        try:
+            segments.symlink_to(moved)
+        except OSError as error:
+            pytest.skip(f"file symlinks unavailable: {error}")
 
     with pytest.raises(PdfQAFailure, match="segments|safe|regular file"):
         finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
@@ -1850,6 +1927,13 @@ def test_pdf_manifest_and_report_preserve_complete_unreconstructed_link_evidence
     document["extraction_warnings"] = [warning]
     path.write_text(
         json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    layout_path = prepared_pdf_run.run_dir / "layout.json"
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    layout["links"] = document["links"]
+    layout_path.write_text(
+        json.dumps(layout, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 

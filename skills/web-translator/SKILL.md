@@ -48,7 +48,7 @@ preserving spaces and non-ASCII characters.
    authenticated pages, JavaScript-only applications, recursive sites, and PDF input.
    Do not silently narrow or broaden scope.
 
-2. Set `workspace = Path.cwd().absolute()`, then create unique paths with
+2. Set `workspace = web_translator.paths.lexical_workspace()`, then create unique paths with
    `web_translator.paths.create_run_paths(workspace, url, datetime.now(UTC))`. Keep the
    returned `work_dir` and unused `output_dir` absolute without resolving either path.
    Verify lexically that `work_dir.parent == workspace / ".web-translator" / "runs"`

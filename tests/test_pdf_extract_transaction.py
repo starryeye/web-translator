@@ -158,3 +158,38 @@ def test_pdf_extract_transaction_preserves_existing_destination_set(
     assert (run_dir / "document.json").read_text(encoding="utf-8") == "old document"
     assert (run_dir / "segments.jsonl").read_text(encoding="utf-8") == "old segments"
     assert (run_dir / "media" / "keep.txt").read_text(encoding="utf-8") == "old media"
+
+
+def test_pdf_extract_transaction_rejects_raced_extra_published_media_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import web_translator.pdf_extract_transaction as transaction_module
+
+    run_dir = _acquired_run(tmp_path)
+    real_publish = transaction_module.anchored._publish_new_file
+    injected = False
+
+    def publish_then_race(*args: object, **kwargs: object) -> object:
+        nonlocal injected
+        published = real_publish(*args, **kwargs)  # type: ignore[arg-type]
+        destination = args[2]
+        if getattr(destination, "path", None) == run_dir / "media":
+            (run_dir / "media" / "foreign.txt").write_bytes(b"foreign media racer")
+            injected = True
+        return published
+
+    monkeypatch.setattr(
+        transaction_module.anchored,
+        "_publish_new_file",
+        publish_then_race,
+    )
+
+    with pytest.raises(PdfExtractionError, match="media.*exact|unexpected media"):
+        extract_pdf_transaction(run_dir, extractor=_write_staged_outputs)
+
+    assert injected
+    assert (run_dir / "media" / "foreign.txt").read_bytes() == b"foreign media racer"
+    assert not (run_dir / "media" / "figure-0001.png").exists()
+    assert not (run_dir / "document.json").exists()
+    assert not (run_dir / "segments.jsonl").exists()

@@ -58,6 +58,14 @@ REVIEW_DIMENSIONS = (
 )
 
 
+def _web_cli_paths(tmp_path: Path, run_id: str = "run") -> tuple[Path, Path]:
+    run_dir = tmp_path / ".web-translator" / "runs" / run_id
+    output_dir = tmp_path / "translated-pages" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    return run_dir, output_dir
+
+
 def reviewed_zone_findings() -> list[dict[str, str]]:
     return [
         {
@@ -174,8 +182,8 @@ def copy_reviewed_fixture_translations(run_dir: Path) -> None:
 def test_fixture_pipeline_builds_complete_offline_bundle(
     tmp_path: Path, fixture_server: FixtureServer, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "작업 공간" / "run"
-    output_dir = tmp_path / "작업 공간" / "translated-pages" / "fixture"
+    workspace = tmp_path / "작업 공간"
+    run_dir, output_dir = _web_cli_paths(workspace, "fixture")
 
     assert main(["capture", fixture_server.url, "--run-dir", str(run_dir)]) == 0
     capture = json.loads((run_dir / "capture.json").read_text("utf-8"))
@@ -299,7 +307,7 @@ def test_fixture_pipeline_builds_complete_offline_bundle(
 
 def materialize_representative_snapshot(snapshot_dir: Path, run_dir: Path) -> dict[str, object]:
     metadata = json.loads((snapshot_dir / "snapshot.json").read_text("utf-8"))
-    run_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
     source = run_dir / "source.html"
     shutil.copy2(snapshot_dir / "index.html", source)
     assets = run_dir / "assets"
@@ -415,8 +423,8 @@ def test_versioned_representative_snapshot_runs_complete_reviewed_pipeline(
     glosses: dict[str, str],
 ) -> None:
     snapshot_dir = REPRESENTATIVE_FIXTURE_DIR / snapshot_name
-    run_dir = tmp_path / "대표 문서 작업" / snapshot_name / "run"
-    output_dir = tmp_path / "대표 문서 작업" / snapshot_name / "translated-pages"
+    workspace = tmp_path / "대표 문서 작업" / snapshot_name
+    run_dir, output_dir = _web_cli_paths(workspace, snapshot_name)
     metadata = materialize_representative_snapshot(snapshot_dir, run_dir)
 
     assert main(["extract", "--run-dir", str(run_dir)]) == 0
@@ -479,7 +487,8 @@ def test_invalid_capture_url_returns_argument_exit_code_and_one_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (tmp_path / "occupied").write_text("existing", encoding="utf-8")
-    assert main(["capture", "file:///private", "--run-dir", str(tmp_path)]) == 2
+    run_dir, _output_dir = _web_cli_paths(tmp_path)
+    assert main(["capture", "file:///private", "--run-dir", str(run_dir)]) == 2
     assert_error_status(capsys, command="capture", exit_code=2)
 
 
@@ -493,9 +502,10 @@ def test_unexpected_handler_errors_escape_main(
         raise error_type("simulated programming bug")
 
     monkeypatch.setattr(cli_module, "_validate_run_root", fail_unexpectedly)
+    run_dir, _output_dir = _web_cli_paths(tmp_path)
 
     with pytest.raises(error_type, match="simulated programming bug"):
-        main(["extract", "--run-dir", str(tmp_path / "run")])
+        main(["extract", "--run-dir", str(run_dir)])
 
 
 def test_subcommand_help_keeps_stdout_reserved_for_one_status_object(
@@ -521,6 +531,7 @@ def test_capture_failure_returns_capture_exit_code_and_one_status(
         raise CaptureError("fixture DNS failure")
 
     monkeypatch.setattr(network_module, "_resolve_public_addresses", fail_resolution)
+    run_dir, _output_dir = _web_cli_paths(tmp_path)
 
     assert (
         main(
@@ -528,7 +539,7 @@ def test_capture_failure_returns_capture_exit_code_and_one_status(
                 "capture",
                 "https://fixture.example/",
                 "--run-dir",
-                str(tmp_path / "run"),
+                str(run_dir),
             ]
         )
         == 3
@@ -626,8 +637,8 @@ def test_capture_rejects_nonempty_run_directory_before_network_or_overwrite(
     fixture_server: FixtureServer,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    run_dir.mkdir(exist_ok=True)
     metadata = run_dir / "capture.json"
     metadata.write_text("do not replace", encoding="utf-8")
 
@@ -647,8 +658,8 @@ def test_missing_extract_contract_returns_contract_exit_code_and_one_status(
 def test_nonpositive_zone_limit_is_an_invalid_argument(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    run_dir.mkdir(exist_ok=True)
     (run_dir / "segments.jsonl").write_text("", encoding="utf-8")
 
     assert (
@@ -667,7 +678,7 @@ def test_nonpositive_zone_limit_is_an_invalid_argument(
 
 
 def write_empty_run_contract(run_dir: Path) -> None:
-    run_dir.mkdir(parents=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
     source = run_dir / "source.html"
     source.write_text(
         "<html><head></head><body></body></html>", encoding="utf-8"
@@ -731,7 +742,7 @@ def write_single_segment_run_contract(run_dir: Path) -> None:
 def test_zone_filename_must_match_embedded_zone_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     mismatched = {
         "attempt": 0,
@@ -755,7 +766,7 @@ def test_zone_filename_must_match_embedded_zone_id(
 def test_validate_rejects_stale_translation_files(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     (run_dir / "translations" / "stale.jsonl").write_text("", encoding="utf-8")
 
@@ -768,7 +779,7 @@ def test_validate_rejects_stale_translation_files(
 def test_validate_one_completed_zone_before_other_results_exist(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     segments = [
         {
@@ -829,7 +840,7 @@ def test_validate_one_completed_zone_before_other_results_exist(
 def test_prepare_assignments_builds_bounded_immutable_zone_packages(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_single_segment_run_contract(run_dir)
     (run_dir / "document-summary.txt").write_text(
         "OAuth 문서의 목적과 흐름", encoding="utf-8"
@@ -869,7 +880,7 @@ def test_prepare_assignments_rejects_missing_or_oversized_summary(
     capsys: pytest.CaptureFixture[str],
     summary: str,
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_single_segment_run_contract(run_dir)
     (run_dir / "document-summary.txt").write_text(summary, encoding="utf-8")
 
@@ -880,7 +891,7 @@ def test_prepare_assignments_rejects_missing_or_oversized_summary(
 def test_validate_one_zone_rejects_unknown_zone_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_single_segment_run_contract(run_dir)
 
     assert (
@@ -901,7 +912,7 @@ def test_validate_one_zone_rejects_unknown_zone_id(
 def test_assemble_rejects_unsafe_capture_asset_paths_as_contract_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     capture_path = run_dir / "capture.json"
     capture = json.loads(capture_path.read_text("utf-8"))
@@ -920,7 +931,7 @@ def test_assemble_rejects_unsafe_capture_asset_paths_as_contract_failure(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 4
@@ -933,7 +944,7 @@ def test_assemble_rejects_unsafe_capture_asset_paths_as_contract_failure(
 def test_assemble_rejects_inconsistent_capture_fingerprints(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     capture_path = run_dir / "capture.json"
     capture = json.loads(capture_path.read_text("utf-8"))
@@ -950,7 +961,7 @@ def test_assemble_rejects_inconsistent_capture_fingerprints(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 4
@@ -963,7 +974,7 @@ def test_assemble_rejects_inconsistent_capture_fingerprints(
 def test_assemble_rejects_captured_asset_whose_bytes_changed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     source = run_dir / "source.html"
     source.write_text("<html><body></body></html>", encoding="utf-8")
@@ -990,7 +1001,7 @@ def test_assemble_rejects_captured_asset_whose_bytes_changed(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 4
@@ -1003,7 +1014,7 @@ def test_assemble_rejects_captured_asset_whose_bytes_changed(
 def test_qa_rejects_review_that_does_not_cover_every_zone(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_single_segment_run_contract(run_dir)
     (run_dir / "review.json").write_text(
         '{"unresolved_required":[],"retries":{},"section_findings":{}}\n',
@@ -1017,7 +1028,7 @@ def test_qa_rejects_review_that_does_not_cover_every_zone(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 4
@@ -1054,7 +1065,7 @@ def test_qa_rejects_invalid_review_zone_evidence(
     review: dict[str, object],
     diagnostic: str,
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_single_segment_run_contract(run_dir)
     (run_dir / "review.json").write_text(
         json.dumps(review) + "\n", encoding="utf-8"
@@ -1067,7 +1078,7 @@ def test_qa_rejects_invalid_review_zone_evidence(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(tmp_path / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 4
@@ -1080,8 +1091,8 @@ def test_qa_rejects_invalid_review_zone_evidence(
 def test_extract_rejects_linked_source_without_modifying_its_target(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    run_dir.mkdir(exist_ok=True)
     outside = tmp_path / "outside.html"
     original = "<html><body><p>Do not modify</p></body></html>"
     outside.write_text(original, encoding="utf-8")
@@ -1098,8 +1109,8 @@ def test_extract_rejects_linked_source_without_modifying_its_target(
 def test_extract_atomically_replaces_hardlink_without_modifying_other_name(
     tmp_path: Path,
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    run_dir.mkdir(exist_ok=True)
     outside = tmp_path / "outside.html"
     original = "<html><body><p>OAuth</p></body></html>"
     outside.write_text(original, encoding="utf-8")
@@ -1135,7 +1146,7 @@ def test_extract_atomically_replaces_hardlink_without_modifying_other_name(
 
 
 def write_extractable_run(run_dir: Path) -> tuple[Path, Path]:
-    run_dir.mkdir()
+    run_dir.mkdir(exist_ok=True)
     source = run_dir / "source.html"
     source.write_text("<html><body><p>OAuth</p></body></html>", encoding="utf-8")
     capture_path = run_dir / "capture.json"
@@ -1162,7 +1173,7 @@ def write_extractable_run(run_dir: Path) -> tuple[Path, Path]:
 def test_extract_rejects_directory_segment_destination_without_partial_update(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     source, capture_path = write_extractable_run(run_dir)
     original_source = source.read_bytes()
     original_capture = capture_path.read_bytes()
@@ -1180,7 +1191,7 @@ def test_extract_rolls_back_all_files_when_metadata_publication_fails_once(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     source, capture_path = write_extractable_run(run_dir)
     segments = run_dir / "segments.jsonl"
     segments.write_text("original segments\n", encoding="utf-8")
@@ -1205,8 +1216,8 @@ def test_extract_rolls_back_all_files_when_metadata_publication_fails_once(
 def test_assembly_failure_returns_assembly_exit_code_and_one_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
-    output_dir = tmp_path / "output"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    output_dir = allocated_output_dir
     write_empty_run_contract(run_dir)
     output_dir.mkdir()
 
@@ -1231,8 +1242,7 @@ def test_missing_captured_source_is_a_contract_failure(
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    run_dir = tmp_path / command
-    output_dir = tmp_path / f"{command}-output"
+    run_dir, output_dir = _web_cli_paths(tmp_path, command)
     write_empty_run_contract(run_dir)
     (run_dir / "source.html").unlink()
     (run_dir / "review.json").write_text(
@@ -1258,8 +1268,8 @@ def test_missing_captured_source_is_a_contract_failure(
 def test_failed_qa_writes_reports_and_returns_qa_exit_code_and_one_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
-    output_dir = tmp_path / "output"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
+    output_dir = allocated_output_dir
     write_empty_run_contract(run_dir)
     (run_dir / "review.json").write_text(
         '{"unresolved_required":[],"retries":{},"section_findings":{}}\n',
@@ -1288,14 +1298,14 @@ def test_failed_qa_writes_reports_and_returns_qa_exit_code_and_one_status(
 def test_qa_report_io_failure_returns_qa_exit_code_and_one_status(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, allocated_output_dir = _web_cli_paths(tmp_path)
     write_empty_run_contract(run_dir)
     (run_dir / "review.json").write_text(
         '{"unresolved_required":[],"retries":{},"section_findings":{}}\n',
         encoding="utf-8",
     )
-    occupied = tmp_path / "occupied"
-    occupied.write_text("not a directory", encoding="utf-8")
+    allocated_output_dir.mkdir()
+    (allocated_output_dir / "review-report.md").mkdir()
 
     assert (
         main(
@@ -1304,7 +1314,7 @@ def test_qa_report_io_failure_returns_qa_exit_code_and_one_status(
                 "--run-dir",
                 str(run_dir),
                 "--output-dir",
-                str(occupied / "output"),
+                str(allocated_output_dir),
             ]
         )
         == 6

@@ -931,6 +931,11 @@ def pair_figure_captions(blocks: Sequence[PdfBlock]) -> list[PdfBlock]:
                 f"ambiguous figure-caption pairing for {caption.id}"
             )
         claimed[caption.id] = figure.id
+    orphaned = sorted(caption.id for caption in captions if caption.id not in claimed)
+    if orphaned:
+        raise PdfExtractionError(
+            "orphan figure-caption evidence: " + ", ".join(orphaned)
+        )
     replacements: dict[str, PdfBlock] = {}
     by_id = {block.id: block for block in blocks}
     for caption_id, figure_id in claimed.items():

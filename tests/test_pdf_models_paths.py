@@ -385,3 +385,50 @@ def test_pdf_run_paths_reject_workspace_replacement_during_allocation(
 
     assert replaced is True
     assert not (workspace / ".web-translator" / "runs" / run_id).exists()
+
+
+def test_pdf_run_contract_requires_matching_exact_allocator_children(
+    tmp_path: Path,
+) -> None:
+    from web_translator.paths import hold_allocated_run_paths
+
+    workspace = tmp_path / "workspace"
+    paths = create_pdf_run_paths(
+        workspace,
+        "source.pdf",
+        datetime(2026, 8, 30, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="same run ID"):
+        with hold_allocated_run_paths(
+            workspace,
+            paths.work_dir,
+            paths.output_dir.with_name("different-run-id"),
+            output_root="translated-pdfs",
+        ):
+            pass
+
+
+def test_pdf_run_contract_retains_held_workspace_identity(tmp_path: Path) -> None:
+    from web_translator.paths import hold_allocated_run_paths
+
+    if os.name == "nt":
+        pytest.skip("native Windows identity injection is covered separately")
+    workspace = tmp_path / "workspace"
+    paths = create_pdf_run_paths(
+        workspace,
+        "source.pdf",
+        datetime(2026, 8, 30, tzinfo=UTC),
+    )
+    moved = tmp_path / "held-workspace"
+
+    with hold_allocated_run_paths(
+        workspace,
+        paths.work_dir,
+        paths.output_dir,
+        output_root="translated-pdfs",
+    ) as contract:
+        workspace.rename(moved)
+        workspace.mkdir()
+        with pytest.raises(ValueError, match="workspace.*changed identity"):
+            contract.verify()

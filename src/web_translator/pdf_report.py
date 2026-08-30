@@ -698,9 +698,7 @@ def build_pdf_manifest(
     tables = {
         block.table_id for block in document.blocks if block.table_id is not None
     }
-    unreconstructed = tuple(
-        link for link in document.links if not link.reconstructed
-    )
+    unreconstructed = tuple(link for link in layout.links if not link.reconstructed)
     extraction_warnings = set(document.extraction_warnings)
     for link in unreconstructed:
         destination = link.uri or link.destination or "unresolved:missing-destination"
@@ -753,7 +751,7 @@ def build_pdf_manifest(
                 "tables": len(tables),
                 "table_cells": len(document.table_cells),
                 "reconstructed_links": sum(
-                    link.reconstructed for link in document.links
+                    link.reconstructed for link in layout.links
                 ),
                 "unreconstructed_links": len(unreconstructed),
             },

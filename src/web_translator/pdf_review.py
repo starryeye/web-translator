@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -98,56 +99,163 @@ class PdfSemanticReviewInput:
         return cls("1.0", digest, expected_policy, parsed)
 
 
+@dataclass(slots=True)
+class PdfSemanticInputSnapshot:
+    """Held exact semantic inputs and the digest derived from those same bytes."""
+
+    run_anchor: Any
+    root_files: dict[str, Any]
+    directories: dict[str, Any]
+    directory_files: dict[str, dict[str, Any]]
+    payloads: dict[str, bytes]
+    review_input: PdfSemanticReviewInput
+    owns_run_anchor: bool
+
+    def verify(self) -> None:
+        import web_translator.pdf_assemble as anchored
+
+        try:
+            self.run_anchor.verify_visible()
+            anchored._verify_anchored_evidence(self.run_anchor, self.root_files)
+            for directory_name, directory in self.directories.items():
+                directory.verify_visible()
+                opened = self.directory_files[directory_name]
+                if anchored._anchored_directory_names(directory) != sorted(opened):
+                    raise PdfSemanticReviewError(
+                        f"PDF semantic input directory changed child set: {directory_name}"
+                    )
+                anchored._verify_anchored_evidence(directory, opened)
+            for relative, expected in self.payloads.items():
+                if "/" in relative:
+                    directory_name, name = relative.split("/", 1)
+                    directory = self.directories[directory_name]
+                    opened = self.directory_files[directory_name][name]
+                else:
+                    directory = self.run_anchor
+                    opened = self.root_files[relative]
+                current = anchored._read_opened_bytes(
+                    opened,
+                    directory.path / (name if "/" in relative else relative),
+                    f"PDF semantic input {relative}",
+                )
+                if current != expected:
+                    raise PdfSemanticReviewError(
+                        f"PDF semantic input changed content: {relative}"
+                    )
+        except PdfSemanticReviewError:
+            raise
+        except anchored.PdfAssemblyError as error:
+            raise PdfSemanticReviewError(str(error)) from error
+
+
+@contextmanager
+def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapshot]:
+    """Hold every reviewed file and directory from snapshot through consumption."""
+    import web_translator.pdf_assemble as anchored
+
+    owns_run = isinstance(run, (str, os.PathLike, Path))
+    run_anchor = None
+    root_files: dict[str, Any] = {}
+    directories: dict[str, Any] = {}
+    directory_files: dict[str, dict[str, Any]] = {}
+    yield_started = False
+    try:
+        run_anchor = (
+            anchored._open_directory_anchor(Path(run), "PDF run")
+            if owns_run
+            else run
+        )
+        for name in ("segments.jsonl", "glossary.json"):
+            root_files[name] = anchored._open_anchored_input_file(
+                run_anchor, name, f"PDF semantic input {name}"
+            )
+        payloads = {
+            name: anchored._read_opened_bytes(
+                opened, run_anchor.path / name, f"PDF semantic input {name}"
+            )
+            for name, opened in root_files.items()
+        }
+        zone_ids: dict[str, set[str]] = {}
+        for directory_name, suffix in (
+            ("zones", ".json"),
+            ("assignments", ".json"),
+            ("translations", ".jsonl"),
+        ):
+            directory = anchored._open_existing_child_directory(
+                run_anchor, directory_name, f"PDF {directory_name}"
+            )
+            directories[directory_name] = directory
+            names = anchored._anchored_directory_names(directory)
+            stems = {
+                name[: -len(suffix)]
+                for name in names
+                if name.endswith(suffix)
+                and _ZONE.fullmatch(name[: -len(suffix)])
+            }
+            if not names or len(stems) != len(names):
+                raise PdfSemanticReviewError(
+                    f"PDF {directory_name} must contain only zone-NNN{suffix} files"
+                )
+            zone_ids[directory_name] = stems
+            opened_files: dict[str, Any] = {}
+            directory_files[directory_name] = opened_files
+            for name in names:
+                opened = anchored._open_anchored_input_file(
+                    directory, name, f"PDF semantic input {directory_name}/{name}"
+                )
+                opened_files[name] = opened
+                relative = f"{directory_name}/{name}"
+                payloads[relative] = anchored._read_opened_bytes(
+                    opened, directory.path / name, f"PDF semantic input {relative}"
+                )
+        if len({frozenset(value) for value in zone_ids.values()}) != 1:
+            raise PdfSemanticReviewError(
+                "PDF zones, assignments, and translations must exactly cover the same zones"
+            )
+        files = tuple(
+            PdfSemanticInputFile(
+                path=path,
+                byte_length=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            for path, payload in sorted(payloads.items())
+        )
+        snapshot = PdfSemanticInputSnapshot(
+            run_anchor=run_anchor,
+            root_files=root_files,
+            directories=directories,
+            directory_files=directory_files,
+            payloads=payloads,
+            review_input=PdfSemanticReviewInput(
+                "1.0", _semantic_digest(payloads), _terminology_policy(), files
+            ),
+            owns_run_anchor=owns_run,
+        )
+        snapshot.verify()
+        yield_started = True
+        yield snapshot
+    except PdfSemanticReviewError:
+        raise
+    except anchored.PdfAssemblyError as error:
+        if yield_started:
+            raise
+        raise PdfSemanticReviewError(str(error)) from error
+    finally:
+        for opened_files in directory_files.values():
+            for opened in opened_files.values():
+                anchored._close_opened_file(opened)
+        for directory in directories.values():
+            directory.close()
+        for opened in root_files.values():
+            anchored._close_opened_file(opened)
+        if owns_run and run_anchor is not None:
+            run_anchor.close()
+
+
 def build_pdf_semantic_review_input(run_dir: Path) -> PdfSemanticReviewInput:
     """Snapshot every exact file reviewed by the PDF semantic master."""
-    run_dir = Path(os.path.abspath(run_dir))
-    _require_safe_directory(run_dir, "PDF run")
-    payloads: dict[str, bytes] = {
-        "segments.jsonl": _read_safe_file(run_dir, "segments.jsonl"),
-        "glossary.json": _read_safe_file(run_dir, "glossary.json"),
-    }
-    zone_ids: dict[str, set[str]] = {}
-    for directory_name, suffix in (
-        ("zones", ".json"),
-        ("assignments", ".json"),
-        ("translations", ".jsonl"),
-    ):
-        directory = run_dir / directory_name
-        _require_safe_directory(directory, f"PDF {directory_name}")
-        try:
-            names = sorted(path.name for path in directory.iterdir())
-        except OSError as error:
-            raise PdfSemanticReviewError(
-                f"cannot inspect PDF {directory_name}: {error}"
-            ) from error
-        stems = {
-            name[: -len(suffix)]
-            for name in names
-            if name.endswith(suffix) and _ZONE.fullmatch(name[: -len(suffix)])
-        }
-        if not names or len(stems) != len(names):
-            raise PdfSemanticReviewError(
-                f"PDF {directory_name} must contain only zone-NNN{suffix} files"
-            )
-        zone_ids[directory_name] = stems
-        for name in names:
-            relative = f"{directory_name}/{name}"
-            payloads[relative] = _read_safe_file(run_dir, relative)
-    if len({frozenset(value) for value in zone_ids.values()}) != 1:
-        raise PdfSemanticReviewError(
-            "PDF zones, assignments, and translations must exactly cover the same zones"
-        )
-
-    files = tuple(
-        PdfSemanticInputFile(
-            path=path,
-            byte_length=len(payload),
-            sha256=hashlib.sha256(payload).hexdigest(),
-        )
-        for path, payload in sorted(payloads.items())
-    )
-    digest = _semantic_digest(payloads)
-    return PdfSemanticReviewInput("1.0", digest, _terminology_policy(), files)
+    with hold_pdf_semantic_inputs(Path(run_dir)) as snapshot:
+        return snapshot.review_input
 
 
 def validate_pdf_semantic_review(
@@ -155,6 +263,15 @@ def validate_pdf_semantic_review(
     review: Mapping[str, Any],
 ) -> PdfSemanticReviewInput:
     """Require one strict PDF review to match the current reviewed inputs."""
+    with hold_pdf_semantic_inputs(Path(run_dir)) as snapshot:
+        return validate_pdf_semantic_review_snapshot(snapshot, review)
+
+
+def validate_pdf_semantic_review_snapshot(
+    snapshot: PdfSemanticInputSnapshot,
+    review: Mapping[str, Any],
+) -> PdfSemanticReviewInput:
+    """Validate review evidence against an already-held consumed snapshot."""
     expected_fields = {
         "semantic_input_sha256",
         "retries",
@@ -166,7 +283,8 @@ def validate_pdf_semantic_review(
     digest = review.get("semantic_input_sha256")
     if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
         raise PdfSemanticReviewError("PDF semantic review digest is invalid")
-    semantic_input = build_pdf_semantic_review_input(run_dir)
+    snapshot.verify()
+    semantic_input = snapshot.review_input
     if digest != semantic_input.semantic_input_sha256:
         raise PdfSemanticReviewError(
             "PDF semantic review digest does not match current reviewed inputs"
@@ -250,5 +368,7 @@ __all__ = [
     "PdfSemanticReviewError",
     "PdfSemanticReviewInput",
     "build_pdf_semantic_review_input",
+    "hold_pdf_semantic_inputs",
+    "validate_pdf_semantic_review_snapshot",
     "validate_pdf_semantic_review",
 ]

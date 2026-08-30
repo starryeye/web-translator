@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import hashlib
 from importlib.resources import as_file, files
@@ -172,6 +172,24 @@ class _OpenedFile:
     identity: tuple[int, int]
 
 
+def _anchored_directory_names(directory: _DirectoryAnchor) -> list[str]:
+    """Enumerate the exact held directory without reopening its visible path."""
+    try:
+        if directory.descriptor is not None:
+            return sorted(os.listdir(directory.descriptor))
+        if _IS_WINDOWS:
+            return sorted(_windows_directory_names(_windows_anchor_handle(directory)))
+        raise PdfAssemblyError(
+            f"safe anchored directory enumeration is unavailable: {directory.path}"
+        )
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate anchored directory {directory.path}: {error}"
+        ) from error
+
+
 def assemble_pdf(
     run_dir: Path,
     translations: Mapping[str, Translation],
@@ -228,6 +246,10 @@ def assemble_pdf(
             segments,
             translations,
             glossary,
+        )
+        document = replace(
+            document,
+            links=list(_translated_link_evidence(document, ordered)),
         )
         _validate_rich_relationships(document)
         media_payloads: dict[str, bytes] = {}
@@ -303,6 +325,7 @@ def assemble_pdf(
             page_size=page_size,
             minimum_font_size=MINIMUM_FONT_SIZE,
             flowables=tuple(records),
+            links=tuple(document.links),
         )
         # Validate every field before either run-visible artifact is published.
         PdfAssemblyLayout.from_dict(layout.to_dict())
@@ -1366,25 +1389,51 @@ def _translated_link_spans(
     links: Sequence[PdfLinkEvidence],
 ) -> list[tuple[int, int, PdfLinkEvidence]]:
     spans: list[tuple[int, int, PdfLinkEvidence]] = []
-    source_length = max(1, len(block.source_text))
-    target_length = len(text)
     for link in links:
         exact = text.find(link.visible_label)
         if exact >= 0 and text.find(link.visible_label, exact + 1) < 0:
             start, end = exact, exact + len(link.visible_label)
         else:
-            assert link.source_span is not None
-            source_start, source_end = link.source_span
-            start = min(target_length, round(source_start * target_length / source_length))
-            end = min(target_length, round(source_end * target_length / source_length))
-            if end <= start:
-                end = min(target_length, start + 1)
+            raise PdfAssemblyError(
+                f"link {link.id} has no unambiguous exact translated label "
+                f"for {block.id}"
+            )
         if end <= start or (spans and start < spans[-1][1]):
             raise PdfAssemblyError(
                 f"ambiguous translated link spans for {block.id}"
             )
         spans.append((start, end, link))
     return spans
+
+
+def _translated_link_evidence(
+    document: PdfDocument,
+    translated: Mapping[str, str] | Sequence[tuple[PdfBlock, Segment, str]],
+) -> tuple[PdfLinkEvidence, ...]:
+    """Downgrade links whose visible label has no unique exact target mapping."""
+    by_block = (
+        dict(translated)
+        if isinstance(translated, Mapping)
+        else {block.id: text for block, _segment, text in translated}
+    )
+    effective: list[PdfLinkEvidence] = []
+    for link in document.links:
+        if not link.reconstructed or link.source_block_id is None:
+            effective.append(link)
+            continue
+        text = by_block.get(link.source_block_id, "")
+        first = text.find(link.visible_label)
+        if first >= 0 and text.find(link.visible_label, first + 1) < 0:
+            effective.append(link)
+            continue
+        effective.append(
+            replace(
+                link,
+                reconstructed=False,
+                reason="translated-visible-label-not-unambiguous",
+            )
+        )
+    return tuple(effective)
 
 
 def _classify_footnotes(
@@ -2648,6 +2697,100 @@ def _windows_anchor_handle(anchor: _DirectoryAnchor) -> int:
     return handle
 
 
+def _windows_directory_names(directory_handle: int) -> list[str]:
+    if not _IS_WINDOWS:
+        raise PdfAssemblyError("Windows anchored directory enumeration is unavailable")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = (
+                ("status_or_pointer", ctypes.c_void_p),
+                ("information", ctypes.c_size_t),
+            )
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        query_directory = ntdll.NtQueryDirectoryFile
+        query_directory.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            ctypes.POINTER(IoStatusBlock),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int32,
+            wintypes.BOOLEAN,
+            wintypes.LPVOID,
+            wintypes.BOOLEAN,
+        )
+        query_directory.restype = ctypes.c_int32
+        to_dos_error = ntdll.RtlNtStatusToDosError
+        to_dos_error.argtypes = (ctypes.c_int32,)
+        to_dos_error.restype = wintypes.ULONG
+
+        names: list[str] = []
+        restart_scan = True
+        while True:
+            buffer = ctypes.create_string_buffer(64 * 1024)
+            status_block = IoStatusBlock()
+            status = int(
+                query_directory(
+                    wintypes.HANDLE(directory_handle),
+                    wintypes.HANDLE(),
+                    None,
+                    None,
+                    ctypes.byref(status_block),
+                    buffer,
+                    len(buffer),
+                    12,
+                    False,
+                    None,
+                    restart_scan,
+                )
+            )
+            if ctypes.c_uint32(status).value == 0x80000006:
+                break
+            if status < 0:
+                raise ctypes.WinError(int(to_dos_error(status)))
+            used = int(status_block.information)
+            offset = 0
+            while offset < used:
+                if used - offset < 12:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned a truncated record"
+                    )
+                next_offset = int.from_bytes(buffer.raw[offset : offset + 4], "little")
+                name_length = int.from_bytes(
+                    buffer.raw[offset + 8 : offset + 12], "little"
+                )
+                name_start = offset + 12
+                name_end = name_start + name_length
+                if name_length % 2 or name_end > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid name"
+                    )
+                name = buffer.raw[name_start:name_end].decode("utf-16-le")
+                if name not in {".", ".."}:
+                    names.append(name)
+                if next_offset == 0:
+                    break
+                if next_offset < 12 or offset + next_offset > used:
+                    raise PdfAssemblyError(
+                        "Windows directory enumeration returned an invalid offset"
+                    )
+                offset += next_offset
+            restart_scan = False
+        return names
+    except PdfAssemblyError:
+        raise
+    except (AttributeError, NotImplementedError, OSError, UnicodeError) as error:
+        raise PdfAssemblyError(
+            f"cannot enumerate Windows anchored directory: {error}"
+        ) from error
+
+
 def _windows_path_anchor_handle(path_anchor: object) -> int:
     handle = getattr(path_anchor, "handle", None)
     if not isinstance(handle, int):
@@ -3024,14 +3167,17 @@ def _windows_delete_open_file(handle: int) -> None:
             wintypes.DWORD,
         )
         set_information.restype = wintypes.BOOL
-        set_information(
+        if not set_information(
             handle,
             4,
             ctypes.byref(information),
             ctypes.sizeof(information),
-        )
-    except (AttributeError, OSError):
-        return
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except (AttributeError, OSError) as error:
+        raise PdfAssemblyError(
+            f"cannot mark exact Windows file for deletion: {error}"
+        ) from error
 
 
 def _close_published_file(published: _PublishedFile | None) -> None:

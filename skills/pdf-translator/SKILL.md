@@ -62,14 +62,14 @@ PDFs, files larger than 50 MiB, and documents over 100 pages. `pdf-acquire` and
 a rejection and never pass a PDF to the HTML `capture` or `extract` commands.
 
 Create unique paths with
-`web_translator.paths.create_pdf_run_paths(Path.cwd().absolute(), source_label,
+`web_translator.paths.create_pdf_run_paths(web_translator.paths.lexical_workspace(), source_label,
 datetime.now(UTC))`.
 Keep its returned `work_dir` and reserved, unused `output_dir` absolute. The final output
 directory must not exist before finalization. Never resolve either result: link resolution
 erases the evidence needed to reject a symlink or reparse point. Verify that
 `work_dir.parent == workspace / ".web-translator" / "runs"` and
 `output_dir.parent == workspace / "translated-pdfs"`, where
-`workspace = Path.cwd().absolute()`. Each returned path must be an exact child of the
+`workspace = web_translator.paths.lexical_workspace()`. Each returned path must be an exact child of the
 intended held root. Abort on a linked, dangling, replaced, or moved run/root/ancestor.
 
 Bind exactly one source value, then allocate the paths through the resolved interpreter.
@@ -85,7 +85,7 @@ assignment:
   # For a public URL instead, replace the line above with:
   # $source = 'https://example.com/reports/분기-보고서.pdf'
 
-  $allocationJson = & $python -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; workspace = Path.cwd().absolute(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' $source
+  $allocationJson = & $python -c 'import json, sys; from datetime import UTC, datetime; from web_translator.paths import create_pdf_run_paths, lexical_workspace; workspace = lexical_workspace(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' $source
   if ($LASTEXITCODE -ne 0) { throw 'PDF run-path allocation failed.' }
   try {
       $allocation = $allocationJson | ConvertFrom-Json -ErrorAction Stop
@@ -119,17 +119,18 @@ assignment:
   # For a public URL instead, replace the line above with:
   # source="https://example.com/reports/분기-보고서.pdf"
 
-  allocation_json=$("$python" -c 'import json, sys; from datetime import UTC, datetime; from pathlib import Path; from web_translator.paths import create_pdf_run_paths; workspace = Path.cwd().absolute(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' "$source") || exit 1
+  allocation_json=$("$python" -c 'import json, sys; from datetime import UTC, datetime; from web_translator.paths import create_pdf_run_paths, lexical_workspace; workspace = lexical_workspace(); paths = create_pdf_run_paths(workspace, sys.argv[1], datetime.now(UTC)); expected_run_root = workspace / ".web-translator" / "runs"; expected_output_root = workspace / "translated-pdfs"; (paths.work_dir.parent == expected_run_root and paths.output_dir.parent == expected_output_root) or (_ for _ in ()).throw(RuntimeError("allocated paths are not exact children of intended roots")); print(json.dumps({"work_dir": str(paths.work_dir), "output_dir": str(paths.output_dir)}, ensure_ascii=False, sort_keys=True, separators=(",", ":")))' "$source") || exit 1
   allocation_field() {
       "$python" -c '
 import json, os, sys
+from web_translator.paths import lexical_workspace
 try:
     data = json.loads(sys.argv[1])
     if type(data) is not dict or set(data) != {"work_dir", "output_dir"}:
         raise ValueError
     if any(type(data[name]) is not str or not data[name] or not os.path.isabs(data[name]) for name in data):
         raise ValueError
-    workspace = os.path.abspath(os.getcwd())
+    workspace = os.fspath(lexical_workspace())
     if os.path.dirname(data["work_dir"]) != os.path.join(workspace, ".web-translator", "runs"):
         raise ValueError
     if os.path.dirname(data["output_dir"]) != os.path.join(workspace, "translated-pdfs"):

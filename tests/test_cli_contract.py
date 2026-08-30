@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,7 @@ from web_translator.pdf_models import (
 )
 from web_translator.pdf_qa import PdfQAFailure
 from web_translator.pdf_review import build_pdf_semantic_review_input
+from web_translator.paths import create_pdf_run_paths
 from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
@@ -40,8 +43,75 @@ REVIEW_DIMENSIONS = (
 )
 
 
+def _pdf_cli_paths(tmp_path: Path) -> tuple[Path, Path]:
+    paths = create_pdf_run_paths(
+        tmp_path,
+        "source.pdf",
+        datetime(2026, 8, 30, tzinfo=UTC),
+    )
+    return paths.work_dir, paths.output_dir
+
+
+def test_pdf_consumer_rejects_output_outside_exact_allocator_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = create_pdf_run_paths(
+        tmp_path,
+        "source.pdf",
+        datetime(2026, 8, 30, tzinfo=UTC),
+    )
+    monkeypatch.setattr(cli_module, "prepare_pdf_qa", lambda *_args: None)
+
+    exit_code = main(
+        [
+            "pdf-qa",
+            "prepare",
+            "--run-dir",
+            str(paths.work_dir),
+            "--output-dir",
+            str(tmp_path / "translated-pdfs" / "different-run"),
+        ]
+    )
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+
+
+def test_pdf_consumer_retains_allocator_roots_for_entire_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("native Windows retained-root injection is covered separately")
+    paths = create_pdf_run_paths(
+        tmp_path,
+        "source.pdf",
+        datetime(2026, 8, 30, tzinfo=UTC),
+    )
+    moved = tmp_path.with_name(f"{tmp_path.name}-held")
+
+    def replace_workspace(*_args: object) -> None:
+        tmp_path.rename(moved)
+        tmp_path.mkdir()
+
+    monkeypatch.setattr(cli_module, "prepare_pdf_qa", replace_workspace)
+
+    exit_code = main(
+        [
+            "pdf-qa",
+            "prepare",
+            "--run-dir",
+            str(paths.work_dir),
+            "--output-dir",
+            str(paths.output_dir),
+        ]
+    )
+
+    assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
+
+
 def _write_pdf_assembly_cli_run(run_dir: Path) -> None:
-    run_dir.mkdir()
+    run_dir.mkdir(parents=True, exist_ok=True)
     block = PdfBlock(
         id="pdf:page-0001:block-0001",
         page_number=1,
@@ -125,9 +195,8 @@ def _write_pdf_assembly_cli_run(run_dir: Path) -> None:
 def test_pdf_assemble_cli_requires_review_and_stages_without_publishing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, final_output = _pdf_cli_paths(tmp_path)
     _write_pdf_assembly_cli_run(run_dir)
-    final_output = tmp_path / "translated-pdfs" / "result"
 
     exit_code = main(
         ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
@@ -147,12 +216,12 @@ def test_pdf_assemble_cli_requires_review_and_stages_without_publishing(
 def test_pdf_assemble_cli_rejects_missing_semantic_review_before_staging(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, final_output = _pdf_cli_paths(tmp_path)
     _write_pdf_assembly_cli_run(run_dir)
     (run_dir / "review.json").unlink()
 
     exit_code = main(
-        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
     )
 
     assert exit_code == cli_module.EXIT_CONTRACT_FAILURE
@@ -167,7 +236,7 @@ def test_pdf_assemble_cli_rejects_missing_semantic_review_before_staging(
 def test_pdf_assemble_cli_rejects_unresolved_semantic_review_as_assembly_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, final_output = _pdf_cli_paths(tmp_path)
     _write_pdf_assembly_cli_run(run_dir)
     review = json.loads((run_dir / "review.json").read_text(encoding="utf-8"))
     review["section_findings"]["zone-001"][0]["verdict"] = "required-fix"
@@ -175,7 +244,7 @@ def test_pdf_assemble_cli_rejects_unresolved_semantic_review_as_assembly_failure
     _write_json(run_dir / "review.json", review)
 
     exit_code = main(
-        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
     )
 
     assert exit_code == cli_module.EXIT_ASSEMBLY_FAILURE
@@ -192,7 +261,7 @@ def test_pdf_assemble_cli_maps_pdf_assembly_error(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir = tmp_path / "run"
+    run_dir, final_output = _pdf_cli_paths(tmp_path)
     _write_pdf_assembly_cli_run(run_dir)
 
     def fail_assembly(*args: object, **kwargs: object) -> Path:
@@ -203,7 +272,7 @@ def test_pdf_assemble_cli_maps_pdf_assembly_error(
     monkeypatch.setattr(cli_module, "assemble_pdf", fail_assembly)
 
     exit_code = main(
-        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(tmp_path / "final")]
+        ["pdf-assemble", "--run-dir", str(run_dir), "--output-dir", str(final_output)]
     )
 
     assert exit_code == cli_module.EXIT_ASSEMBLY_FAILURE
@@ -232,8 +301,7 @@ def test_pdf_qa_prepare_cli_maps_pdf_qa_failure(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
 
     def fail_prepare(*args: object, **kwargs: object) -> object:
         from web_translator.pdf_qa import PdfQAFailure
@@ -248,7 +316,7 @@ def test_pdf_qa_prepare_cli_maps_pdf_qa_failure(
             "--run-dir",
             str(run_dir),
             "--output-dir",
-            str(tmp_path / "final"),
+            str(output_dir),
         ]
     )
 
@@ -265,9 +333,7 @@ def test_pdf_qa_finalize_cli_publishes_before_emitting_success(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    output_dir = tmp_path / "final"
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
 
     def finalize(run: Path, output: Path) -> Path:
         assert run == run_dir
@@ -301,8 +367,7 @@ def test_pdf_qa_finalize_cli_maps_pdf_qa_failure(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, output_dir = _pdf_cli_paths(tmp_path)
 
     def fail_finalize(*args: object, **kwargs: object) -> object:
         raise PdfQAFailure("visual review failed")
@@ -315,7 +380,7 @@ def test_pdf_qa_finalize_cli_maps_pdf_qa_failure(
             "--run-dir",
             str(run_dir),
             "--output-dir",
-            str(tmp_path / "final"),
+            str(output_dir),
         ]
     )
 
@@ -331,7 +396,7 @@ def test_pdf_extract_cli_publishes_document_segments_and_media_atomically(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     source = make_text_pdf(tmp_path / "input.pdf")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     capsys.readouterr()
 
@@ -354,7 +419,7 @@ def test_pdf_extract_cli_maps_extraction_rejection_to_contract_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     source = make_image_only_pdf(tmp_path / "image-only.pdf")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     capsys.readouterr()
 
@@ -377,7 +442,7 @@ def test_pdf_extract_cli_keeps_existing_outputs_when_staging_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_text_pdf(tmp_path / "input.pdf")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     capsys.readouterr()
     (run_dir / "document.json").write_text("old document", encoding="utf-8")
@@ -411,7 +476,7 @@ def test_pdf_extract_cli_rolls_back_all_outputs_when_publication_fails_midway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = make_text_pdf(tmp_path / "input.pdf")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     assert main(["pdf-acquire", str(source), "--run-dir", str(run_dir)]) == 0
     capsys.readouterr()
     (run_dir / "document.json").write_text("old document", encoding="utf-8")
@@ -451,7 +516,7 @@ def test_pdf_acquire_cli_requires_an_empty_run_directory_and_writes_source_metad
 ) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\n")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
 
     exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
 
@@ -471,8 +536,7 @@ def test_pdf_acquire_cli_rejects_nonempty_directory_without_overwrite(
 ) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\n")
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     existing = run_dir / "keep.txt"
     existing.write_text("keep", encoding="utf-8")
 
@@ -493,7 +557,7 @@ def test_pdf_acquire_cli_rolls_back_source_when_metadata_publication_fails(
 ) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\n")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
 
     def fail_metadata(path: Path, value: object) -> None:
         raise OSError("metadata disk failure")
@@ -517,7 +581,7 @@ def test_pdf_acquire_cli_rolls_back_source_when_metadata_destination_races(
 ) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\n")
-    run_dir = tmp_path / "run"
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     import web_translator.pdf_acquire as acquire_module
 
     original_link = acquire_module.os.link
@@ -548,6 +612,7 @@ def test_pdf_acquire_cli_maps_windows_fallback_link_failure(
 ) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"%PDF-1.7\n")
+    run_dir, _output_dir = _pdf_cli_paths(tmp_path)
     import web_translator.pdf_acquire as acquire_module
 
     monkeypatch.setattr(
@@ -558,7 +623,7 @@ def test_pdf_acquire_cli_maps_windows_fallback_link_failure(
     def fail_final_source_link(
         source_path: str | Path, destination: str | Path, **kwargs: object
     ) -> None:
-        if Path(destination) == tmp_path / "run" / "source.pdf":
+        if Path(destination) == run_dir / "source.pdf":
             raise NotImplementedError()
         original_link(source_path, destination, **kwargs)  # type: ignore[arg-type]
 
@@ -568,7 +633,7 @@ def test_pdf_acquire_cli_maps_windows_fallback_link_failure(
         fail_final_source_link,
     )
 
-    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(tmp_path / "run")])
+    exit_code = main(["pdf-acquire", str(source), "--run-dir", str(run_dir)])
 
     assert exit_code == cli_module.EXIT_CAPTURE_FAILURE
     assert json.loads(capsys.readouterr().out) == {

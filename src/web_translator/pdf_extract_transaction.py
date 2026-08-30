@@ -107,9 +107,7 @@ def extract_pdf_transaction(
             "media",
             "staged PDF media",
         )
-        media_names = sorted(
-            path.name for path in staged_media_anchor.current_path().iterdir()
-        )
+        media_names = anchored._anchored_directory_names(staged_media_anchor)
         for name in media_names:
             opened = anchored._open_anchored_input_file(
                 staged_media_anchor,
@@ -120,7 +118,11 @@ def extract_pdf_transaction(
             staged_media_anchor.owned_files[name] = opened.identity
         anchored._verify_anchored_evidence(staging_anchor, staged_files)
         anchored._verify_anchored_evidence(staged_media_anchor, staged_media_files)
-        if sorted(path.name for path in staging_anchor.current_path().iterdir()) != [
+        if anchored._anchored_directory_names(staged_media_anchor) != media_names:
+            raise PdfExtractionError(
+                "staged PDF media child set does not exactly match held artifacts"
+            )
+        if anchored._anchored_directory_names(staging_anchor) != [
             "document.json",
             "media",
             "segments.jsonl",
@@ -178,6 +180,10 @@ def extract_pdf_transaction(
             published_media_anchor,
             staged_media_files,
         )
+        if anchored._anchored_directory_names(published_media_anchor) != media_names:
+            raise PdfExtractionError(
+                "published PDF media child set does not exactly match held artifacts"
+            )
         completed = True
     except PdfExtractionError:
         raise

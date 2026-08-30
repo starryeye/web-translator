@@ -201,7 +201,8 @@ def test_public_skills_keep_allocated_paths_lexical_and_under_exact_roots() -> N
         (pdf, "translated-pdfs"),
     ):
         assert ".resolve()" not in text
-        assert "Path.cwd().absolute()" in text
+        assert "lexical_workspace()" in text
+        assert "Path.cwd().absolute()" not in text
         assert 'workspace / ".web-translator" / "runs"' in text
         assert f'workspace / "{output_root}"' in text
         assert "exact child" in text

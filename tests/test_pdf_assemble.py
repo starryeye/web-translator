@@ -2637,6 +2637,49 @@ def test_assemble_pdf_recreates_each_unambiguous_inline_link_span(
     assert uris == ["https://example.com/alpha", "https://example.com/beta"]
 
 
+def test_translated_link_evidence_downgrades_unmapped_label_without_proportional_fallback(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    block = replace(document.blocks[1], source_text="Read Beta now")
+    link = PdfLinkEvidence(
+        id="pdf:page-0001:link-0001",
+        page_number=1,
+        source_block_id=block.id,
+        source_span=(5, 9),
+        bounds=(90.0, 108.0, 125.0, 144.0),
+        visible_label="Beta",
+        uri="https://example.com/beta",
+        destination=None,
+        reconstructed=True,
+        reason=None,
+    )
+
+    effective_document = replace(
+        document,
+        blocks=[block if item.id == block.id else item for item in document.blocks],
+        links=[link],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(effective_document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    assert block.segment_id is not None
+    translations[block.segment_id] = Translation(
+        block.segment_id, "완전히 관련 없는 한국어 ⟦WT:000001⟧"
+    )
+
+    assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    effective = read_pdf_layout(run_dir / "layout.json").links
+
+    assert len(effective) == 1
+    assert effective[0].reconstructed is False
+    assert effective[0].reason == "translated-visible-label-not-unambiguous"
+
+
 def test_pdf_layout_reader_rejects_contained_table_cell_peer_overlap(
     tmp_path: Path,
 ) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,8 @@ def _write(path: Path, content: str) -> None:
 
 
 def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
-    run_dir = tmp_path / "run"
+    run_dir = tmp_path / ".web-translator" / "runs" / "run"
+    (tmp_path / "translated-pdfs").mkdir()
     _write(run_dir / "segments.jsonl", '{"id":"seg-000001"}\n')
     _write(run_dir / "glossary.json", '{"OAuth":"권한 위임"}\n')
     _write(run_dir / "zones" / "zone-001.json", '{"id":"zone-001"}\n')
@@ -171,3 +173,29 @@ def test_pdf_assembly_review_reader_binds_digest_without_changing_web_reader(
     translation.write_bytes(translation.read_bytes() + b" ")
     with pytest.raises(CLIContractError, match="digest does not match"):
         _read_pdf_review(review_path, [zone])
+
+
+def test_held_semantic_snapshot_reads_and_verifies_the_same_exact_inputs(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_review import hold_pdf_semantic_inputs
+
+    run_dir, review = _reviewed_run(tmp_path)
+    translation = run_dir / "translations" / "zone-001.jsonl"
+    held_translation = run_dir / "held-translation.jsonl"
+
+    with hold_pdf_semantic_inputs(run_dir) as snapshot:
+        assert snapshot.review_input.semantic_input_sha256 == review[
+            "semantic_input_sha256"
+        ]
+        assert snapshot.payloads["translations/zone-001.jsonl"] == (
+            '{"segment_id":"seg-000001","text":"번역"}\n'.encode()
+        )
+        if os.name == "nt":
+            pytest.skip("native Windows replacement is covered by pipeline injection")
+        translation.rename(held_translation)
+        translation.write_bytes(
+            b'{"segment_id":"seg-000001","text":"raced"}\n'
+        )
+        with pytest.raises(PdfSemanticReviewError, match="changed identity"):
+            snapshot.verify()

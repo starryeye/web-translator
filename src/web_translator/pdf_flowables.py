@@ -14,6 +14,8 @@ from typing import Any, Callable, Literal
 
 from reportlab.platypus import Flowable
 
+from web_translator.pdf_models import PdfContractError, PdfLinkEvidence
+
 
 _BLOCK_ID = re.compile(
     r"pdf:page-\d{4}:(?:block-\d{4}|table-\d{4}:row-\d{4}:cell-\d{4})\Z"
@@ -140,10 +142,12 @@ class PdfAssemblyLayout:
     page_size: PdfPageSize
     minimum_font_size: float
     flowables: tuple[PdfFlowableLayout, ...]
+    links: tuple[PdfLinkEvidence, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
             "flowables": [item.to_dict() for item in self.flowables],
+            "links": [item.to_dict() for item in self.links],
             "minimum_font_size": self.minimum_font_size,
             "page_size": self.page_size.to_dict(),
             "reserved_output_dir": self.reserved_output_dir,
@@ -158,6 +162,7 @@ class PdfAssemblyLayout:
             "layout",
             {
                 "flowables",
+                "links",
                 "minimum_font_size",
                 "page_size",
                 "reserved_output_dir",
@@ -179,6 +184,21 @@ class PdfAssemblyLayout:
             PdfFlowableLayout.from_dict(item, index)
             for index, item in enumerate(raw_flowables)
         )
+        raw_links = data.get("links")
+        if not isinstance(raw_links, list):
+            raise PdfAssemblyError("layout.links must be an array")
+        try:
+            links = tuple(
+                PdfLinkEvidence.from_dict(
+                    item
+                )
+                for index, item in enumerate(raw_links)
+                if isinstance(item, Mapping)
+            )
+            if len(links) != len(raw_links):
+                raise PdfAssemblyError("layout link evidence entries must be objects")
+        except (PdfContractError, TypeError, ValueError) as error:
+            raise PdfAssemblyError(f"layout link evidence is invalid: {error}") from error
         pairs = [(item.block_id, item.split_part) for item in flowables]
         if len(pairs) != len(set(pairs)):
             raise PdfAssemblyError(
@@ -218,6 +238,7 @@ class PdfAssemblyLayout:
             page_size=PdfPageSize.from_dict(data.get("page_size")),
             minimum_font_size=minimum_font_size,
             flowables=flowables,
+            links=links,
         )
 
 

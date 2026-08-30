@@ -1674,6 +1674,23 @@ def test_extract_pdf_rejects_ambiguous_figure_caption_pairing(
         )
 
 
+def test_pair_figure_captions_rejects_caption_like_orphan() -> None:
+    from web_translator.pdf_layout import pair_figure_captions
+
+    orphan = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(72.0, 500.0, 300.0, 520.0),
+        style=PdfBlockStyle(10.0, False, "left", 0.0, 0.0),
+        source_text="Figure 9. No graphical region exists",
+    )
+
+    with pytest.raises(PdfExtractionError, match="orphan figure-caption"):
+        pair_figure_captions([orphan])
+
+
 def test_detect_footnotes_rejects_two_bodies_claiming_one_marker() -> None:
     from web_translator.pdf_layout import detect_footnotes
 

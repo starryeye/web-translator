@@ -266,3 +266,22 @@ def test_web_run_paths_reject_workspace_replacement_during_allocation(
 
     assert replaced is True
     assert not (workspace / ".web-translator" / "runs" / run_id).exists()
+
+
+def test_lexical_workspace_rejects_linked_pwd_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from web_translator.paths import lexical_workspace
+
+    target = tmp_path / "real-workspace"
+    target.mkdir()
+    linked = tmp_path / "linked-workspace"
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+    monkeypatch.setenv("PWD", str(linked))
+
+    with pytest.raises(ValueError, match="link or reparse"):
+        lexical_workspace()

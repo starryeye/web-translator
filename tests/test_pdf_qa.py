@@ -133,8 +133,9 @@ def _write_passing_layout_review(run_dir: Path, *, staged_sha256: str | None = N
 
 @pytest.fixture
 def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir = tmp_path / ".web-translator" / "runs" / "result"
+    run_dir.mkdir(parents=True)
+    (tmp_path / "translated-pdfs").mkdir()
     source_pdf = make_text_pdf(run_dir / "source.pdf")
     source_sha256 = _sha256(source_pdf)
     blocks = [
@@ -725,6 +726,76 @@ def test_remove_owned_qa_record_restores_a_mismatching_visible_file(
     assert list(run_dir.glob(".pdf-qa-cleanup-*")) == []
 
 
+def test_windows_report_cleanup_fails_closed_when_native_disposition_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staged-output"
+    staging.mkdir()
+    report = staging / "manifest.json"
+    report.write_bytes(b"owned manifest")
+    metadata = staging.stat()
+
+    class FakePathAnchor:
+        handle = 41
+
+        def current_path(self) -> Path:
+            return staging
+
+        def close(self) -> None:
+            return None
+
+    anchor = pdf_qa_module.assembly._DirectoryAnchor(
+        staging,
+        "staged PDF output",
+        (metadata.st_dev, metadata.st_ino),
+        None,
+        FakePathAnchor(),
+    )
+    owned_identity = report.stat()
+    closed: list[int] = []
+    monkeypatch.setattr(pdf_qa_module.assembly, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_open_relative_file",
+        lambda _root, _name: 99,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_file_identity",
+        lambda _handle, require_regular: (
+            owned_identity.st_dev,
+            owned_identity.st_ino,
+        ),
+    )
+
+    def disposition_fails(_handle: int) -> None:
+        raise pdf_qa_module.PdfAssemblyError("native disposition rejected")
+
+    monkeypatch.setattr(
+        pdf_qa_module.assembly,
+        "_windows_delete_open_file",
+        disposition_fails,
+    )
+    monkeypatch.setattr(
+        pdf_qa_module.assembly.pdf_acquire_module,
+        "_close_windows_handle",
+        closed.append,
+    )
+
+    with pytest.raises(PdfQAFailure, match="native disposition rejected"):
+        pdf_qa_module._remove_owned_qa_record(
+            anchor,
+            "manifest.json",
+            pdf_qa_module.assembly._PublishedFile(
+                (owned_identity.st_dev, owned_identity.st_ino)
+            ),
+        )
+
+    assert report.read_bytes() == b"owned manifest"
+    assert closed == [99]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory descriptors")
 def test_qa_snapshot_enumerates_the_held_directory_after_path_replacement(
     tmp_path: Path,
@@ -1056,7 +1127,7 @@ def test_finalize_rejects_linked_output_and_keeps_staging(
     _write_passing_layout_review(assembled_pdf_run.run_dir)
     linked_target = tmp_path / "linked-target"
     linked_target.mkdir()
-    assembled_pdf_run.output_dir.parent.mkdir(parents=True)
+    assembled_pdf_run.output_dir.parent.mkdir(parents=True, exist_ok=True)
     assembled_pdf_run.output_dir.symlink_to(linked_target, target_is_directory=True)
 
     with pytest.raises(PdfQAFailure, match="linked|already exists"):

@@ -144,8 +144,10 @@ def _expected_render_pixel_counts(source_pdf: Path, dpi: int) -> list[int]:
         pixels = []
         for page in reader.pages:
             user_unit = float(page.user_unit)
-            width = abs(float(page.cropbox.width)) * user_unit
-            height = abs(float(page.cropbox.height)) * user_unit
+            # Default pdftoppm renders the MediaBox unless ``-cropbox`` is passed.
+            # Budget the same surface the command below actually renders.
+            width = abs(float(page.mediabox.width)) * user_unit
+            height = abs(float(page.mediabox.height)) * user_unit
             if (
                 not math.isfinite(user_unit)
                 or user_unit <= 0

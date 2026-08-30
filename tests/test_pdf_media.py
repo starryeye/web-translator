@@ -224,6 +224,41 @@ def test_render_rejects_oversized_user_unit_before_locating_poppler(
         media_module.render_pdf_pages(source, tmp_path / "rendered", dpi=144)
 
 
+def test_render_preflight_budgets_default_poppler_media_box_not_crop_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, FloatObject, NameObject
+
+    import web_translator.pdf_media as media_module
+
+    source = tmp_path / "media-box-over-budget.pdf"
+    canvas = Canvas(str(source), pagesize=(100, 100))
+    canvas.drawString(10, 50, "small crop inside huge media surface")
+    canvas.save()
+    reader = PdfReader(source)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    page = writer.pages[0]
+    page[NameObject("/MediaBox")] = ArrayObject(
+        [FloatObject(0), FloatObject(0), FloatObject(100_000), FloatObject(100_000)]
+    )
+    page[NameObject("/CropBox")] = ArrayObject(
+        [FloatObject(0), FloatObject(0), FloatObject(100), FloatObject(100)]
+    )
+    with source.open("wb") as stream:
+        writer.write(stream)
+
+    def poppler_must_not_run() -> object:
+        raise AssertionError("MediaBox budget must reject before Poppler lookup")
+
+    monkeypatch.setattr(media_module, "find_poppler", poppler_must_not_run)
+
+    with pytest.raises(media_module.PdfMediaError, match="pixels per page"):
+        media_module.render_pdf_pages(source, tmp_path / "rendered", dpi=144)
+
+
 def test_crop_figure_regions_keeps_rendered_pixels_and_exact_dimensions(
     tmp_path: Path,
 ) -> None:
