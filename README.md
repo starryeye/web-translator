@@ -53,8 +53,8 @@ interpreter for your platform:
 ```
 
 Use `patch` for compatible fixes, `minor` for backward-compatible features, and
-`major` for breaking changes. Marketplace releases must vendor a committed plugin
-snapshot; Codex displays the vendored `.codex-plugin/plugin.json` version.
+`major` for breaking changes. Marketplace releases reference an immutable upstream
+tag and commit SHA; Codex materializes the pinned Git source declared by the marketplace.
 
 ## Use from Codex
 
