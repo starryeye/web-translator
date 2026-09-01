@@ -14,7 +14,7 @@
 
 - Preserve all current HTML commands and the full existing test suite.
 - Accept exactly one readable local PDF, attached PDF, or public HTTP(S) PDF URL.
-- Reject files over 50 MiB, files over 100 pages, every encrypted PDF, malformed PDFs, and scanned PDFs using the exact thresholds in the spec.
+- Reject files over 50 MiB, files over 500 pages, every encrypted PDF, malformed PDFs, and scanned PDFs using the exact thresholds in the spec.
 - Emit no successful final output directory before `pdf-qa finalize` passes.
 - Preserve the existing `Segment`, zone, assignment, translation, glossary, retry, and semantic-review contracts.
 - Keep Windows PowerShell and macOS/POSIX invocation behavior equivalent; paths with spaces and Korean characters are required cases.
@@ -460,7 +460,7 @@ git commit -m "feat: acquire local and public PDFs"
 - [ ] **Step 1: Add fixture builders and failing inspection tests**
 
 Add deterministic builders for text, image-only, mixed cover/text, encrypted, malformed,
-zero-page, rotated, 101-page, and oversized-dimension PDFs. Assert the exact scan rule:
+zero-page, rotated, 501-page, and oversized-dimension PDFs. Assert the exact scan rule:
 
 ```python
 def test_scan_rule_allows_one_image_cover_but_rejects_image_dominant_document(
@@ -500,7 +500,7 @@ and dimensions outside 36 through 14,400 points.
 
 - [ ] **Step 4: Implement exact document rejection**
 
-Reject when page count is zero or above 100, total selectable non-whitespace characters
+Reject when page count is zero or above 500, total selectable non-whitespace characters
 are below 100, or scan candidates exceed `max(1, floor(page_count * 0.20))`. Include page
 numbers, character counts, and coverages in the exception evidence.
 
@@ -1169,7 +1169,7 @@ and three final artifact links.
 - [ ] **Step 5: Update plugin metadata and README**
 
 Keep manifest name `web-translator`; broaden descriptions to public pages and text-based
-PDFs. Document Windows/macOS Poppler installation, local/public examples, 50 MiB/100-page
+PDFs. Document Windows/macOS Poppler installation, local/public examples, 50 MiB/500-page
 limits, scan/encryption rejection, stage commands, output tree, font provenance, and visual
 review.
 

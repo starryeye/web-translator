@@ -130,10 +130,11 @@ semantic-review evidence. PDF `review.json` carries its `semantic_input_sha256`,
 the exact segments, zones, assignments, translations, and glossary policy/content before
 assembly and both QA stages.
 
-Poppler/Pillow rendering is limited to 36,000,000 pixels per page, 360,000,000 pixels per
-PDF, 64 MiB per encoded PNG, and 1 GiB for the rendered set. Decoded dimensions are
-checked before full decode. These deterministic budgets remain enforced on platforms
-without an OS-level address-space limit.
+Poppler/Pillow rendering is limited to 36,000,000 pixels per page, 2,000,000,000 pixels
+per PDF, 64 MiB per encoded PNG, and 4 GiB for the rendered set. Each Poppler subprocess
+is limited to 600 seconds. Decoded dimensions are checked before full decode. These
+deterministic budgets remain enforced on platforms without an OS-level address-space
+limit.
 
 ### Performance-oriented orchestration
 
@@ -232,7 +233,7 @@ Missing optional images or fonts may remain origin fallbacks and are reported as
 missing critical HTML or CSS fails the run.
 
 The PDF workflow accepts one readable local/attached PDF or public HTTP(S) PDF, up to
-50 MiB and 100 pages, only when its required text is selectable. It rejects scanned,
+50 MiB and 500 pages, only when its required text is selectable. It rejects scanned,
 encrypted, malformed, oversized, over-page-limit, non-PDF, private-network, authenticated,
 or structurally ambiguous inputs. It does not OCR scans or preserve source line wrapping
 pixel-for-pixel. Missing required text, tables, figures, captions, embedded fonts, pages,

@@ -151,7 +151,7 @@ hash for local inputs.
 - invalid cross-reference tables or page trees that cannot be repaired deterministically;
 - zero-page documents;
 - documents larger than 50 MiB;
-- documents with more than 100 pages; and
+- documents with more than 500 pages; and
 - pages with unsupported dimensions or rotations that the renderer cannot reproduce.
 
 `pdfplumber` measures selectable characters and image coverage. A page is a
@@ -324,11 +324,12 @@ The generated PDF is reopened independently. QA requires:
 ### Rendering QA
 
 Poppler renders every output page to PNG. Before launch, source/output page dimensions and
-DPI are rejected above 36,000,000 rendered pixels per page or 360,000,000 pixels across
+DPI are rejected above 36,000,000 rendered pixels per page or 2,000,000,000 pixels across
 one PDF. While and after rendering, any PNG above 64 MiB or complete rendered-page set
-above 1 GiB terminates or fails the operation. PNG headers and decoded raster dimensions
-are validated against the same per-page pixel limit before full Pillow decode. Subprocess
-timeouts remain mandatory. Where a platform cannot impose an OS-level address-space limit,
+above 4 GiB terminates or fails the operation. PNG headers and decoded raster dimensions
+are validated against the same per-page pixel limit before full Pillow decode. Each
+Poppler subprocess is limited to 600 seconds. Where a platform cannot impose an
+OS-level address-space limit,
 these deterministic pre/while/post geometry, encoded-byte, decoded-pixel, and timeout
 budgets remain mandatory.
 

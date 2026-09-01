@@ -926,7 +926,7 @@ def test_rejects_documents_with_too_little_selectable_text(tmp_path: Path) -> No
         (make_encrypted_pdf, "encrypted"),
         (make_malformed_pdf, "final %%EOF"),
         (make_zero_page_pdf, "zero pages"),
-        (make_many_pages_pdf, "page count 101"),
+        (make_many_pages_pdf, "page count 501"),
         (make_oversized_dimension_pdf, "unsupported dimensions"),
         (make_oversized_pdf, "size limit"),
         (make_truncated_eof_pdf, "final %%EOF"),
@@ -959,7 +959,7 @@ def test_inspect_pdf_rejects_rotation_not_divisible_by_ninety(tmp_path: Path) ->
         inspect_pdf(source)
 
 
-@pytest.mark.parametrize("page_count", [0, 101])
+@pytest.mark.parametrize("page_count", [0, 501])
 def test_reject_unsupported_pdf_enforces_page_count(page_count: int) -> None:
     inspection = PdfInspection(
         page_count=page_count,
@@ -1011,9 +1011,9 @@ def test_inspect_pdf_rejects_dimensions_outside_limits(
 
 
 def test_inspect_pdf_accepts_exact_page_count_limit(tmp_path: Path) -> None:
-    inspection = inspect_pdf(make_many_pages_pdf(tmp_path / "hundred-pages.pdf", pages=100))
+    inspection = inspect_pdf(make_many_pages_pdf(tmp_path / "five-hundred-pages.pdf", pages=500))
 
-    assert inspection.page_count == 100
+    assert inspection.page_count == 500
 
 
 def test_scan_candidate_character_and_coverage_cutoffs(tmp_path: Path) -> None:

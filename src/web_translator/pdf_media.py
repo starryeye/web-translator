@@ -20,7 +20,7 @@ from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
 
-_POPPLER_TIMEOUT_SECONDS = 60
+_POPPLER_TIMEOUT_SECONDS = 600
 _GRAPHIC_JOIN_TOLERANCE = 6.0
 _CONTACT_PAGES_PER_SHEET = 12
 _CONTACT_COLUMNS = 4
@@ -29,9 +29,9 @@ _CONTACT_LABEL_HEIGHT = 28
 _CONTACT_GAP = 16
 _RENDERED_PAGE_NAME = re.compile(r"page-(\d+)\.png\Z")
 MAX_RENDERED_PIXELS_PER_PAGE = 36_000_000
-MAX_RENDERED_PIXELS_TOTAL = 360_000_000
+MAX_RENDERED_PIXELS_TOTAL = 2_000_000_000
 MAX_RENDERED_PNG_BYTES_PER_PAGE = 64 * 1024 * 1024
-MAX_RENDERED_PNG_BYTES_TOTAL = 1024 * 1024 * 1024
+MAX_RENDERED_PNG_BYTES_TOTAL = 4 * 1024 * 1024 * 1024
 
 
 class PdfMediaError(RuntimeError):
@@ -182,14 +182,14 @@ def _validate_render_budget_counts(
         )
     if sum(page_pixels) > MAX_RENDERED_PIXELS_TOTAL:
         raise PdfMediaError(
-            "PDF render exceeds 360,000,000 total rendered pixels"
+            "PDF render exceeds 2,000,000,000 total rendered pixels"
         )
     if any(value > MAX_RENDERED_PNG_BYTES_PER_PAGE for value in encoded_bytes):
         raise PdfMediaError(
             "PDF render exceeds 64 MiB encoded bytes per page"
         )
     if sum(encoded_bytes) > MAX_RENDERED_PNG_BYTES_TOTAL:
-        raise PdfMediaError("PDF render exceeds 1 GiB encoded bytes total")
+        raise PdfMediaError("PDF render exceeds 4 GiB encoded bytes total")
 
 
 def _validate_rendered_png_set(

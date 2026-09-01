@@ -60,7 +60,7 @@ from web_translator.protection import protect_fragment
 
 _MIN_PAGE_POINTS = 36.0
 _MAX_PAGE_POINTS = 14_400.0
-_MAX_PAGE_COUNT = 100
+_MAX_PAGE_COUNT = 500
 
 
 @dataclass(frozen=True, slots=True)

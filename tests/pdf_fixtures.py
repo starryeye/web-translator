@@ -201,7 +201,7 @@ def make_rotated_pdf(path: Path, *, rotation: int) -> Path:
     return path
 
 
-def make_many_pages_pdf(path: Path, *, pages: int = 101) -> Path:
+def make_many_pages_pdf(path: Path, *, pages: int = 501) -> Path:
     return make_text_pdf(path, pages=pages)
 
 

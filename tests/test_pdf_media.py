@@ -126,9 +126,17 @@ def test_render_pdf_pages_uses_fixed_dpi_and_returns_png_pages(tmp_path: Path) -
     ("pixels", "encoded_bytes", "message"),
     [
         ([36_000_001], [1], "pixels per page"),
-        ([36_000_000] * 10 + [1], [1] * 11, "total rendered pixels"),
+        (
+            [36_000_000] * 55 + [20_000_001],
+            [1] * 56,
+            "total rendered pixels",
+        ),
         ([1], [64 * 1024 * 1024 + 1], "encoded bytes per page"),
-        ([1] * 17, [64 * 1024 * 1024] * 16 + [1], "encoded bytes total"),
+        (
+            [1] * 65,
+            [64 * 1024 * 1024] * 64 + [1],
+            "encoded bytes total",
+        ),
     ],
 )
 def test_render_budget_rejects_one_unit_above_each_exact_limit(
@@ -146,21 +154,57 @@ def test_render_budget_accepts_exact_limits_and_one_unit_below() -> None:
     import web_translator.pdf_media as media_module
 
     media_module._validate_render_budget_counts(
-        [36_000_000] * 10,
-        [1] * 10,
+        [36_000_000] * 55 + [20_000_000],
+        [1] * 56,
     )
     media_module._validate_render_budget_counts(
-        [1] * 16,
-        [64 * 1024 * 1024] * 16,
+        [1] * 64,
+        [64 * 1024 * 1024] * 64,
     )
     media_module._validate_render_budget_counts(
-        [35_999_999] * 10,
-        [1] * 10,
+        [35_999_999] * 55 + [19_999_999],
+        [1] * 56,
     )
     media_module._validate_render_budget_counts(
-        [1] * 16,
-        [64 * 1024 * 1024 - 1] * 16,
+        [1] * 64,
+        [64 * 1024 * 1024 - 1] * 64,
     )
+
+
+def test_poppler_render_timeout_allows_ten_minutes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    import web_translator.pdf_media as media_module
+
+    class TimedOutProcess:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            if timeout is None:
+                return "", ""
+            raise subprocess.TimeoutExpired("pdftoppm", timeout)
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = TimedOutProcess()
+    timestamps = iter((0.0, 601.0))
+    monkeypatch.setattr(media_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(media_module.time, "monotonic", lambda: next(timestamps))
+
+    with pytest.raises(media_module.PdfMediaError, match="600 second timeout"):
+        media_module._run_poppler(
+            ["pdftoppm", "source.pdf", str(tmp_path / "page")],
+            "render PDF pages",
+        )
+
+    assert process.killed is True
 
 
 def test_render_rejects_oversized_geometry_before_locating_poppler(

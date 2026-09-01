@@ -226,7 +226,7 @@ def test_pdf_skill_is_discoverable_and_fail_closed() -> None:
         "pdf-layout-review.json",
         "pdf-qa finalize",
         "50 MiB",
-        "100 pages",
+        "500 pages",
         "scans",
         "encryption",
         "malformed",
@@ -391,9 +391,10 @@ def test_pdf_skill_and_spec_bind_review_render_figure_and_link_contracts() -> No
     for text in (skill, spec, readme):
         for phrase in (
             "36,000,000",
-            "360,000,000",
+            "2,000,000,000",
             "64 MiB",
-            "1 GiB",
+            "4 GiB",
+            "600 seconds",
             "pdf-review-input",
             "semantic_input_sha256",
             "standalone uncaptioned figure",
@@ -402,6 +403,7 @@ def test_pdf_skill_and_spec_bind_review_render_figure_and_link_contracts() -> No
             assert phrase in text
     assert "OS-level address-space limit" in skill
     assert "OS-level address-space limit" in spec
+    assert "each source or output PDF" in skill
 
 
 def test_readme_documents_pdf_workflow_and_boundaries() -> None:
@@ -411,7 +413,7 @@ def test_readme_documents_pdf_workflow_and_boundaries() -> None:
         "local text-selectable PDF",
         "public HTTP(S) PDF URL",
         "50 MiB",
-        "100 pages",
+        "500 pages",
         "scanned",
         "encrypted",
         "malformed",

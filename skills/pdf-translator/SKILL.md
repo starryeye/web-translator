@@ -57,7 +57,7 @@ Accept exactly one text-selectable PDF supplied as a readable local path, an att
 file exposed through a readable local path, or a public HTTP(S) URL. For an attachment,
 use the platform-provided local path as the source value. Reject zero or multiple inputs,
 HTML input, directories, private or authenticated URLs, scans, encryption, malformed
-PDFs, files larger than 50 MiB, and documents over 100 pages. `pdf-acquire` and
+PDFs, files larger than 50 MiB, and documents over 500 pages. `pdf-acquire` and
 `pdf-extract` enforce these limits and must stop the run on a nonzero exit. Never bypass
 a rejection and never pass a PDF to the HTML `capture` or `extract` commands.
 
@@ -231,10 +231,11 @@ Apply these requirements at each stage:
    publish the reserved output directory.
 
 Rendering is bounded before, during, and after Poppler/Pillow work: at most 36,000,000
-pixels per page, 360,000,000 rendered pixels for the complete source/output PDF,
-64 MiB encoded bytes for one PNG, and 1 GiB encoded bytes for the complete rendered-page
+pixels per page, 2,000,000,000 rendered pixels for each source or output PDF,
+64 MiB encoded bytes for one PNG, and 4 GiB encoded bytes for the complete rendered-page
 set. Decoded dimensions and pixels are checked before full Pillow decode. Output growth
-is monitored and the timed subprocess is terminated on a limit breach. Platforms that
+is monitored, each Poppler subprocess is limited to 600 seconds, and the process is
+terminated on a limit breach. Platforms that
 cannot impose an OS-level address-space limit still enforce all deterministic geometry,
 encoded-byte, decoded-pixel, and timeout limits.
 
