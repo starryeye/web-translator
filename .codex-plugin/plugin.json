@@ -1,6 +1,6 @@
 {
   "name": "web-translator",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Translate one public static HTML page or one local or public text-selectable PDF into reviewed Korean output.",
   "author": {
     "name": "starryeye"
