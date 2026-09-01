@@ -1342,6 +1342,97 @@ def test_assemble_pdf_stages_selectable_korean_without_publishing(
     assert all(item.page_number >= 1 for item in layout.flowables)
 
 
+def test_assemble_pdf_normalizes_alternating_footer_page_tokens(tmp_path: Path) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    footer_style = PdfBlockStyle(9.0, False, "left", 0.0, 0.0)
+    document = replace(
+        document,
+        page_count=2,
+        pages=[
+            *document.pages,
+            PdfPage(number=2, width=612.0, height=792.0, rotation=0),
+        ],
+        blocks=[
+            *document.blocks,
+            PdfBlock(
+                id="pdf:page-0001:block-0098",
+                page_number=1,
+                order=3,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="vi | Table of Contents",
+            ),
+            PdfBlock(
+                id="pdf:page-0002:block-0099",
+                page_number=2,
+                order=4,
+                kind="footer",
+                bbox=(390.0, 770.0, 540.0, 782.0),
+                style=footer_style,
+                source_text="Table of Contents | vii",
+            ),
+        ],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert "Table of Contents | 1" in text
+    assert "vi | Table of Contents" not in text
+
+
+def test_assemble_pdf_rejects_repeated_identical_composite_footer(tmp_path: Path) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    footer_style = PdfBlockStyle(9.0, False, "left", 0.0, 0.0)
+    document = replace(
+        document,
+        page_count=2,
+        pages=[
+            *document.pages,
+            PdfPage(number=2, width=612.0, height=792.0, rotation=0),
+        ],
+        blocks=[
+            *document.blocks,
+            PdfBlock(
+                id="pdf:page-0001:block-0098",
+                page_number=1,
+                order=3,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="i | Contents",
+            ),
+            PdfBlock(
+                id="pdf:page-0002:block-0099",
+                page_number=2,
+                order=4,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="i | Contents",
+            ),
+        ],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PdfAssemblyError, match="ambiguous repeated footer evidence"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+
 def test_assemble_pdf_chooses_a4_for_a4_like_source_pages(tmp_path: Path) -> None:
     run_dir, translations, glossary = _assembly_run(
         tmp_path, width=595.275590551, height=841.88976378

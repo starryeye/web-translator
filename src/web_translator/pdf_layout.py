@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
+from numbers import Real
 from pathlib import Path
 import re
 
@@ -35,6 +36,10 @@ _NUMBERED_LIST_PATTERN = re.compile(
 )
 _HEADING_NUMBER_PATTERN = re.compile(r"^(?P<number>\d+(?:\.\d+)*)[.)]?\s+")
 _PAGE_NUMBER_PATTERN = re.compile(r"\d+\Z")
+_RUNNING_PAGE_TOKEN_PATTERN = re.compile(r"(?:\d+|[ivxlcdm]+)\Z", re.IGNORECASE)
+_TOC_DOT_LEADER_PATTERN = re.compile(
+    r"^\s*\d+(?:\.\d+)*[.)]?\s+\S.*(?:\.\s*){3,}\d+\s*\Z"
+)
 _TEXT_BLOCK_KINDS = {
     "heading",
     "paragraph",
@@ -139,6 +144,7 @@ class PdfLine:
     heading_level: int | None = None
     page_width: float | None = None
     page_height: float | None = None
+    spanning: bool = False
 
     @classmethod
     def from_word(cls, word: PdfWord) -> PdfLine:
@@ -177,6 +183,10 @@ class PdfLine:
         return (self.x0 + self.x1) / 2.0
 
     @property
+    def is_spanning(self) -> bool:
+        return self.spanning
+
+    @property
     def size(self) -> float:
         weighted = sum(word.size * word.character_count for word in self.words)
         characters = sum(word.character_count for word in self.words)
@@ -212,9 +222,17 @@ class PdfLine:
         return 0.0
 
     def accepts(self, word: PdfWord) -> bool:
-        dynamic_gap = min(
-            _MINIMUM_GUTTER - 1e-6,
-            max(self.size, word.size) * _WORD_GAP_FONT_MULTIPLIER,
+        monospaced = all(
+            "mono" in candidate.fontname.casefold()
+            for candidate in (*self.words, word)
+        )
+        dynamic_gap = (
+            _MINIMUM_GUTTER - 1e-6
+            if monospaced
+            else min(
+                _MINIMUM_GUTTER - 1e-6,
+                max(self.size, word.size) * _WORD_GAP_FONT_MULTIPLIER,
+            )
         )
         return self.horizontal_gap(word) <= dynamic_gap
 
@@ -250,10 +268,35 @@ def group_words_into_lines(words: Sequence[Mapping[str, object]]) -> list[PdfLin
             continue
         index = max(matching, key=lambda item: (item[1], item[2], -item[0]))[0]
         lines[index] = lines[index].with_word(word)
-    return [
+    normalized = [
         line.normalized()
         for line in sorted(lines, key=lambda item: (item.top, item.x0, item.text))
     ]
+    return _coalesce_line_fragments(normalized)
+
+
+def _coalesce_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
+    result = list(lines)
+    changed = True
+    while changed:
+        changed = False
+        for left_index, left in enumerate(result):
+            for right_index in range(left_index + 1, len(result)):
+                right = result[right_index]
+                if left.vertical_overlap_ratio(right) < _VERTICAL_OVERLAP:
+                    continue
+                if not any(left.accepts(word) for word in right.words):
+                    continue
+                merged = left
+                for word in right.words:
+                    merged = merged.with_word(word)
+                result[left_index] = merged.normalized()
+                result.pop(right_index)
+                changed = True
+                break
+            if changed:
+                break
+    return sorted(result, key=lambda item: (item.top, item.x0, item.text))
 
 
 def find_clear_gutter(
@@ -272,41 +315,64 @@ def find_clear_gutter(
         if not line.is_heading
         and line.kind not in {"caption", "header", "footer", "page-number"}
     ]
-    evidence: list[tuple[float, float]] = []
-    for left_boundary in candidates:
-        for right_boundary in candidates:
-            if right_boundary.x0 - left_boundary.x1 < minimum_width:
-                continue
-            left = [line for line in candidates if line.x1 <= left_boundary.x1]
-            right = [line for line in candidates if line.x0 >= right_boundary.x0]
-            if not left or not right:
-                continue
-            gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
-            if gutter[1] - gutter[0] < minimum_width:
-                continue
-            if not all(
-                line.x1 <= gutter[0]
-                or line.x0 >= gutter[1]
-                or line.crosses(gutter)
-                for line in candidates
-            ):
-                continue
-            matching = next(
-                (
-                    index
-                    for index, existing in enumerate(evidence)
-                    if math.isclose(gutter[0], existing[0], abs_tol=0.01)
-                    and math.isclose(gutter[1], existing[1], abs_tol=0.01)
-                ),
-                None,
-            )
-            if matching is None:
-                evidence.append(gutter)
+    aligned_with = {
+        line: {
+            peer
+            for peer in candidates
+            if peer is not line
+            and line.vertical_overlap_ratio(peer) >= _VERTICAL_OVERLAP
+        }
+        for line in candidates
+    }
+    evidence: list[tuple[tuple[float, float], bool]] = []
+    boundary_pairs = sorted(
+        {
+            (left_boundary.x1, right_boundary.x0)
+            for left_boundary in candidates
+            for right_boundary in candidates
+            if right_boundary.x0 - left_boundary.x1 >= minimum_width
+        }
+    )
+    for left_edge, right_edge in boundary_pairs:
+        left = [line for line in candidates if line.x1 <= left_edge]
+        right = [line for line in candidates if line.x0 >= right_edge]
+        if not left or not right:
+            continue
+        gutter = (max(line.x1 for line in left), min(line.x0 for line in right))
+        if gutter[1] - gutter[0] < minimum_width:
+            continue
+        if not all(
+            line.x1 <= gutter[0]
+            or line.x0 >= gutter[1]
+            or line.crosses(gutter)
+            for line in candidates
+        ):
+            continue
+        left_set = set(left)
+        right_set = set(right)
+        has_aligned_rows = (
+            sum(bool(aligned_with[line] & right_set) for line in left) >= 2
+            and sum(bool(aligned_with[line] & left_set) for line in right) >= 2
+        )
+        matching = next(
+            (
+                index
+                for index, (existing, _) in enumerate(evidence)
+                if math.isclose(gutter[0], existing[0], abs_tol=0.01)
+                and math.isclose(gutter[1], existing[1], abs_tol=0.01)
+            ),
+            None,
+        )
+        if matching is None:
+            evidence.append((gutter, has_aligned_rows))
+        elif has_aligned_rows and not evidence[matching][1]:
+            evidence[matching] = (evidence[matching][0], True)
     if not evidence:
         return None
     if len(evidence) > 1:
         raise PdfExtractionError("ambiguous column evidence")
-    return evidence[0]
+    gutter, has_aligned_rows = evidence[0]
+    return gutter if has_aligned_rows else None
 
 
 def order_page_lines(
@@ -319,13 +385,37 @@ def order_page_lines(
     gutter = find_clear_gutter(lines, page_width, minimum_width=_MINIMUM_GUTTER)
     if gutter is None:
         return sorted(lines, key=lambda item: (item.top, item.x0, item.text))
+    edge_lines = [
+        line
+        for line in lines
+        if line.kind in {"header", "footer", "page-number"}
+        and _edge_band(line) is not None
+    ]
+    content_lines = [line for line in lines if line not in edge_lines]
     conflicting = [
-        line for line in lines if line.crosses(gutter) and not line.is_heading
+        line
+        for line in content_lines
+        if line.crosses(gutter) and not _is_spanning_line(line)
     ]
     if conflicting:
         evidence = ", ".join(repr(line.text) for line in conflicting[:3])
         raise PdfExtractionError(f"conflicting column evidence: {evidence}")
-    return order_column_regions(lines, gutter, spanning_bboxes=spanning_bboxes)
+    key = lambda item: (item.top, item.x0, item.text)
+    top_edge = sorted(
+        (line for line in edge_lines if _edge_band(line) == "top"), key=key
+    )
+    bottom_edge = sorted(
+        (line for line in edge_lines if _edge_band(line) == "bottom"), key=key
+    )
+    return [
+        *top_edge,
+        *order_column_regions(
+            content_lines,
+            gutter,
+            spanning_bboxes=spanning_bboxes,
+        ),
+        *bottom_edge,
+    ]
 
 
 def order_column_regions(
@@ -336,7 +426,7 @@ def order_column_regions(
 ) -> list[PdfLine]:
     """Order each region between spanning content left-column then right-column."""
     spanning = sorted(
-        (line for line in lines if line.crosses(gutter) and line.is_heading),
+        (line for line in lines if line.crosses(gutter) and _is_spanning_line(line)),
         key=lambda item: (item.top, item.x0, item.text),
     )
     ordinary = [line for line in lines if line not in spanning]
@@ -391,6 +481,10 @@ def _order_two_columns(
     return [*sorted(left, key=key), *sorted(right, key=key)]
 
 
+def _is_spanning_line(line: PdfLine) -> bool:
+    return line.is_heading or line.is_spanning
+
+
 def classify_document_lines(
     pages: Sequence[tuple[Sequence[PdfLine], float]],
 ) -> list[list[PdfLine]]:
@@ -406,7 +500,9 @@ def classify_document_lines(
         for lines, height in pages
     ]
     normalized = _classify_page_numbers(normalized)
+    normalized = _classify_running_bands(normalized)
     normalized = _classify_repeated_bands(normalized)
+    normalized = _classify_toc_entries(normalized)
 
     sizes: Counter[int] = Counter()
     for lines in normalized:
@@ -434,8 +530,13 @@ def classify_document_lines(
                 and number is not None
                 and _has_heading_spacing(lines, index)
                 and not _has_tight_numbered_list_peer(lines, index)
+                and not line.is_spanning
             )
-            if heading_candidate and (list_marker is None or numbered_heading):
+            if (
+                heading_candidate
+                and not line.is_spanning
+                and (list_marker is None or numbered_heading)
+            ):
                 if number is not None:
                     level = number.group("number").count(".") + 1
                 elif rounded_size in heading_sizes:
@@ -577,6 +678,142 @@ def _classify_repeated_bands(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
     ]
 
 
+def _classify_running_bands(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
+    occurrences: dict[
+        tuple[str, str], list[tuple[int, int, int, str]]
+    ] = defaultdict(list)
+    for page_index, lines in enumerate(pages):
+        for line_index, line in enumerate(lines):
+            band = _edge_band(line)
+            evidence = _running_band_evidence(line)
+            if line.kind is not None or band is None or evidence is None:
+                continue
+            label, value, side = evidence
+            page_width = line.page_width
+            if page_width is None or (
+                side == "left" and line.center_x >= page_width / 2.0
+            ) or (
+                side == "right" and line.center_x <= page_width / 2.0
+            ):
+                continue
+            occurrences[(band, label)].append((page_index, line_index, value, side))
+    running_band_locations = {
+        (page_index, line_index)
+        for locations in occurrences.values()
+        if _is_sequential_running_band(locations)
+        for page_index, line_index, _value, _side in locations
+    }
+    return [
+        [
+            replace(
+                line,
+                kind=("header" if _edge_band(line) == "top" else "footer"),
+            )
+            if (page_index, line_index) in running_band_locations
+            else line
+            for line_index, line in enumerate(lines)
+        ]
+        for page_index, lines in enumerate(pages)
+    ]
+
+
+def _running_band_label(line: PdfLine) -> str | None:
+    evidence = _running_band_evidence(line)
+    return evidence[0] if evidence is not None else None
+
+
+def _running_band_evidence(line: PdfLine) -> tuple[str, int, str] | None:
+    parts = [part.strip() for part in line.text.split("|")]
+    if len(parts) != 2 or any(not part for part in parts):
+        return None
+    page_tokens = [
+        _RUNNING_PAGE_TOKEN_PATTERN.fullmatch(part) is not None for part in parts
+    ]
+    if sum(page_tokens) != 1:
+        return None
+    token_index = page_tokens.index(True)
+    value = _page_token_value(parts[token_index])
+    if value is None:
+        return None
+    return (
+        _normalized_text(parts[1 - token_index]),
+        value,
+        "left" if token_index == 0 else "right",
+    )
+
+
+def _page_token_value(token: str) -> int | None:
+    if token.isdecimal():
+        value = int(token)
+        return value if value > 0 else None
+    values = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+    normalized = token.casefold()
+    total = 0
+    previous = 0
+    for character in reversed(normalized):
+        value = values.get(character)
+        if value is None:
+            return None
+        total += -value if value < previous else value
+        previous = max(previous, value)
+    return total if 0 < total <= 3999 and _roman_page_token(total) == normalized else None
+
+
+def _roman_page_token(value: int) -> str:
+    parts: list[str] = []
+    for amount, token in (
+        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+        (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+        (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+    ):
+        while value >= amount:
+            parts.append(token)
+            value -= amount
+    return "".join(parts)
+
+
+def _is_sequential_running_band(
+    locations: Sequence[tuple[int, int, int, str]],
+) -> bool:
+    ordered = sorted(locations)
+    if len({page_index for page_index, *_rest in ordered}) < 2:
+        return False
+    for left, right in zip(ordered, ordered[1:]):
+        page_delta = right[0] - left[0]
+        if page_delta <= 0 or right[2] - left[2] != page_delta:
+            return False
+    sides = [location[3] for location in ordered]
+    same_side = len(set(sides)) == 1
+    alternating = all(
+        (right[3] != left[3]) == ((right[0] - left[0]) % 2 == 1)
+        for left, right in zip(ordered, ordered[1:])
+    )
+    return same_side or alternating
+
+
+def _classify_toc_entries(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
+    evidence: set[tuple[int, int]] = set()
+    for page_index, lines in enumerate(pages):
+        matches = [
+            (line_index, line)
+            for line_index, line in enumerate(lines)
+            if line.kind is None and _TOC_DOT_LEADER_PATTERN.fullmatch(line.text)
+        ]
+        if len(matches) >= 2:
+            evidence.update((page_index, index) for index, _line in matches)
+    if not evidence:
+        return pages
+    return [
+        [
+            replace(line, spanning=True)
+            if (page_index, line_index) in evidence
+            else line
+            for line_index, line in enumerate(lines)
+        ]
+        for page_index, lines in enumerate(pages)
+    ]
+
+
 def _edge_band(line: PdfLine) -> str | None:
     if line.page_height is None:
         return None
@@ -615,18 +852,32 @@ def merge_contiguous_paragraph_lines(
 ) -> list[tuple[PdfBlockKind, tuple[PdfLine, ...]]]:
     """Merge only geometrically contiguous paragraph lines."""
     merged: list[tuple[PdfBlockKind, tuple[PdfLine, ...]]] = []
-    for kind, line in classified:
+    for index, (kind, line) in enumerate(classified):
         if (
             kind == "paragraph"
             and merged
             and merged[-1][0] == "paragraph"
             and _paragraphs_are_contiguous(merged[-1][1][-1], line)
+            and not _has_side_by_side_successor(classified, index)
         ):
             previous_kind, previous_lines = merged[-1]
             merged[-1] = (previous_kind, (*previous_lines, line))
         else:
             merged.append((kind, (line,)))
     return merged
+
+
+def _has_side_by_side_successor(
+    classified: Sequence[tuple[PdfBlockKind, PdfLine]], index: int
+) -> bool:
+    if index + 1 >= len(classified):
+        return False
+    line = classified[index][1]
+    following = classified[index + 1][1]
+    return (
+        line.vertical_overlap_ratio(following) >= _VERTICAL_OVERLAP
+        and (line.x1 <= following.x0 or following.x1 <= line.x0)
+    )
 
 
 def _paragraphs_are_contiguous(previous: PdfLine, current: PdfLine) -> bool:
@@ -827,6 +1078,16 @@ def detect_footnotes(
                 for character in characters
             )
         ]
+        trailing_owners = [
+            block
+            for block in blocks
+            if block.id != body.id
+            and block.bbox[1] < body.bbox[1]
+            and _trailing_marker(block.source_text) == marker
+            and _trailing_marker_characters(block, marker, characters) is not None
+        ]
+        if len(trailing_owners) == 1 and (not owners or len(owners) > 1):
+            owners = trailing_owners
         standalone_markers = [
             block
             for block in blocks
@@ -835,6 +1096,31 @@ def detect_footnotes(
             and _normalized_marker(block.source_text) == marker
             and block.style.font_size <= median_size * 0.85 + 1e-9
         ]
+        if len(owners) == 1 and len(standalone_markers) == 1:
+            owner = owners[0]
+            marker_block = standalone_markers[0]
+            if (
+                _vertical_overlap_ratio(owner.bbox, marker_block.bbox) >= 0.50
+                and _horizontal_bbox_gap(owner.bbox, marker_block.bbox)
+                <= median_size * 1.5
+            ):
+                owners = [
+                    replace(
+                        owner,
+                        bbox=(
+                            min(owner.bbox[0], marker_block.bbox[0]),
+                            min(owner.bbox[1], marker_block.bbox[1]),
+                            max(owner.bbox[2], marker_block.bbox[2]),
+                            max(owner.bbox[3], marker_block.bbox[3]),
+                        ),
+                        source_text=(
+                            owner.source_text
+                            if _trailing_marker(owner.source_text) == marker
+                            else f"{owner.source_text.rstrip()} {marker}"
+                        ),
+                    )
+                ]
+                removed.add(marker_block.id)
         if not owners and standalone_markers:
             if len(standalone_markers) > 1:
                 raise PdfExtractionError(
@@ -869,6 +1155,8 @@ def detect_footnotes(
                     )
                 ]
                 removed.add(marker_block.id)
+        if len(owners) == 1 and _trailing_marker(owners[0].source_text) == marker:
+            owners = [_trim_footnote_marker_extent(owners[0], characters)]
         if len(owners) > 1:
             raise PdfExtractionError(
                 f"ambiguous footnote marker {marker!r} on page {body.page_number}"
@@ -907,34 +1195,42 @@ def pair_figure_captions(blocks: Sequence[PdfBlock]) -> list[PdfBlock]:
         if block.kind in {"paragraph", "caption"}
         and re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", block.source_text, re.I)
     ]
-    candidates: dict[str, list[PdfBlock]] = {}
-    for figure in figures:
-        candidates[figure.id] = [
-            caption
-            for caption in captions
-            if caption.page_number == figure.page_number
-            and _caption_distance(figure.bbox, caption.bbox) <= 36.0
-            and _horizontal_overlap_ratio(figure.bbox, caption.bbox) >= 0.25
-        ]
-        if len(candidates[figure.id]) > 1:
-            raise PdfExtractionError(
-                f"ambiguous figure-caption pairing for {figure.id}"
-            )
-    claimed: dict[str, str] = {}
-    for figure in figures:
-        matches = candidates[figure.id]
-        if not matches:
-            continue
-        caption = matches[0]
-        if caption.id in claimed:
-            raise PdfExtractionError(
-                f"ambiguous figure-caption pairing for {caption.id}"
-            )
-        claimed[caption.id] = figure.id
-    orphaned = sorted(caption.id for caption in captions if caption.id not in claimed)
+    figure_by_id = {figure.id: figure for figure in figures}
+    candidates = {
+        caption.id: sorted(
+            (
+                figure.id
+                for figure in figures
+                if caption.page_number == figure.page_number
+                and _caption_distance(figure.bbox, caption.bbox) <= 36.0
+                and _horizontal_overlap_ratio(figure.bbox, caption.bbox) >= 0.25
+            ),
+            key=lambda figure_id: (
+                _caption_distance(
+                    figure_by_id[figure_id].bbox,
+                    caption.bbox,
+                ),
+                figure_id,
+            ),
+        )
+        for caption in captions
+    }
+    orphaned = sorted(
+        caption.id for caption in captions if not candidates[caption.id]
+    )
     if orphaned:
         raise PdfExtractionError(
             "orphan figure-caption evidence: " + ", ".join(orphaned)
+        )
+    claimed = _find_caption_matching(candidates)
+    if claimed is None or any(
+        _find_caption_matching(candidates, forbidden=(caption_id, figure_id))
+        is not None
+        for caption_id, figure_id in claimed.items()
+    ):
+        evidence = next(iter(sorted(candidates)), "unknown-caption")
+        raise PdfExtractionError(
+            f"ambiguous figure-caption pairing for {evidence}"
         )
     replacements: dict[str, PdfBlock] = {}
     by_id = {block.id: block for block in blocks}
@@ -944,6 +1240,30 @@ def pair_figure_captions(blocks: Sequence[PdfBlock]) -> list[PdfBlock]:
             by_id[caption_id], kind="caption", caption_id=figure_id
         )
     return [replacements.get(block.id, block) for block in blocks]
+
+
+def _find_caption_matching(
+    candidates: Mapping[str, Sequence[str]],
+    *,
+    forbidden: tuple[str, str] | None = None,
+) -> dict[str, str] | None:
+    figure_owners: dict[str, str] = {}
+
+    def assign(caption_id: str, visited: set[str]) -> bool:
+        for figure_id in candidates[caption_id]:
+            if forbidden == (caption_id, figure_id) or figure_id in visited:
+                continue
+            visited.add(figure_id)
+            owner = figure_owners.get(figure_id)
+            if owner is None or assign(owner, visited):
+                figure_owners[figure_id] = caption_id
+                return True
+        return False
+
+    for caption_id in sorted(candidates, key=lambda item: (len(candidates[item]), item)):
+        if not assign(caption_id, set()):
+            return None
+    return {caption_id: figure_id for figure_id, caption_id in figure_owners.items()}
 
 
 def extract_link_evidence(
@@ -1314,12 +1634,152 @@ def _edge_index(edges: Sequence[float], value: float) -> int:
 
 
 def _leading_footnote_marker(text: str) -> str | None:
-    match = re.match(r"^\s*([\[(]?(?:\d{1,3}|[*†‡])[\].)]?)\s+", text)
+    match = re.match(
+        r"^\s*((?:[\[(]?(?:\d{1,3}|[*†‡])[\].)]?)|"
+        r"(?:[ivxlcdm]{1,6}[.)]|\([ivxlcdm]{1,6}\)|\[[ivxlcdm]{1,6}\]))\s+",
+        text,
+        re.IGNORECASE,
+    )
     return _normalized_marker(match.group(1)) if match is not None else None
 
 
 def _normalized_marker(text: str) -> str:
     return re.sub(r"[\s\[\]().]", "", text).casefold()
+
+
+def _trailing_marker(text: str) -> str | None:
+    tokens = text.rstrip().rsplit(maxsplit=1)
+    return _normalized_marker(tokens[-1]) if tokens else None
+
+
+def _trailing_marker_characters(
+    owner: PdfBlock,
+    marker: str,
+    characters: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...] | None:
+    candidates = sorted(
+        (
+            character
+            for character in characters
+            if str(character.get("text", "")).strip()
+            and _character_fully_inside_bbox(character, owner.bbox)
+            and _character_size(character) <= owner.style.font_size * 0.85 + 1e-9
+        ),
+        key=lambda character: (
+            float(character.get("top", 0.0)),
+            float(character.get("x0", 0.0)),
+        ),
+    )
+    if not candidates:
+        return None
+    owner_characters = [
+        character
+        for character in characters
+        if str(character.get("text", "")).strip()
+        and _character_fully_inside_bbox(character, owner.bbox)
+        and _character_bbox(character) is not None
+    ]
+    if not owner_characters:
+        return None
+    baseline_bboxes = [
+        bbox
+        for character in owner_characters
+        if (bbox := _character_bbox(character)) is not None
+        and _character_size(character) > owner.style.font_size * 0.85 + 1e-9
+    ]
+    if not baseline_bboxes:
+        return None
+    baseline_rows: list[list[tuple[float, float, float, float]]] = []
+    for bbox in sorted(baseline_bboxes, key=lambda item: (item[1] + item[3], item[0])):
+        center = (bbox[1] + bbox[3]) / 2.0
+        if baseline_rows:
+            previous_center = sum(
+                (item[1] + item[3]) / 2.0 for item in baseline_rows[-1]
+            ) / len(baseline_rows[-1])
+        else:
+            previous_center = math.inf
+        if abs(center - previous_center) <= owner.style.font_size * 0.25:
+            baseline_rows[-1].append(bbox)
+        else:
+            baseline_rows.append([bbox])
+    row_centers = [
+        sum((bbox[1] + bbox[3]) / 2.0 for bbox in row) / len(row)
+        for row in baseline_rows
+    ]
+    final_row_index = max(range(len(baseline_rows)), key=row_centers.__getitem__)
+    for start in range(len(candidates)):
+        selected: list[Mapping[str, object]] = []
+        rendered = ""
+        for character in candidates[start:]:
+            if selected:
+                previous_bbox = _character_bbox(selected[-1])
+                current_bbox = _character_bbox(character)
+                if previous_bbox is None or current_bbox is None:
+                    break
+                if _vertical_overlap_ratio(previous_bbox, current_bbox) < 0.50:
+                    break
+                if current_bbox[0] - previous_bbox[2] > owner.style.font_size * 0.50:
+                    break
+            selected.append(character)
+            rendered += _normalized_marker(str(character.get("text", "")))
+            if rendered == marker:
+                selected_bboxes = [
+                    bbox
+                    for item in selected
+                    if (bbox := _character_bbox(item)) is not None
+                ]
+                if not selected_bboxes:
+                    break
+                selected_center = sum(
+                    (bbox[1] + bbox[3]) / 2.0 for bbox in selected_bboxes
+                ) / len(selected_bboxes)
+                nearest_row_index = min(
+                    range(len(baseline_rows)),
+                    key=lambda index: abs(selected_center - row_centers[index]),
+                )
+                final_row = baseline_rows[final_row_index]
+                row_right = max(bbox[2] for bbox in final_row)
+                marker_left = min(bbox[0] for bbox in selected_bboxes)
+                horizontal_gap = marker_left - row_right
+                if (
+                    nearest_row_index == final_row_index
+                    and abs(selected_center - row_centers[final_row_index])
+                    <= owner.style.font_size * 1.5
+                    and -owner.style.font_size * 0.50
+                    <= horizontal_gap
+                    <= owner.style.font_size * 1.50
+                ):
+                    return tuple(selected)
+                break
+            if not marker.startswith(rendered):
+                break
+    return None
+
+
+def _trim_footnote_marker_extent(
+    owner: PdfBlock,
+    characters: Sequence[Mapping[str, object]],
+) -> PdfBlock:
+    content_bottoms = [
+        float(character["bottom"])
+        for character in characters
+        if str(character.get("text", "")).strip()
+        and _character_fully_inside_bbox(character, owner.bbox)
+        and not (
+            _character_size(character) <= owner.style.font_size * 0.85 + 1e-9
+        )
+        and isinstance(character.get("bottom"), Real)
+        and math.isfinite(float(character["bottom"]))
+    ]
+    if not content_bottoms:
+        return owner
+    content_bottom = max(content_bottoms)
+    if content_bottom >= owner.bbox[3] or content_bottom <= owner.bbox[1]:
+        return owner
+    return replace(
+        owner,
+        bbox=(owner.bbox[0], owner.bbox[1], owner.bbox[2], content_bottom),
+    )
 
 
 def _character_size(character: Mapping[str, object]) -> float:

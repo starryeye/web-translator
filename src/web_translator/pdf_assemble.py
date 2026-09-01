@@ -1029,6 +1029,8 @@ def _build_rich_document(
     running_header = _running_block(document, "header")
     running_footer = _running_block(document, "footer")
     running_page_number = _running_block(document, "page-number")
+    header_embeds_page_number = _embedded_running_page_number(document, "header")
+    footer_embeds_page_number = _embedded_running_page_number(document, "footer")
     running_style = ParagraphStyle(
         "WT-Running",
         fontName=REGULAR_FONT_NAME,
@@ -1067,9 +1069,12 @@ def _build_rich_document(
         )
         page_number = int(canvas.getPageNumber())
         if running_header is not None:
+            header_text = running_header.source_text
+            if header_embeds_page_number:
+                header_text = f"{header_text} | {page_number}"
             frame = (left_margin, height - 37.0, width - 108.0, 13.0)
             flowable = TrackedFlowable(
-                Paragraph(escape(running_header.source_text), running_style),
+                Paragraph(escape(header_text), running_style),
                 block_id=running_header.id,
                 kind="header",
                 source_order=running_header.order,
@@ -1082,9 +1087,12 @@ def _build_rich_document(
             flowable.wrapOn(canvas, frame[2], frame[3])
             flowable.drawOn(canvas, frame[0], frame[1])
         if running_footer is not None:
+            footer_text = running_footer.source_text
+            if footer_embeds_page_number:
+                footer_text = f"{footer_text} | {page_number}"
             frame = (left_margin, 20.0, width - 180.0, 13.0)
             flowable = TrackedFlowable(
-                Paragraph(escape(running_footer.source_text), running_style),
+                Paragraph(escape(footer_text), running_style),
                 block_id=running_footer.id,
                 kind="footer",
                 source_order=running_footer.order,
@@ -1096,7 +1104,9 @@ def _build_rich_document(
             )
             flowable.wrapOn(canvas, frame[2], frame[3])
             flowable.drawOn(canvas, frame[0], frame[1])
-        if running_page_number is not None:
+        if running_page_number is not None and not (
+            header_embeds_page_number or footer_embeds_page_number
+        ):
             frame = (width - right_margin - 54.0, 20.0, 54.0, 13.0)
             page_style = ParagraphStyle(
                 "WT-PageNumber",
@@ -1558,9 +1568,108 @@ def _running_block(document: PdfDocument, kind: str) -> PdfBlock | None:
     blocks = [block for block in document.blocks if block.kind == kind]
     if not blocks:
         return None
-    if kind != "page-number" and len({block.source_text for block in blocks}) != 1:
-        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    if kind != "page-number":
+        label = _validated_composite_running_label(blocks, kind)
+        if label is not None:
+            return replace(blocks[0], source_text=label)
+        if len({block.source_text for block in blocks}) != 1:
+            raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
     return blocks[0]
+
+
+_COMPOSITE_RUNNING_PAGE_PATTERN = re.compile(r"(?:\d+|[ivxlcdm]+)\Z", re.I)
+
+
+def _embedded_running_page_number(document: PdfDocument, kind: str) -> bool:
+    blocks = [block for block in document.blocks if block.kind == kind]
+    return bool(blocks) and _validated_composite_running_label(blocks, kind) is not None
+
+
+def _validated_composite_running_label(
+    blocks: Sequence[PdfBlock],
+    kind: str,
+) -> str | None:
+    parsed = [_composite_running_band(block.source_text) for block in blocks]
+    if not any(item is not None for item in parsed):
+        return None
+    if len(blocks) < 2 or any(item is None for item in parsed):
+        if len({block.source_text for block in blocks}) == 1:
+            return None
+        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    evidence = [item for item in parsed if item is not None]
+    if len({label.casefold() for label, _value in evidence}) != 1:
+        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    ordered = sorted(
+        zip(blocks, evidence, strict=True),
+        key=lambda item: item[0].page_number,
+    )
+    if any(
+        right_evidence[1] - left_evidence[1]
+        != right_block.page_number - left_block.page_number
+        for (left_block, left_evidence), (right_block, right_evidence)
+        in zip(ordered, ordered[1:])
+    ):
+        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    return evidence[0][0]
+
+
+def _composite_running_band(text: str) -> tuple[str, int] | None:
+    parts = [part.strip() for part in text.split("|")]
+    if len(parts) != 2 or any(not part for part in parts):
+        return None
+    matches = [
+        _COMPOSITE_RUNNING_PAGE_PATTERN.fullmatch(part) is not None for part in parts
+    ]
+    if sum(matches) != 1:
+        return None
+    token_index = matches.index(True)
+    value = _running_page_value(parts[token_index])
+    if value is None:
+        return None
+    return parts[1 - token_index], value
+
+
+def _running_page_value(token: str) -> int | None:
+    if token.isdecimal():
+        value = int(token)
+        return value if value > 0 else None
+    values = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+    total = 0
+    previous = 0
+    for character in reversed(token.casefold()):
+        value = values.get(character)
+        if value is None:
+            return None
+        total += -value if value < previous else value
+        previous = max(previous, value)
+    return (
+        total
+        if 0 < total <= 3999 and _running_roman_token(total) == token.casefold()
+        else None
+    )
+
+
+def _running_roman_token(value: int) -> str:
+    parts: list[str] = []
+    for amount, token in (
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ):
+        while value >= amount:
+            parts.append(token)
+            value -= amount
+    return "".join(parts)
 
 
 def _table_blocks(document: PdfDocument) -> dict[str, list[PdfBlock]]:

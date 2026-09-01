@@ -379,6 +379,27 @@ def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     ]
 
 
+def test_build_text_blocks_does_not_merge_a_side_by_side_row_into_prior_prose() -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("Full-width prose", x0=10, x1=190, top=10, bottom=20),
+            _word("Editors: Left", x0=10, x1=90, top=22, bottom=32),
+            _word("Copyeditor: Right", x0=110, x1=190, top=22, bottom=32),
+        ]
+    )
+
+    blocks = build_text_blocks(lines, page_number=1)
+
+    assert [block.source_text for block in blocks] == [
+        "Full-width prose",
+        "Editors: Left",
+        "Copyeditor: Right",
+    ]
+    assert blocks[1].bbox[2] <= blocks[2].bbox[0]
+
+
 @pytest.mark.parametrize(
     "marker",
     ["-", "1.", "1.2)", "A.", "A)", "iv)", "‣", "◦", "⁃", "∙"],
@@ -707,6 +728,302 @@ def test_repeated_band_classification_accepts_exactly_sixty_percent() -> None:
     ]
 
 
+def test_running_band_classification_handles_alternating_page_number_sides() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    footer_texts = [
+        "vi | Table of Contents",
+        "Table of Contents | vii",
+        "8 | Table of Contents",
+        "One-off note | ix",
+    ]
+    pages = []
+    for page_number, footer_text in enumerate(footer_texts, start=1):
+        footer_x0, footer_x1 = (
+            (10, 90) if footer_text.split("|", 1)[0].strip().lower() in {"vi", "8"}
+            else (110, 190)
+        )
+        lines = group_words_into_lines(
+            [
+                _word(
+                    f"Body {page_number}",
+                    x0=20,
+                    x1=100,
+                    top=50,
+                    bottom=60,
+                ),
+                _word(
+                    footer_text,
+                    x0=footer_x0,
+                    x1=footer_x1,
+                    top=185,
+                    bottom=195,
+                ),
+            ]
+        )
+        pages.append(
+            ([line.with_page_geometry(200, 200) for line in lines], 200.0)
+        )
+
+    classified = classify_document_lines(pages)
+
+    assert [lines[1].kind for lines in classified] == [
+        "footer",
+        "footer",
+        "footer",
+        "paragraph",
+    ]
+    assert [lines[1].text for lines in classified[:3]] == footer_texts[:3]
+
+
+def test_running_band_rejects_nonsequential_page_like_notice() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    pages = []
+    for footer_text, x0, x1 in (
+        ("i | Important notice", 10, 90),
+        ("Important notice | 999", 110, 190),
+    ):
+        lines = group_words_into_lines(
+            [
+                _word("Body", x0=20, x1=100, top=50, bottom=60),
+                _word(footer_text, x0=x0, x1=x1, top=185, bottom=195),
+            ]
+        )
+        pages.append(([line.with_page_geometry(200, 200) for line in lines], 200.0))
+
+    classified = classify_document_lines(pages)
+
+    assert [lines[1].kind for lines in classified] == ["paragraph", "paragraph"]
+
+
+def test_order_page_lines_keeps_running_footer_outside_column_assignment() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+        order_page_lines,
+    )
+
+    pages = []
+    for footer_text, footer_x0, footer_x1 in (
+        ("vi | Table of Contents", 10, 90),
+        ("Table of Contents | vii", 110, 190),
+    ):
+        lines = group_words_into_lines(
+            [
+                _word("Left one", x0=10, x1=50, top=40, bottom=50),
+                _word("1", x0=150, x1=190, top=40, bottom=50),
+                _word("Left two", x0=10, x1=50, top=70, bottom=80),
+                _word("2", x0=150, x1=190, top=70, bottom=80),
+                _word(
+                    footer_text,
+                    x0=footer_x0,
+                    x1=footer_x1,
+                    top=185,
+                    bottom=195,
+                ),
+            ]
+        )
+        pages.append(
+            ([line.with_page_geometry(200, 200) for line in lines], 200.0)
+        )
+
+    classified = classify_document_lines(pages)
+    ordered = order_page_lines(classified[0], 200)
+
+    assert [line.text for line in ordered] == [
+        "Left one",
+        "Left two",
+        "1",
+        "2",
+        "vi | Table of Contents",
+    ]
+
+
+def test_order_page_lines_treats_evidenced_dot_leader_toc_entries_as_spanning_content() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+        order_page_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word(
+                "7. Transactions. . . . . . . . . 213",
+                x0=10,
+                x1=190,
+                top=10,
+                bottom=20,
+            ),
+            _word(
+                "8. The Trouble with Distributed Systems. . . . . 235",
+                x0=10,
+                x1=190,
+                top=22,
+                bottom=28,
+            ),
+            _word("First topic", x0=10, x1=50, top=30, bottom=40),
+            _word("214", x0=150, x1=190, top=30, bottom=40),
+            _word("Second topic", x0=10, x1=50, top=50, bottom=60),
+            _word("215", x0=150, x1=190, top=50, bottom=60),
+        ]
+    )
+
+    classified = classify_document_lines(
+        [([line.with_page_geometry(200, 200) for line in lines], 200.0)]
+    )[0]
+    assert [line.kind for line in classified[:2]] == ["list-item", "list-item"]
+    assert [line.is_spanning for line in classified[:2]] == [True, True]
+    ordered = order_page_lines(classified, 200)
+
+    assert [line.text for line in ordered] == [
+        "7. Transactions. . . . . . . . . 213",
+        "8. The Trouble with Distributed Systems. . . . . 235",
+        "First topic",
+        "Second topic",
+        "214",
+        "215",
+    ]
+
+
+def test_order_page_lines_does_not_treat_one_dot_leader_notice_as_toc() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+        order_page_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word("Wait. . . . . . . . . 123", x0=10, x1=190, top=10, bottom=20),
+            _word("Left one", x0=10, x1=50, top=30, bottom=40),
+            _word("Right one", x0=150, x1=190, top=30, bottom=40),
+            _word("Left two", x0=10, x1=50, top=50, bottom=60),
+            _word("Right two", x0=150, x1=190, top=50, bottom=60),
+        ]
+    )
+    classified = classify_document_lines(
+        [([line.with_page_geometry(200, 200) for line in lines], 200.0)]
+    )[0]
+
+    with pytest.raises(PdfExtractionError, match="conflicting column evidence"):
+        order_page_lines(classified, 200)
+
+
+def test_order_page_lines_rejects_column_gutter_without_aligned_rows() -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("Right-aligned attribution", x0=150, x1=190, top=20, bottom=30),
+            _word("Full-width quotation", x0=10, x1=190, top=40, bottom=50),
+            _word("Full-width body", x0=10, x1=190, top=60, bottom=70),
+            _word("Wrapped list tail", x0=10, x1=50, top=90, bottom=100),
+        ]
+    )
+
+    ordered = order_page_lines(lines, 200)
+
+    assert [line.text for line in ordered] == [
+        "Right-aligned attribution",
+        "Full-width quotation",
+        "Full-width body",
+        "Wrapped list tail",
+    ]
+
+
+def test_find_clear_gutter_precomputes_vertical_alignment_once(monkeypatch) -> None:
+    from web_translator.pdf_layout import PdfLine, find_clear_gutter, group_words_into_lines
+
+    words = []
+    for row in range(40):
+        top = 10.0 + row * 12.0
+        words.extend(
+            [
+                _word(f"L{row}", x0=10, x1=80, top=top, bottom=top + 8),
+                _word(f"R{row}", x0=120, x1=190, top=top, bottom=top + 8),
+            ]
+        )
+    lines = group_words_into_lines(words)
+    original = PdfLine.vertical_overlap_ratio
+    calls = 0
+
+    def counted(left, right):
+        nonlocal calls
+        calls += 1
+        return original(left, right)
+
+    monkeypatch.setattr(PdfLine, "vertical_overlap_ratio", counted)
+
+    assert find_clear_gutter(lines, 200) == (80, 120)
+    assert calls <= len(lines) * len(lines)
+
+
+def test_group_words_keeps_one_monospaced_code_row_across_alignment_spaces() -> None:
+    from web_translator.pdf_layout import group_words_into_lines
+
+    words = [
+        _word(
+            "JOIN users",
+            x0=10,
+            x1=55,
+            top=10,
+            bottom=19,
+            size=9,
+            fontname="UbuntuMono-Regular",
+        ),
+        _word(
+            "ON sender_id",
+            x0=72.9,
+            x1=130,
+            top=10,
+            bottom=19,
+            size=9,
+            fontname="UbuntuMono-Regular",
+        ),
+    ]
+
+    assert [line.text for line in group_words_into_lines(words)] == [
+        "JOIN users ON sender_id"
+    ]
+
+
+def test_group_words_rejoins_mixed_font_fragments_on_one_visual_row() -> None:
+    from web_translator.pdf_layout import group_words_into_lines
+
+    words = [
+        _word("identifier,", x0=10, x1=50, top=12, bottom=22),
+        _word(
+            "user_id",
+            x0=54,
+            x1=80,
+            top=10,
+            bottom=20,
+            fontname="UbuntuMono-Regular",
+        ),
+        _word("Fields like", x0=84, x1=120, top=12, bottom=22),
+        _word(
+            "first_name",
+            x0=124,
+            x1=160,
+            top=10,
+            bottom=20,
+            fontname="UbuntuMono-Regular",
+        ),
+    ]
+
+    assert [line.text for line in group_words_into_lines(words)] == [
+        "identifier, user_id Fields like first_name"
+    ]
+
+
 def test_character_assignment_accepts_exactly_ninety_nine_percent() -> None:
     inspection = PdfInspection(
         page_count=1,
@@ -770,6 +1087,31 @@ def test_peer_overlap_accepts_exactly_ten_percent_and_rejects_above() -> None:
         _validate_peer_overlap([left, above])
     with pytest.raises(PdfExtractionError, match="above 10 percent.*block-0001"):
         _validate_peer_overlap([left, infinitesimally_above])
+
+
+def test_peer_overlap_accepts_tight_leading_between_consecutive_rows() -> None:
+    prose_style = PdfBlockStyle(10.5, False, "left", 0, 0)
+    code_style = PdfBlockStyle(9, False, "left", 20, 0)
+    prose = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0, 0, 200, 20),
+        style=prose_style,
+        source_text="Prose immediately before code:",
+    )
+    code = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="paragraph",
+        bbox=(20, 15, 150, 24),
+        style=code_style,
+        source_text="SELECT value FROM records",
+    )
+
+    _validate_peer_overlap([prose, code])
 
 
 def test_extract_pdf_emits_heading_context_and_opaque_locators(tmp_path: Path) -> None:
@@ -1249,6 +1591,34 @@ def _ambiguous_caption_pdf(path: Path) -> Path:
     return path
 
 
+def _figure_with_embedded_table_pdf(path: Path) -> Path:
+    canvas = Canvas(str(path), pagesize=(504, 662))
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(
+        72,
+        610,
+        "Composite diagrams keep their selectable labels inside the original figure.",
+    )
+    canvas.drawString(
+        72,
+        594,
+        "Surrounding body prose remains independently selectable and translatable.",
+    )
+    canvas.rect(72, 260, 360, 220, stroke=1, fill=0)
+    canvas.line(300, 280, 360, 330)
+    canvas.rect(90, 330, 130, 80, stroke=1, fill=0)
+    canvas.line(155, 330, 155, 410)
+    canvas.line(90, 370, 220, 370)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(100, 388, "id")
+    canvas.drawString(165, 388, "name")
+    canvas.drawString(100, 348, "12")
+    canvas.drawString(165, 348, "jack")
+    canvas.drawString(72, 242, "Figure 1. Composite diagram with an embedded table")
+    canvas.save()
+    return path
+
+
 def _ambiguous_link_pdf(path: Path) -> Path:
     canvas = Canvas(str(path), pagesize=(400, 400))
     canvas.drawString(50, 300, "First visible owner")
@@ -1674,6 +2044,29 @@ def test_extract_pdf_rejects_ambiguous_figure_caption_pairing(
         )
 
 
+def test_extract_pdf_assigns_embedded_table_text_to_its_composite_figure(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    document = extract_pdf(
+        _figure_with_embedded_table_pdf(tmp_path / "composite-figure.pdf"),
+        tmp_path / "document.json",
+        tmp_path / "segments.jsonl",
+        tmp_path / "media",
+    )
+
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    captions = [block for block in document.blocks if block.kind == "caption"]
+    assert len(figures) == 1
+    assert len(captions) == 1
+    assert figures[0].caption_id == captions[0].id
+    assert document.table_cells == []
+    assert all(segment.semantic_type != "table-cell" for segment in read_segments(
+        tmp_path / "segments.jsonl"
+    ))
+
+
 def test_pair_figure_captions_rejects_caption_like_orphan() -> None:
     from web_translator.pdf_layout import pair_figure_captions
 
@@ -1689,6 +2082,60 @@ def test_pair_figure_captions_rejects_caption_like_orphan() -> None:
 
     with pytest.raises(PdfExtractionError, match="orphan figure-caption"):
         pair_figure_captions([orphan])
+
+
+def test_pair_figure_captions_accepts_one_unique_page_wide_matching() -> None:
+    from web_translator.pdf_layout import pair_figure_captions
+
+    style = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    blocks = [
+        PdfBlock(
+            id="pdf:page-0001:block-0001",
+            page_number=1,
+            order=0,
+            kind="figure",
+            bbox=(0.0, 0.0, 100.0, 100.0),
+            style=style,
+            media_path="media/figure-0001.png",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0002",
+            page_number=1,
+            order=1,
+            kind="paragraph",
+            bbox=(0.0, 105.0, 100.0, 115.0),
+            style=style,
+            source_text="Figure 1. First figure",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0003",
+            page_number=1,
+            order=2,
+            kind="figure",
+            bbox=(0.0, 130.0, 100.0, 230.0),
+            style=style,
+            media_path="media/figure-0002.png",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0004",
+            page_number=1,
+            order=3,
+            kind="paragraph",
+            bbox=(0.0, 235.0, 100.0, 245.0),
+            style=style,
+            source_text="Figure 2. Second figure",
+        ),
+    ]
+
+    paired = pair_figure_captions(blocks)
+    by_id = {block.id: block for block in paired}
+
+    assert by_id["pdf:page-0001:block-0001"].caption_id == (
+        "pdf:page-0001:block-0002"
+    )
+    assert by_id["pdf:page-0001:block-0003"].caption_id == (
+        "pdf:page-0001:block-0004"
+    )
 
 
 def test_detect_footnotes_rejects_two_bodies_claiming_one_marker() -> None:
@@ -1740,6 +2187,420 @@ def test_detect_footnotes_rejects_two_bodies_claiming_one_marker() -> None:
 
     with pytest.raises(PdfExtractionError, match="ambiguous footnote"):
         detect_footnotes([owner, context, *bodies], [marker], page_height=792.0)
+
+
+def test_detect_footnotes_pairs_a_lowercase_roman_marker() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    marker_style = PdfBlockStyle(5.0, False, "left", 0.0, 0.0)
+    footnote_style = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    blocks = [
+        PdfBlock(
+            id="pdf:page-0001:block-0001",
+            page_number=1,
+            order=0,
+            kind="paragraph",
+            bbox=(0.0, 100.0, 200.0, 120.0),
+            style=normal,
+            source_text="Body with a roman footnote",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0002",
+            page_number=1,
+            order=1,
+            kind="paragraph",
+            bbox=(180.0, 100.0, 185.0, 106.0),
+            style=marker_style,
+            source_text="i",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0003",
+            page_number=1,
+            order=2,
+            kind="list-item",
+            bbox=(0.0, 180.0, 150.0, 190.0),
+            style=footnote_style,
+            source_text="i. Roman footnote definition",
+        ),
+        PdfBlock(
+            id="pdf:page-0001:block-0004",
+            page_number=1,
+            order=3,
+            kind="paragraph",
+            bbox=(0.0, 130.0, 180.0, 145.0),
+            style=normal,
+            source_text="Additional normal prose",
+        ),
+    ]
+
+    detected = detect_footnotes(
+        blocks,
+        [
+            {
+                "text": "i",
+                "x0": 180.0,
+                "x1": 185.0,
+                "top": 100.0,
+                "bottom": 106.0,
+                "size": 5.0,
+            }
+        ],
+        page_height=200.0,
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert "pdf:page-0001:block-0002" not in by_id
+    assert by_id["pdf:page-0001:block-0001"].destination == (
+        "pdf:page-0001:block-0003"
+    )
+    assert by_id["pdf:page-0001:block-0001"].source_text.endswith(" i")
+    assert by_id["pdf:page-0001:block-0003"].kind == "footnote"
+
+
+def test_footnote_marker_does_not_treat_roman_letter_words_as_markers() -> None:
+    from web_translator.pdf_layout import _leading_footnote_marker
+
+    assert _leading_footnote_marker("XML data remains ordinary prose") is None
+
+
+def test_detect_footnotes_uses_a_trailing_marker_to_resolve_bbox_overlap() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    small = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 100.0, 200.0, 120.0),
+        style=normal,
+        source_text="The models disconnect ii",
+    )
+    overlapping = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="paragraph",
+        bbox=(0.0, 110.0, 200.0, 130.0),
+        style=normal,
+        source_text="between the models",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0003",
+        page_number=1,
+        order=2,
+        kind="list-item",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=small,
+        source_text="ii. Impedance definition",
+    )
+    context = replace(
+        overlapping,
+        id="pdf:page-0001:block-0004",
+        order=3,
+        bbox=(0.0, 140.0, 200.0, 155.0),
+        source_text="Additional normal prose",
+    )
+    marker_characters = [
+        {
+            "text": "i",
+            "x0": 150.0,
+            "x1": 153.0,
+            "top": 110.0,
+            "bottom": 115.0,
+            "size": 6.0,
+        },
+        {
+            "text": "i",
+            "x0": 153.0,
+            "x1": 156.0,
+            "top": 110.0,
+            "bottom": 115.0,
+            "size": 6.0,
+        },
+    ]
+    body_character = {
+        "text": "A",
+        "x0": 140.0,
+        "x1": 148.0,
+        "top": 100.0,
+        "bottom": 108.0,
+        "size": 10.0,
+    }
+
+    detected = detect_footnotes(
+        [owner, overlapping, footnote, context],
+        [body_character, *marker_characters],
+        page_height=200.0,
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[owner.id].destination == footnote.id
+    assert by_id[owner.id].bbox[3] == 108.0
+    assert by_id[overlapping.id].destination is None
+    assert by_id[footnote.id].kind == "footnote"
+
+
+def test_detect_footnotes_rejects_unrelated_small_glyph_as_trailing_marker() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    small = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 100.0, 200.0, 120.0),
+        style=normal,
+        source_text="The models disconnect ii",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="list-item",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=small,
+        source_text="ii. Impedance definition",
+    )
+    context = replace(
+        owner,
+        id="pdf:page-0001:block-0003",
+        order=2,
+        bbox=(0.0, 140.0, 200.0, 155.0),
+        source_text="Additional normal prose",
+    )
+
+    detected = detect_footnotes(
+        [owner, footnote, context],
+        [
+            {
+                "text": "x",
+                "x0": 150.0,
+                "x1": 153.0,
+                "top": 110.0,
+                "bottom": 115.0,
+                "size": 6.0,
+            }
+        ],
+        page_height=200.0,
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[owner.id].destination is None
+    assert by_id[footnote.id].kind == "list-item"
+
+
+def test_detect_footnotes_rejects_matching_superscript_before_final_marker() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    small = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 100.0, 200.0, 140.0),
+        style=normal,
+        source_text="Inline superscript ii then World War II",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="list-item",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=small,
+        source_text="ii. Unrelated footnote",
+    )
+    context = replace(
+        owner,
+        id="pdf:page-0001:block-0003",
+        order=2,
+        bbox=(0.0, 150.0, 200.0, 165.0),
+        source_text="Additional normal prose",
+    )
+    characters = [
+        {"text": "i", "x0": 80.0, "x1": 83.0, "top": 105.0, "bottom": 110.0, "size": 6.0},
+        {"text": "i", "x0": 83.0, "x1": 86.0, "top": 105.0, "bottom": 110.0, "size": 6.0},
+        {"text": "W", "x0": 10.0, "x1": 18.0, "top": 125.0, "bottom": 135.0, "size": 10.0},
+        {"text": "I", "x0": 180.0, "x1": 184.0, "top": 125.0, "bottom": 135.0, "size": 10.0},
+        {"text": "I", "x0": 184.0, "x1": 188.0, "top": 125.0, "bottom": 135.0, "size": 10.0},
+    ]
+
+    detected = detect_footnotes(
+        [owner, footnote, context], characters, page_height=200.0
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[owner.id].destination is None
+    assert by_id[footnote.id].kind == "list-item"
+
+
+def test_detect_footnotes_accepts_raised_marker_on_final_visual_row() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    small = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 100.0, 200.0, 120.0),
+        style=normal,
+        source_text="Normal baseline ends with ii",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="list-item",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=small,
+        source_text="ii. Raised marker footnote",
+    )
+    context = replace(
+        owner,
+        id="pdf:page-0001:block-0003",
+        order=2,
+        bbox=(0.0, 140.0, 200.0, 155.0),
+        source_text="Additional normal prose",
+    )
+    characters = [
+        {"text": "e", "x0": 140.0, "x1": 148.0, "top": 110.0, "bottom": 120.0, "size": 10.0},
+        {"text": "i", "x0": 150.0, "x1": 153.0, "top": 100.0, "bottom": 108.0, "size": 6.0},
+        {"text": "i", "x0": 153.0, "x1": 156.0, "top": 100.0, "bottom": 108.0, "size": 6.0},
+    ]
+
+    detected = detect_footnotes(
+        [owner, footnote, context], characters, page_height=200.0
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[owner.id].destination == footnote.id
+    assert by_id[footnote.id].kind == "footnote"
+
+
+def test_detect_footnotes_rejects_tight_leading_previous_row_marker() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    normal = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    small = PdfBlockStyle(6.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 90.0, 180.0, 125.0),
+        style=normal,
+        source_text="Earlier superscript ii and a short final line II",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="list-item",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=small,
+        source_text="ii. Unrelated tight-leading footnote",
+    )
+    context = replace(
+        owner,
+        id="pdf:page-0001:block-0003",
+        order=2,
+        bbox=(0.0, 140.0, 180.0, 155.0),
+        source_text="Additional normal prose",
+    )
+    characters = [
+        {"text": "x", "x0": 10.0, "x1": 100.0, "top": 95.0, "bottom": 105.0, "size": 10.0},
+        {"text": "i", "x0": 102.0, "x1": 105.0, "top": 90.0, "bottom": 98.0, "size": 6.0},
+        {"text": "i", "x0": 105.0, "x1": 108.0, "top": 90.0, "bottom": 98.0, "size": 6.0},
+        {"text": "I", "x0": 10.0, "x1": 14.0, "top": 100.0, "bottom": 110.0, "size": 10.0},
+        {"text": "I", "x0": 14.0, "x1": 18.0, "top": 100.0, "bottom": 110.0, "size": 10.0},
+    ]
+
+    detected = detect_footnotes(
+        [owner, footnote, context], characters, page_height=200.0
+    )
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[owner.id].destination is None
+    assert by_id[footnote.id].kind == "list-item"
+
+
+def test_build_segments_protects_numeric_and_roman_footnote_markers() -> None:
+    from web_translator.pdf_extract import _build_segments
+
+    style = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 10.0, 180.0, 20.0),
+        style=style,
+        source_text="A roman note ii continues after the marker",
+        destination="pdf:page-0001:block-0002",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="footnote",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=style,
+        source_text="ii. Do not translate the marker",
+    )
+    numeric = replace(
+        footnote,
+        id="pdf:page-0001:block-0003",
+        order=2,
+        source_text="12 Numeric marker",
+    )
+
+    _blocks, segments = _build_segments([owner, footnote, numeric])
+
+    assert [token.value for token in segments[0].protected] == ["ii"]
+    assert [token.value for token in segments[1].protected] == ["ii."]
+    assert [token.value for token in segments[2].protected] == ["12"]
+    assert all(
+        token.kind == "footnote-marker"
+        for segment in segments
+        for token in segment.protected
+    )
+
+
+def test_build_segments_rejects_ambiguous_owner_footnote_marker() -> None:
+    from web_translator.pdf_extract import _build_segments
+
+    style = PdfBlockStyle(10.0, False, "left", 0.0, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(0.0, 10.0, 180.0, 20.0),
+        style=style,
+        source_text="Marker ii appears twice ii",
+        destination="pdf:page-0001:block-0002",
+    )
+    footnote = PdfBlock(
+        id="pdf:page-0001:block-0002",
+        page_number=1,
+        order=1,
+        kind="footnote",
+        bbox=(0.0, 180.0, 180.0, 190.0),
+        style=style,
+        source_text="ii. Ambiguous owner",
+    )
+
+    with pytest.raises(PdfExtractionError, match="ambiguous owner footnote marker"):
+        _build_segments([owner, footnote])
 
 
 @pytest.mark.parametrize(

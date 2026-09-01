@@ -32,6 +32,7 @@ from web_translator.pdf_layout import (
     PdfExtractionError,
     PdfExtractionWarning,
     PdfLine,
+    TableDetectionResult,
     build_text_blocks,
     classify_document_lines,
     detect_footnotes,
@@ -357,6 +358,16 @@ def _extract_page_materials(
                     ]
                 except PdfMediaError as error:
                     raise PdfExtractionError(str(error)) from error
+                characters = tuple(
+                    dict(character)
+                    for character in page.chars
+                    if isinstance(character, Mapping)
+                )
+                tables = _exclude_tables_inside_figures(
+                    tables,
+                    regions,
+                    characters,
+                )
                 raw_words = page.extract_words(
                     return_chars=True,
                     extra_attrs=["fontname", "size"],
@@ -379,11 +390,6 @@ def _extract_page_materials(
                     else line
                     for line in lines
                 ]
-                characters = tuple(
-                    dict(character)
-                    for character in page.chars
-                    if isinstance(character, Mapping)
-                )
                 figure_character_count = sum(
                     1
                     for character in characters
@@ -410,6 +416,54 @@ def _extract_page_materials(
         raise
     except Exception as error:
         raise PdfExtractionError(f"cannot extract PDF words: {error}") from error
+
+
+def _exclude_tables_inside_figures(
+    tables: TableDetectionResult,
+    regions: Sequence[FigureRegion],
+    characters: Sequence[Mapping[str, object]],
+) -> TableDetectionResult:
+    figure_bboxes = [region.bbox for region in regions]
+    retained_bboxes = tuple(
+        bbox
+        for bbox in tables.bboxes
+        if not any(_bbox_inside(bbox, figure_bbox) for figure_bbox in figure_bboxes)
+    )
+    if len(retained_bboxes) == len(tables.bboxes):
+        return tables
+    table_ids = list(dict.fromkeys(block.table_id for block in tables.blocks))
+    if len(table_ids) != len(tables.bboxes) or any(
+        table_id is None for table_id in table_ids
+    ):
+        raise PdfExtractionError("table evidence cannot be mapped to detected bounds")
+    retained_ids = {
+        table_id
+        for table_id, bbox in zip(table_ids, tables.bboxes, strict=True)
+        if bbox in retained_bboxes
+    }
+    return TableDetectionResult(
+        blocks=tuple(block for block in tables.blocks if block.table_id in retained_ids),
+        cells=tuple(cell for cell in tables.cells if cell.table_id in retained_ids),
+        bboxes=retained_bboxes,
+        owned_character_count=sum(
+            1
+            for character in characters
+            if str(character.get("text", "")).strip()
+            and _mapping_center_in_any_bbox(character, retained_bboxes)
+        ),
+    )
+
+
+def _bbox_inside(
+    inner: tuple[float, float, float, float],
+    outer: tuple[float, float, float, float],
+) -> bool:
+    return (
+        inner[0] >= outer[0] - 1e-6
+        and inner[1] >= outer[1] - 1e-6
+        and inner[2] <= outer[2] + 1e-6
+        and inner[3] <= outer[3] + 1e-6
+    )
 
 
 def _extract_page_lines(
@@ -539,11 +593,31 @@ def _validate_peer_overlap(blocks: list[PdfBlock]) -> None:
                 if intersection == 0:
                     continue
                 smaller_area = min(_bbox_area(left.bbox), _bbox_area(right.bbox))
-                if smaller_area > 0 and intersection / smaller_area > 0.10:
+                if (
+                    smaller_area > 0
+                    and intersection / smaller_area > 0.10
+                    and not _is_tight_leading(left, right)
+                ):
                     raise PdfExtractionError(
                         "PDF peer text blocks overlap above 10 percent on page "
                         f"{page_number}: {left.id}, {right.id}"
                     )
+
+
+def _is_tight_leading(left: PdfBlock, right: PdfBlock) -> bool:
+    text_kinds = {"heading", "paragraph", "list-item", "caption", "footnote"}
+    overlap_height = max(
+        0.0,
+        min(left.bbox[3], right.bbox[3]) - max(left.bbox[1], right.bbox[1]),
+    )
+    return (
+        left.kind in text_kinds
+        and right.kind in text_kinds
+        and right.order == left.order + 1
+        and right.bbox[1] > left.bbox[1]
+        and overlap_height
+        <= max(left.style.font_size, right.style.font_size) * 0.50
+    )
 
 
 def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
@@ -587,8 +661,20 @@ def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segmen
     headings: list[str] = []
     drafts: list[tuple[PdfBlock, list[str], str, list[ProtectedToken]]] = []
     segment_by_block: dict[str, str] = {}
+    footnote_markers = {
+        block.id: marker
+        for block in target_blocks
+        if block.kind == "footnote"
+        and (marker := _pdf_leading_marker_value(block.source_text)) is not None
+    }
     for identifier, block in zip(identifiers, target_blocks, strict=True):
         source_text, protected = protect_fragment(block.source_text)
+        source_text, protected = _protect_pdf_numbers_and_markers(
+            source_text,
+            list(protected),
+            leading_marker=block.kind == "footnote",
+            owner_marker=footnote_markers.get(block.destination or ""),
+        )
         drafts.append((block, list(headings), source_text, list(protected)))
         segment_by_block[block.id] = identifier
         if block.kind == "heading":
@@ -619,6 +705,74 @@ def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segmen
     return [
         replace(block, segment_id=segment_by_block.get(block.id)) for block in blocks
     ], segments
+
+
+_PDF_PLACEHOLDER_PATTERN = re.compile(r"⟦WT:(\d{6})⟧")
+_PDF_LEADING_MARKER_PATTERN = re.compile(
+    r"^(?P<space>\s*)(?P<marker>(?:\d{1,3}|[*†‡])(?:[.)])?|"
+    r"(?:[ivxlcdm]{1,6}[.)]|\([ivxlcdm]{1,6}\)|\[[ivxlcdm]{1,6}\]))(?=\s)",
+    re.IGNORECASE,
+)
+_PDF_NUMBER_PATTERN = re.compile(r"(?<![\w⟦])[-+]?\d+(?:[,.]\d+)*(?:%)?(?![\w⟧])")
+
+
+def _protect_pdf_numbers_and_markers(
+    text: str,
+    protected: list[ProtectedToken],
+    *,
+    leading_marker: bool,
+    owner_marker: str | None,
+) -> tuple[str, list[ProtectedToken]]:
+    next_index = max(
+        (int(match.group(1)) for match in _PDF_PLACEHOLDER_PATTERN.finditer(text)),
+        default=-1,
+    ) + 1
+
+    def replace_match(
+        rendered: str,
+        match: re.Match[str],
+        kind: str,
+    ) -> str:
+        nonlocal next_index
+        placeholder = f"⟦WT:{next_index:06d}⟧"
+        next_index += 1
+        value = match.group("marker") if "marker" in match.groupdict() else match.group()
+        protected.append(ProtectedToken(placeholder, kind, value))
+        start, end = match.span("marker") if "marker" in match.groupdict() else match.span()
+        return f"{rendered[:start]}{placeholder}{rendered[end:]}"
+
+    if leading_marker and (match := _PDF_LEADING_MARKER_PATTERN.search(text)) is not None:
+        text = replace_match(text, match, "footnote-marker")
+    if owner_marker is not None:
+        owner_pattern = re.compile(
+            rf"(?<!\w)(?P<marker>{re.escape(owner_marker)})(?!\w)",
+            re.IGNORECASE,
+        )
+        matches = list(owner_pattern.finditer(text))
+        if len(matches) != 1:
+            raise PdfExtractionError(
+                f"ambiguous owner footnote marker {owner_marker!r}"
+            )
+        text = replace_match(text, matches[0], "footnote-marker")
+
+    position = 0
+    while (match := _PDF_NUMBER_PATTERN.search(text, position)) is not None:
+        if any(
+            placeholder.start() <= match.start() < placeholder.end()
+            for placeholder in _PDF_PLACEHOLDER_PATTERN.finditer(text)
+        ):
+            position = match.end()
+            continue
+        text = replace_match(text, match, "number")
+        position = match.start() + len(f"⟦WT:{next_index - 1:06d}⟧")
+    return text, protected
+
+
+def _pdf_leading_marker_value(text: str) -> str | None:
+    match = _PDF_LEADING_MARKER_PATTERN.search(text)
+    if match is None:
+        return None
+    return re.sub(r"[\s\[\]().]", "", match.group("marker")).casefold()
 
 
 def _block_heading_level(block: PdfBlock, heading_sizes: list[int]) -> int:

@@ -686,17 +686,29 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
             for line in (temporary / "segments.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-    translations = [
-        {
-            "segment_id": record["id"],
-            "text": _FIXTURE_KOREAN_TRANSLATIONS[record["source_text"]]
-            + "".join(token["token"] for token in record["protected"]),
-            "notes": None,
-            "glossary_observations": {},
-        }
-        for record in records
-        if record["target"]
-    ]
+    translations = []
+    for record in records:
+        if not record["target"]:
+            continue
+        source = record["source_text"]
+        for token in record["protected"]:
+            source = source.replace(token["token"], token["value"])
+        translated = _FIXTURE_KOREAN_TRANSLATIONS[source]
+        for token in record["protected"]:
+            if token["value"] in translated:
+                translated = translated.replace(
+                    token["value"], token["token"], 1
+                )
+            else:
+                translated += token["token"]
+        translations.append(
+            {
+                "segment_id": record["id"],
+                "text": translated,
+                "notes": None,
+                "glossary_observations": {},
+            }
+        )
     if len(translations) != sum(record["target"] for record in records):
         raise AssertionError("fixture translation mapping must cover every target")
     translations_dir = fixture_dir / "translations"
@@ -727,7 +739,7 @@ _FIXTURE_KOREAN_TRANSLATIONS = {
     "Figure 1. Raster workflow status panel.": "그림 1. 래스터 작업 흐름 상태 패널.",
     "Figure 2. Vector review coverage trend.": "그림 2. 벡터 검토 범위 추세.",
     "The raster panel verifies image preservation and the vector plot verifies path rendering. Each caption follows its figure directly so extraction retains an unambiguous pair. Review checks sharp rendering, readable labels, and the absence of clipping or overlap.": "래스터 패널은 이미지 보존을 검증하고 벡터 그래프는 경로 렌더링을 검증합니다. 각 캡션은 해당 그림 바로 뒤에 배치되어 추출 시 모호하지 않은 쌍을 유지합니다. 검토는 선명한 렌더링, 읽기 쉬운 레이블 및 잘림이나 겹침이 없음을 확인합니다.",
-    "Two-Column Evidence Review": "두 열 증거 검토", "Column 1 first logical sentence. Column 1 second logical sentence.": "첫 번째 열의 첫 논리 문장입니다. 첫 번째 열의 두 번째 논리 문장입니다.", "Column 2 first logical sentence. Column 2 second logical sentence.": "두 번째 열의 첫 논리 문장입니다. 두 번째 열의 두 번째 논리 문장입니다.",
+    "Two-Column Evidence Review": "두 열 증거 검토", "Column 1 first logical sentence. Column 1 second logical sentence.": "1열의 첫 논리 문장입니다. 1열의 두 번째 논리 문장입니다.", "Column 2 first logical sentence. Column 2 second logical sentence.": "2열의 첫 논리 문장입니다. 2열의 두 번째 논리 문장입니다.",
     "Page-Local Footnote Evidence": "페이지 내 각주 증거", "Source order is validated before bounded zone planning begins.": "제한된 영역 계획을 시작하기 전에 원본 순서를 검증합니다.", "Contact-sheet evidence covers every rendered output page exactly once.": "연락처 시트는 렌더링된 각 출력 페이지를 정확히 한 번 포함합니다.", "Semantic review checks every required quality dimension.": "의미 검토는 모든 필수 품질 기준을 확인합니다.", "Validated Korean text remains selectable in the staged PDF.": "검증된 한국어 텍스트는 스테이징 PDF에서 선택 가능한 상태로 유지됩니다.", "Automated QA records exact output and contact-sheet page counts.": "자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록합니다.", "Final publication exposes exactly three reviewed artifacts.": "최종 게시에는 검토된 세 가지 산출물만 공개됩니다.", "The deterministic workflow includes a page-local note 1": "결정론적 작업 흐름에는 페이지 내 주석 1이 포함됩니다.", "1 Footnote evidence remains linked to its marker.": "1 각주 증거는 해당 표식에 연결된 상태로 유지됩니다.",
     "Semantic review checks every required quality dimension. Validated Korean text remains selectable in the staged PDF. Automated QA records exact output and contact-sheet page counts. Final publication exposes exactly three reviewed artifacts.": "의미 검토는 모든 필수 품질 기준을 확인하며, 검증된 한국어 텍스트는 스테이징 PDF에서 선택 가능하게 유지됩니다. 자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록하고 최종 게시에는 검토된 세 가지 산출물만 공개됩니다.",
     "First half measurements summarize deterministic acceptance outcomes for the release.": "상반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.", "Second half measurements summarize deterministic acceptance outcomes for the release.": "하반기 측정값은 릴리스의 결정론적 승인 결과를 요약합니다.", "First half metrics": "상반기 지표", "Second half metrics": "하반기 지표", "Measure": "측정 항목", "Observed": "관찰값", "Required": "필수값", "Selectable characters": "선택 가능한 문자", "At least 100": "최소 100개", "Reviewed pages": "검토한 페이지", "Required findings": "필수 지적 사항", "Published artifacts": "게시된 산출물", "Merged header cells retain their logical span and all body rows remain readable. The same report structure continues on the next page without losing table evidence.": "병합된 머리글 셀은 논리적 범위를 유지하고 모든 본문 행은 계속 읽을 수 있습니다. 동일한 보고서 구조는 표 증거를 잃지 않고 다음 페이지로 이어집니다.",

@@ -117,10 +117,10 @@ _SEMANTIC_ORACLE = {
     "two-column-footnotes-v1": {
         "Two-Column Evidence Review": "두 열 증거 검토",
         "Column 1 first logical sentence. Column 1 second logical sentence.": (
-            "첫 번째 열의 첫 논리 문장입니다. 첫 번째 열의 두 번째 논리 문장입니다."
+            "1열의 첫 논리 문장입니다. 1열의 두 번째 논리 문장입니다."
         ),
         "Column 2 first logical sentence. Column 2 second logical sentence.": (
-            "두 번째 열의 첫 논리 문장입니다. 두 번째 열의 두 번째 논리 문장입니다."
+            "2열의 첫 논리 문장입니다. 2열의 두 번째 논리 문장입니다."
         ),
         "Page-Local Footnote Evidence": "페이지 내 각주 증거",
         "Source order is validated before bounded zone planning begins.": (
@@ -206,13 +206,27 @@ def _assert_committed_fixture_semantics(
         assert Counter(_PROTECTED_TOKEN.findall(source)) == expected_token_counts
         assert Counter(_PROTECTED_TOKEN.findall(translation)) == expected_token_counts
 
-        if not any(character.isalpha() for character in source):
-            continue
-        previous = actual_pairs.setdefault(source, translation)
-        assert previous == translation, f"repeated source changed translation: {source!r}"
+        restored_source = source
+        restored_translation = translation
+        for token in protected:
+            assert isinstance(token, dict)
+            if token["kind"] in {"number", "footnote-marker"}:
+                restored_source = restored_source.replace(
+                    str(token["token"]), str(token["value"])
+                )
+                restored_translation = restored_translation.replace(
+                    str(token["token"]), str(token["value"])
+                )
 
         source_body = _without_protected_tokens(source, protected_tokens)
         translation_body = _without_protected_tokens(translation, protected_tokens)
+        if not any(character.isalpha() for character in source_body):
+            continue
+        previous = actual_pairs.setdefault(restored_source, restored_translation)
+        assert previous == restored_translation, (
+            f"repeated source changed translation: {restored_source!r}"
+        )
+
         assert _KOREAN_SYLLABLE.search(translation_body), (
             f"alphabetic source lacks Korean translation: {source!r}"
         )
@@ -226,7 +240,9 @@ def _assert_committed_fixture_semantics(
         assert _LATIN_ALPHABET.search(prose_candidate) is None, (
             f"Latin alphabet remains in translation: {translation!r}"
         )
-        normalized_translations[source] = translation_body
+        normalized_translations[restored_source] = _without_protected_tokens(
+            restored_translation, protected_tokens
+        )
 
     assert actual_pairs == oracle, "literal semantic oracle mismatch"
     assert len(set(normalized_translations.values())) == len(normalized_translations), (

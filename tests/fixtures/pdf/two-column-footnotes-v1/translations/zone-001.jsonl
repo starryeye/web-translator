@@ -1,9 +1,9 @@
 {"segment_id":"seg-000001","text":"두 열 증거 검토","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000002","text":"첫 번째 열의 첫 논리 문장입니다. 첫 번째 열의 두 번째 논리 문장입니다.","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000003","text":"두 번째 열의 첫 논리 문장입니다. 두 번째 열의 두 번째 논리 문장입니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000002","text":"⟦WT:000000⟧열의 첫 논리 문장입니다. ⟦WT:000001⟧열의 두 번째 논리 문장입니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000003","text":"⟦WT:000000⟧열의 첫 논리 문장입니다. ⟦WT:000001⟧열의 두 번째 논리 문장입니다.","notes":null,"glossary_observations":{}}
 {"segment_id":"seg-000004","text":"페이지 내 각주 증거","notes":null,"glossary_observations":{}}
 {"segment_id":"seg-000005","text":"제한된 영역 계획을 시작하기 전에 원본 순서를 검증합니다.","notes":null,"glossary_observations":{}}
 {"segment_id":"seg-000006","text":"연락처 시트는 렌더링된 각 출력 페이지를 정확히 한 번 포함합니다.","notes":null,"glossary_observations":{}}
 {"segment_id":"seg-000007","text":"의미 검토는 모든 필수 품질 기준을 확인하며, 검증된 한국어 텍스트는 스테이징 PDF에서 선택 가능하게 유지됩니다. 자동 QA는 정확한 출력 및 연락처 시트 페이지 수를 기록하고 최종 게시에는 검토된 세 가지 산출물만 공개됩니다.","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000008","text":"결정론적 작업 흐름에는 페이지 내 주석 1이 포함됩니다.","notes":null,"glossary_observations":{}}
-{"segment_id":"seg-000009","text":"1 각주 증거는 해당 표식에 연결된 상태로 유지됩니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000008","text":"결정론적 작업 흐름에는 페이지 내 주석 ⟦WT:000000⟧이 포함됩니다.","notes":null,"glossary_observations":{}}
+{"segment_id":"seg-000009","text":"⟦WT:000000⟧ 각주 증거는 해당 표식에 연결된 상태로 유지됩니다.","notes":null,"glossary_observations":{}}
