@@ -1389,6 +1389,133 @@ def test_assemble_pdf_normalizes_alternating_footer_page_tokens(tmp_path: Path) 
     assert "vi | Table of Contents" not in text
 
 
+def test_assemble_pdf_allows_figure_to_fill_declared_body_frame(tmp_path: Path) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    media_dir = run_dir / "media"
+    media_dir.mkdir()
+    Image.new("RGB", (240, 1256), (42, 120, 196)).save(
+        media_dir / "figure-0001.png"
+    )
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    document = replace(
+        document,
+        blocks=[
+            *document.blocks,
+            PdfBlock(
+                id="pdf:page-0001:block-0096",
+                page_number=1,
+                order=3,
+                kind="figure",
+                bbox=(72.0, 72.0, 192.0, 700.0),
+                style=PdfBlockStyle(9.0, False, "left", 0.0, 0.0),
+                source_text="",
+                media_path="media/figure-0001.png",
+            ),
+        ],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    assert staged.is_file()
+
+
+def test_style_normalizes_centered_body_text_to_left_alignment() -> None:
+    body = PdfBlock(
+        id="pdf:page-0001:block-0001",
+        page_number=1,
+        order=0,
+        kind="paragraph",
+        bbox=(54.0, 72.0, 558.0, 120.0),
+        style=PdfBlockStyle(11.0, False, "center", 54.0, 6.0),
+        source_text="A visually centered bounding box is not centered body prose.",
+    )
+
+    _font_size, style = pdf_assemble_module._style_for_block(
+        body,
+        heading_sizes=[],
+        list_level=0,
+    )
+
+    assert style.alignment == 0
+
+
+def test_assemble_pdf_omits_coherent_varying_composite_footers(tmp_path: Path) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    footer_style = PdfBlockStyle(9.0, False, "left", 0.0, 0.0)
+    document = replace(
+        document,
+        page_count=4,
+        pages=[
+            *document.pages,
+            PdfPage(number=2, width=612.0, height=792.0, rotation=0),
+            PdfPage(number=3, width=612.0, height=792.0, rotation=0),
+            PdfPage(number=4, width=612.0, height=792.0, rotation=0),
+        ],
+        blocks=[
+            *document.blocks,
+            PdfBlock(
+                id="pdf:page-0001:block-0097",
+                page_number=1,
+                order=3,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="vi | Front Matter",
+            ),
+            PdfBlock(
+                id="pdf:page-0002:block-0098",
+                page_number=2,
+                order=4,
+                kind="footer",
+                bbox=(390.0, 770.0, 540.0, 782.0),
+                style=footer_style,
+                source_text="Front Matter | vii",
+            ),
+            PdfBlock(
+                id="pdf:page-0003:block-0099",
+                page_number=3,
+                order=5,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="1 | Second Section",
+            ),
+            PdfBlock(
+                id="pdf:page-0004:block-0100",
+                page_number=4,
+                order=6,
+                kind="footer",
+                bbox=(390.0, 770.0, 540.0, 782.0),
+                style=footer_style,
+                source_text="Second Section | 2",
+            ),
+        ],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert "Front Matter" not in text
+    assert "Second Section" not in text
+    assert any(
+        line.strip() == "1"
+        for line in (PdfReader(staged).pages[0].extract_text() or "").splitlines()
+    )
+
+
 def test_assemble_pdf_rejects_repeated_identical_composite_footer(tmp_path: Path) -> None:
     run_dir, translations, glossary = _assembly_run(tmp_path)
     document = PdfDocument.from_dict(

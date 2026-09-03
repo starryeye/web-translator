@@ -55,6 +55,7 @@ from web_translator.pdf_models import (
     PdfPage,
     PdfPageEvidence,
     PdfTableCell,
+    font_size_bucket,
 )
 from web_translator.protection import protect_fragment
 
@@ -652,7 +653,7 @@ def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segmen
     ]
     heading_sizes = sorted(
         {
-            round(block.style.font_size)
+            font_size_bucket(block.style.font_size)
             for block in target_blocks
             if block.kind == "heading"
         },
@@ -779,7 +780,7 @@ def _block_heading_level(block: PdfBlock, heading_sizes: list[int]) -> int:
     numbered = re.match(r"^(\d+(?:\.\d+)*)[.)]?\s+", block.source_text)
     if numbered is not None:
         return numbered.group(1).count(".") + 1
-    rounded_size = round(block.style.font_size)
+    rounded_size = font_size_bucket(block.style.font_size)
     return heading_sizes.index(rounded_size) + 1 if rounded_size in heading_sizes else 1
 
 

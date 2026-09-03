@@ -494,6 +494,39 @@ def test_numbered_heading_classification_consumes_style_and_vertical_spacing() -
     ]
 
 
+def test_heading_classification_ignores_subpixel_font_size_jitter() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word(
+                "A long ordinary body line establishes the document body font size.",
+                x0=20,
+                x1=180,
+                top=10,
+                bottom=21,
+                size=10.5,
+            ),
+            _word(
+                "A continuation at the same visual size.",
+                x0=20,
+                x1=150,
+                top=22,
+                bottom=33,
+                size=10.500000000000028,
+            ),
+        ]
+    )
+    pages = [([line.with_page_geometry(200, 200) for line in lines], 200.0)]
+
+    classified = classify_document_lines(pages)[0]
+
+    assert [line.kind for line in classified] == ["paragraph", "paragraph"]
+
+
 @pytest.mark.parametrize("styled_position", ["first", "last"])
 def test_styled_ordered_list_edge_uses_tight_same_indent_peer_context(
     styled_position: str,

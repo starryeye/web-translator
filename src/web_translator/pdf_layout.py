@@ -19,6 +19,7 @@ from web_translator.pdf_models import (
     PdfBlockStyle,
     PdfLinkEvidence,
     PdfTableCell,
+    font_size_bucket,
 )
 
 
@@ -508,7 +509,7 @@ def classify_document_lines(
     for lines in normalized:
         for line in lines:
             if line.kind is None:
-                sizes[round(line.size)] += line.character_count
+                sizes[font_size_bucket(line.size)] += line.character_count
     body_size = max(sizes, key=lambda size: (sizes[size], -size)) if sizes else 0
     heading_sizes = sorted(
         {size for size in sizes if size >= body_size + 1}, reverse=True
@@ -521,7 +522,7 @@ def classify_document_lines(
             if line.kind is not None:
                 classified.append(line)
                 continue
-            rounded_size = round(line.size)
+            rounded_size = font_size_bucket(line.size)
             heading_candidate = rounded_size in heading_sizes or line.bold
             list_marker = split_list_marker(line.text)
             number = _HEADING_NUMBER_PATTERN.match(line.text)

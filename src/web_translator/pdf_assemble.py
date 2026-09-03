@@ -64,6 +64,7 @@ from web_translator.pdf_models import (
     PdfDocument,
     PdfLinkEvidence,
     PdfSourceRecord,
+    font_size_bucket,
 )
 from web_translator.protection import ProtectionError, restore_tokens
 from web_translator.terminology import TerminologyError, normalize_first_use
@@ -915,7 +916,7 @@ def _build_basic_document(
     story: list[Any] = []
     heading_sizes = sorted(
         {
-            round(block.style.font_size)
+            font_size_bucket(block.style.font_size)
             for block, _segment, _text in ordered
             if block.kind == "heading"
         },
@@ -1028,7 +1029,9 @@ def _build_rich_document(
     drawn_page_notes: set[tuple[int, str]] = set()
     running_header = _running_block(document, "header")
     running_footer = _running_block(document, "footer")
-    running_page_number = _running_block(document, "page-number")
+    running_page_number = _running_block(
+        document, "page-number"
+    ) or _varying_composite_page_number_source(document)
     header_embeds_page_number = _embedded_running_page_number(document, "header")
     footer_embeds_page_number = _embedded_running_page_number(document, "footer")
     running_style = ParagraphStyle(
@@ -1181,7 +1184,17 @@ def _build_rich_document(
     portrait_template = PageTemplate(
         id="portrait",
         pagesize=portrait_size,
-        frames=[Frame(*portrait_frame, id="portrait-body", showBoundary=0)],
+        frames=[
+            Frame(
+                *portrait_frame,
+                id="portrait-body",
+                leftPadding=0,
+                rightPadding=0,
+                topPadding=0,
+                bottomPadding=0,
+                showBoundary=0,
+            )
+        ],
         onPage=lambda canvas, doc: draw_running(
             canvas, doc, orientation="portrait"
         ),
@@ -1192,7 +1205,17 @@ def _build_rich_document(
     landscape_template = PageTemplate(
         id="landscape",
         pagesize=landscape_size,
-        frames=[Frame(*landscape_frame, id="landscape-body", showBoundary=0)],
+        frames=[
+            Frame(
+                *landscape_frame,
+                id="landscape-body",
+                leftPadding=0,
+                rightPadding=0,
+                topPadding=0,
+                bottomPadding=0,
+                showBoundary=0,
+            )
+        ],
         onPage=lambda canvas, doc: draw_running(
             canvas, doc, orientation="landscape"
         ),
@@ -1203,7 +1226,7 @@ def _build_rich_document(
 
     heading_sizes = sorted(
         {
-            round(block.style.font_size)
+            font_size_bucket(block.style.font_size)
             for block, _segment, _text in ordered
             if block.kind == "heading"
         },
@@ -1570,7 +1593,9 @@ def _running_block(document: PdfDocument, kind: str) -> PdfBlock | None:
         return None
     if kind != "page-number":
         label = _validated_composite_running_label(blocks, kind)
-        if label is not None:
+        if label is _VARYING_COMPOSITE_RUNNING_LABELS:
+            return None
+        if isinstance(label, str):
             return replace(blocks[0], source_text=label)
         if len({block.source_text for block in blocks}) != 1:
             raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
@@ -1578,17 +1603,32 @@ def _running_block(document: PdfDocument, kind: str) -> PdfBlock | None:
 
 
 _COMPOSITE_RUNNING_PAGE_PATTERN = re.compile(r"(?:\d+|[ivxlcdm]+)\Z", re.I)
+_VARYING_COMPOSITE_RUNNING_LABELS = object()
 
 
 def _embedded_running_page_number(document: PdfDocument, kind: str) -> bool:
     blocks = [block for block in document.blocks if block.kind == kind]
-    return bool(blocks) and _validated_composite_running_label(blocks, kind) is not None
+    return bool(blocks) and isinstance(
+        _validated_composite_running_label(blocks, kind), str
+    )
+
+
+def _varying_composite_page_number_source(document: PdfDocument) -> PdfBlock | None:
+    """Return evidence for drawing page numbers when varying labels are omitted."""
+    for kind in ("header", "footer"):
+        blocks = [block for block in document.blocks if block.kind == kind]
+        if blocks and (
+            _validated_composite_running_label(blocks, kind)
+            is _VARYING_COMPOSITE_RUNNING_LABELS
+        ):
+            return blocks[0]
+    return None
 
 
 def _validated_composite_running_label(
     blocks: Sequence[PdfBlock],
     kind: str,
-) -> str | None:
+) -> str | object | None:
     parsed = [_composite_running_band(block.source_text) for block in blocks]
     if not any(item is not None for item in parsed):
         return None
@@ -1597,19 +1637,22 @@ def _validated_composite_running_label(
             return None
         raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
     evidence = [item for item in parsed if item is not None]
-    if len({label.casefold() for label, _value in evidence}) != 1:
-        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
-    ordered = sorted(
-        zip(blocks, evidence, strict=True),
-        key=lambda item: item[0].page_number,
-    )
-    if any(
-        right_evidence[1] - left_evidence[1]
-        != right_block.page_number - left_block.page_number
-        for (left_block, left_evidence), (right_block, right_evidence)
-        in zip(ordered, ordered[1:])
-    ):
-        raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    grouped: dict[str, list[tuple[PdfBlock, tuple[str, int]]]] = {}
+    for block, item in zip(blocks, evidence, strict=True):
+        grouped.setdefault(item[0].casefold(), []).append((block, item))
+    for group in grouped.values():
+        if len(group) < 2:
+            raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+        ordered = sorted(group, key=lambda item: item[0].page_number)
+        if any(
+            right_evidence[1] - left_evidence[1]
+            != right_block.page_number - left_block.page_number
+            for (left_block, left_evidence), (right_block, right_evidence)
+            in zip(ordered, ordered[1:])
+        ):
+            raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+    if len(grouped) > 1:
+        return _VARYING_COMPOSITE_RUNNING_LABELS
     return evidence[0][0]
 
 
@@ -1901,8 +1944,8 @@ def _style_for_block(
     heading_sizes: Sequence[int],
     list_level: int,
 ) -> tuple[float, ParagraphStyle]:
-    alignment = _ALIGNMENTS[block.style.alignment]
     if block.kind == "heading":
+        alignment = _ALIGNMENTS[block.style.alignment]
         level = _normalized_heading_level(block, heading_sizes)
         font_size = {1: 18.0, 2: 16.0, 3: 14.0, 4: 12.5, 5: 11.5, 6: 11.0}[level]
         return font_size, ParagraphStyle(
@@ -1927,7 +1970,7 @@ def _style_for_block(
         bulletFontSize=BODY_FONT_SIZE,
         fontSize=BODY_FONT_SIZE,
         leading=15.0,
-        alignment=alignment,
+        alignment=_ALIGNMENTS["left"],
         leftIndent=left_indent,
         firstLineIndent=0.0,
         bulletIndent=bullet_indent,
@@ -1943,7 +1986,7 @@ def _normalized_heading_level(
     numbered = re.match(r"^(\d+(?:\.\d+)*)[.)]?\s+", block.source_text)
     if numbered is not None:
         return max(1, min(6, numbered.group(1).count(".") + 1))
-    rounded_size = round(block.style.font_size)
+    rounded_size = font_size_bucket(block.style.font_size)
     if rounded_size in heading_sizes:
         return max(1, min(6, heading_sizes.index(rounded_size) + 1))
     return 1

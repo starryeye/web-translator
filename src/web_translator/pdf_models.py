@@ -38,6 +38,11 @@ _ALIGNMENTS = {"left", "center", "right", "justify"}
 _VERDICTS = {"pass", "required-fix"}
 
 
+def font_size_bucket(value: float) -> int:
+    """Return a stable whole-point bucket after removing extraction jitter."""
+    return round(round(value, 3))
+
+
 @dataclass(frozen=True, slots=True)
 class PdfSourceRecord:
     """Immutable provenance for a copied PDF source."""
