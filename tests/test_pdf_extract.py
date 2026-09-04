@@ -942,6 +942,42 @@ def test_repair_line_fragments_preserves_noncontinuations(
     assert [line.continues_discretionary_hyphen for line in repaired] == [False, False]
 
 
+def test_repair_line_fragments_rejects_same_x0_left_band_to_spanning_row() -> None:
+    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+
+    lines = [
+        line.with_page_geometry(200, 200)
+        for line in group_words_into_lines(
+            [
+                _word("left fragment‐", x0=10, x1=90, top=10, bottom=20),
+                _word("page spanning prose", x0=10, x1=190, top=22, bottom=32),
+            ]
+        )
+    ]
+
+    repaired = repair_line_fragments(lines)
+
+    assert [line.continues_discretionary_hyphen for line in repaired] == [False, False]
+
+
+def test_repair_line_fragments_keeps_shorter_final_same_column_continuation() -> None:
+    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+
+    lines = [
+        line.with_page_geometry(200, 200)
+        for line in group_words_into_lines(
+            [
+                _word("long fragment‐", x0=10, x1=190, top=10, bottom=20),
+                _word("continuation", x0=10, x1=90, top=22, bottom=32),
+            ]
+        )
+    ]
+
+    repaired = repair_line_fragments(lines)
+
+    assert repaired[1].continues_discretionary_hyphen is True
+
+
 def test_running_band_rejects_nonsequential_page_like_notice() -> None:
     from web_translator.pdf_layout import (
         classify_document_lines,

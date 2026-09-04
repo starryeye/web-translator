@@ -581,6 +581,14 @@ def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
         and abs(previous.x1 - current.x1) > max(previous.size, current.size)
     ):
         return False
+    page_width = previous.page_width or current.page_width
+    if (
+        page_width is not None
+        and previous.x0 <= page_width * 0.10
+        and previous.x1 <= page_width * 0.50
+        and current.x1 >= page_width * 0.90
+    ):
+        return False
     if current.top < previous.bottom - 1e-9:
         return False
     leading = current.top - previous.bottom
