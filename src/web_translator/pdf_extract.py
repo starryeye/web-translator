@@ -35,6 +35,7 @@ from web_translator.pdf_layout import (
     TableDetectionResult,
     build_text_blocks,
     classify_document_lines,
+    classify_semantic_roles,
     detect_footnotes,
     detect_tables,
     extract_link_evidence,
@@ -219,6 +220,7 @@ def extract_pdf(
         classified_pages = classify_document_lines(
             [(material.lines, material.page_height) for material in materials]
         )
+        classified_pages = classify_semantic_roles(classified_pages)
 
         blocks: list[PdfBlock] = []
         table_cells: list[PdfTableCell] = []

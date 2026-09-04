@@ -26,6 +26,7 @@ from tests.pdf_fixtures import (
     make_oversized_dimension_pdf,
     make_oversized_pdf,
     make_pdf_at_size,
+    make_publication_structure_pdf,
     make_rotated_pdf,
     make_text_pdf,
     make_truncated_eof_pdf,
@@ -1376,6 +1377,155 @@ def test_extract_pdf_classifies_repeated_bands_and_sequential_page_numbers(
         for segment in segments
     )
     assert len(segments) == 6
+
+
+def test_extract_pdf_preserves_publication_semantic_roles(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    document = extract_pdf(
+        make_publication_structure_pdf(tmp_path / "publication.pdf"),
+        tmp_path / "document.json",
+        tmp_path / "segments.jsonl",
+        tmp_path / "media",
+    )
+
+    roles = [block.semantic_role for block in document.blocks]
+    assert roles.count("toc-entry") == 3
+    assert roles.count("dedication") == 1
+    assert roles.count("epigraph") == 1
+    assert roles.count("epigraph-attribution") == 1
+    assert roles.count("part-label") == 1
+    assert roles.count("part-title") == 1
+    assert roles.count("chapter-label") == 1
+    assert roles.count("chapter-title") == 1
+    assert roles.count("reference-entry") == 3
+
+    toc_entries = [
+        block.source_text
+        for block in document.blocks
+        if block.semantic_role == "toc-entry"
+    ]
+    assert toc_entries == [
+        "Foundations of Reliable Systems 1",
+        "Observing the Pipeline 17",
+        "Publishing with Confidence 43",
+    ]
+    references = [
+        block.source_text
+        for block in document.blocks
+        if block.semantic_role == "reference-entry"
+    ]
+    assert references == [
+        "[1] Ada North. Deterministic Document Structure. Archive Press, 2024.",
+        "[2] Ben South. Evidence Before Reconstruction. Layout Review Quarterly 18(2), 2025.",
+        "[3] Cora West. Preserving Logical Reading Order. Proceedings of Reliable Publishing, 2026.",
+    ]
+
+
+def test_semantic_classification_warns_on_conflicting_toc_columns() -> None:
+    from web_translator.pdf_layout import (
+        PdfExtractionWarning,
+        classify_semantic_roles,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word("First entry", x0=20, x1=80, top=40, bottom=50),
+            _word("1", x0=150, x1=180, top=40, bottom=50),
+            _word("Second entry", x0=20, x1=80, top=70, bottom=80),
+            _word("17", x0=150, x1=195, top=70, bottom=80),
+            _word("Third entry", x0=20, x1=80, top=100, bottom=110),
+            _word("43", x0=150, x1=190, top=100, bottom=110),
+        ]
+    )
+    page = [line.with_page_geometry(200, 200) for line in lines]
+
+    with pytest.warns(PdfExtractionWarning, match="conflicting TOC row evidence"):
+        classified = classify_semantic_roles([page])[0]
+
+    assert {line.semantic_role for line in classified} == {"body"}
+
+
+def test_reference_continuation_keeps_role_across_page_boundary() -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    first_page = group_words_into_lines(
+        [
+            _word(
+                "REFERENCES",
+                x0=20,
+                x1=100,
+                top=20,
+                bottom=38,
+                size=16,
+                fontname="Helvetica-Bold",
+            ),
+            _word("[1] First source begins", x0=20, x1=140, top=60, bottom=70),
+        ]
+    )
+    second_page = group_words_into_lines(
+        [
+            _word("on the following page.", x0=38, x1=150, top=20, bottom=30),
+            _word("[2] Second source.", x0=20, x1=130, top=50, bottom=60),
+        ]
+    )
+    pages = [
+        [line.with_page_geometry(200, 200) for line in first_page],
+        [line.with_page_geometry(200, 200) for line in second_page],
+    ]
+
+    classified = classify_semantic_roles(pages)
+
+    assert [line.semantic_role for line in classified[0]] == [
+        "reference-heading",
+        "reference-entry",
+    ]
+    assert [line.semantic_role for line in classified[1]] == [
+        "reference-entry",
+        "reference-entry",
+    ]
+
+
+def test_numbered_reference_markers_split_entries_and_keep_wrapped_text() -> None:
+    from web_translator.pdf_layout import (
+        build_text_blocks,
+        classify_document_lines,
+        classify_semantic_roles,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word(
+                "REFERENCES",
+                x0=20,
+                x1=100,
+                top=20,
+                bottom=38,
+                size=16,
+                fontname="Helvetica-Bold",
+            ),
+            _word("1. First numbered source", x0=20, x1=140, top=60, bottom=70),
+            _word("continues on this line.", x0=38, x1=150, top=74, bottom=84),
+            _word("2. Second numbered source", x0=20, x1=150, top=90, bottom=100),
+            _word("has its own continuation.", x0=38, x1=160, top=104, bottom=114),
+        ]
+    )
+    page = [line.with_page_geometry(200, 200) for line in lines]
+    classified = classify_document_lines([(page, 200)])
+    classified = classify_semantic_roles(classified)
+
+    blocks = build_text_blocks(classified[0], page_number=1)
+
+    assert [
+        block.source_text
+        for block in blocks
+        if block.semantic_role == "reference-entry"
+    ] == [
+        "1. First numbered source continues on this line.",
+        "2. Second numbered source has its own continuation.",
+    ]
 
 
 def test_extract_pdf_builds_numbered_heading_hierarchy(tmp_path: Path) -> None:

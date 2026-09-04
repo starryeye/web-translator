@@ -135,6 +135,61 @@ def make_text_pdf(path: Path, *, pages: int = 1) -> Path:
     return path
 
 
+def make_publication_structure_pdf(path: Path) -> Path:
+    """Create deterministic front matter, opener, and reference structures."""
+    canvas = Canvas(str(path), pagesize=(612, 792))
+
+    canvas.setFont("Helvetica-Bold", 24)
+    canvas.drawCentredString(306, 704, "CONTENTS")
+    canvas.setFont("Helvetica", 12)
+    for y, x, label, page_number in (
+        (650, 90, "Foundations of Reliable Systems", "1"),
+        (624, 108, "Observing the Pipeline", "17"),
+        (598, 90, "Publishing with Confidence", "43"),
+    ):
+        canvas.drawString(x, y, label)
+        canvas.drawRightString(522, y, page_number)
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Oblique", 14)
+    canvas.drawCentredString(306, 410, "For everyone who preserves meaning across formats")
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Oblique", 12)
+    canvas.drawCentredString(306, 438, "Structure makes difficult reading feel inevitable.")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawRightString(456, 408, "- A patient typesetter")
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Bold", 15)
+    canvas.drawCentredString(306, 610, "PART I")
+    canvas.setFont("Helvetica-Bold", 28)
+    canvas.drawCentredString(306, 558, "THE SOURCE")
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Bold", 15)
+    canvas.drawCentredString(306, 610, "CHAPTER 2")
+    canvas.setFont("Helvetica-Bold", 28)
+    canvas.drawCentredString(306, 558, "READING THE PAGE")
+    canvas.showPage()
+
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 714, "REFERENCES")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 674, "[1] Ada North. Deterministic Document Structure.")
+    canvas.drawString(90, 658, "Archive Press, 2024.")
+    canvas.drawString(72, 622, "[2] Ben South. Evidence Before Reconstruction.")
+    canvas.drawString(90, 606, "Layout Review Quarterly 18(2), 2025.")
+    canvas.showPage()
+
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 714, "[3] Cora West. Preserving Logical Reading Order.")
+    canvas.drawString(90, 698, "Proceedings of Reliable Publishing, 2026.")
+    canvas.showPage()
+    canvas.save()
+    return path
+
+
 def make_image_only_pdf(path: Path, *, pages: int = 1) -> Path:
     """Create pages whose dominant content is one full-page raster image."""
     image_path = path.with_suffix(".png")
