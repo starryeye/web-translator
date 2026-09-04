@@ -147,6 +147,7 @@ class PdfLine:
     page_width: float | None = None
     page_height: float | None = None
     spanning: bool = False
+    continues_discretionary_hyphen: bool = False
 
     @classmethod
     def from_word(cls, word: PdfWord) -> PdfLine:
@@ -555,11 +556,11 @@ def classify_document_lines(
 
 
 def repair_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
-    """Join wrapped fragments that are geometrically part of one text run."""
+    """Mark proven discretionary-hyphen continuations without changing evidence."""
     repaired: list[PdfLine] = []
     for line in lines:
         if repaired and _is_wrapped_token_continuation(repaired[-1], line):
-            repaired[-1] = _join_wrapped_lines(repaired[-1], line)
+            repaired.append(replace(line, continues_discretionary_hyphen=True))
         else:
             repaired.append(line)
     return repaired
@@ -568,9 +569,17 @@ def repair_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
 def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
     if not previous.words or not current.words:
         return False
-    if split_list_marker(current.text) is not None:
+    if (
+        split_list_marker(previous.text) is not None
+        or split_list_marker(current.text) is not None
+    ):
         return False
     if abs(previous.x0 - current.x0) > max(previous.size, current.size):
+        return False
+    if (
+        not math.isclose(previous.x0, current.x0, abs_tol=1e-9)
+        and abs(previous.x1 - current.x1) > max(previous.size, current.size)
+    ):
         return False
     if current.top < previous.bottom - 1e-9:
         return False
@@ -582,30 +591,7 @@ def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
     first_character = current.text.lstrip()[:1]
     if not first_character or not first_character.isalpha() or not first_character.islower():
         return False
-    final_character = previous.text.rstrip()[-1:]
-    return final_character in _DISCRETIONARY_HYPHENS or final_character.isalpha()
-
-
-def _join_wrapped_lines(previous: PdfLine, current: PdfLine) -> PdfLine:
-    final_word = previous.words[-1]
-    words = previous.words
-    if final_word.text[-1:] in _DISCRETIONARY_HYPHENS:
-        continuation = current.words[0]
-        words = (
-            *words[:-1],
-            replace(
-                final_word,
-                text=final_word.text[:-1] + continuation.text,
-                x1=max(final_word.x1, continuation.x1),
-                bottom=max(final_word.bottom, continuation.bottom),
-                character_count=(
-                    final_word.character_count + continuation.character_count
-                ),
-            ),
-            *current.words[1:],
-        )
-        return replace(previous, words=words)
-    return replace(previous, words=(*words, *current.words))
+    return previous.text.rstrip()[-1:] in _DISCRETIONARY_HYPHENS
 
 
 def _has_heading_spacing(lines: Sequence[PdfLine], index: int) -> bool:
@@ -996,10 +982,23 @@ def build_text_blocks(lines: Sequence[PdfLine], page_number: int) -> list[PdfBlo
                     indentation=min(line.x0 for line in block_lines),
                     space_after=space_after,
                 ),
-                source_text=" ".join(line.text for line in block_lines),
+                source_text=_block_source_text(block_lines),
             )
         )
     return blocks
+
+
+def _block_source_text(lines: Sequence[PdfLine]) -> str:
+    """Render marked discretionary line breaks without altering source evidence."""
+    text = ""
+    for line in lines:
+        if line.continues_discretionary_hyphen and text[-1:] in _DISCRETIONARY_HYPHENS:
+            text = text[:-1] + line.text
+        elif text:
+            text += " " + line.text
+        else:
+            text = line.text
+    return text
 
 
 def _alignment(lines: Sequence[PdfLine]) -> str:

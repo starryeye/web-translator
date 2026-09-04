@@ -868,8 +868,12 @@ def test_running_band_inherits_one_page_token_free_label_from_neighbors() -> Non
     assert [page[-1].kind for page in classified] == ["footer", "footer", "footer"]
 
 
-def test_repair_line_fragments_joins_discretionary_hyphen_and_font_run() -> None:
-    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+def test_repair_line_fragments_marks_discretionary_hyphen_without_mutating_evidence() -> None:
+    from web_translator.pdf_layout import (
+        build_text_blocks,
+        group_words_into_lines,
+        repair_line_fragments,
+    )
 
     lines = group_words_into_lines(
         [
@@ -880,7 +884,14 @@ def test_repair_line_fragments_joins_discretionary_hyphen_and_font_run() -> None
 
     repaired = repair_line_fragments(lines)
 
-    assert [line.text for line in repaired] == ["PostgreSQL [6, 7]."]
+    assert [line.text for line in repaired] == ["Post‐", "greSQL [6, 7]."]
+    assert repaired[0] == lines[0]
+    assert repaired[1].words == lines[1].words
+    assert repaired[1].character_count == lines[1].character_count
+    assert repaired[1].continues_discretionary_hyphen is True
+    assert [block.source_text for block in build_text_blocks(repaired, page_number=1)] == [
+        "PostgreSQL [6, 7]."
+    ]
 
 
 @pytest.mark.parametrize(
@@ -898,8 +909,27 @@ def test_repair_line_fragments_joins_discretionary_hyphen_and_font_run() -> None
             _word("well-", x0=20, x1=70, top=10, bottom=20),
             _word("known", x0=20, x1=80, top=22, bottom=32),
         ],
+        [
+            _word("ordinary alternating", x0=20, x1=160, top=10, bottom=20),
+            _word("current prose", x0=20, x1=120, top=22, bottom=32),
+        ],
+        [
+            _word("- list item‐", x0=20, x1=110, top=10, bottom=20),
+            _word("following prose", x0=20, x1=120, top=22, bottom=32),
+        ],
+        [
+            _word("left fragment‐", x0=10, x1=90, top=10, bottom=20),
+            _word("right continuation", x0=18, x1=190, top=22, bottom=32),
+        ],
     ],
-    ids=["separate-columns", "list-marker", "ordinary-hyphen"],
+    ids=[
+        "separate-columns",
+        "list-marker",
+        "ordinary-hyphen",
+        "ordinary-aligned-prose",
+        "preceding-list-item",
+        "close-x0-different-column-range",
+    ],
 )
 def test_repair_line_fragments_preserves_noncontinuations(
     lines: list[dict[str, object]],
@@ -909,6 +939,7 @@ def test_repair_line_fragments_preserves_noncontinuations(
     repaired = repair_line_fragments(group_words_into_lines(lines))
 
     assert [line.text for line in repaired] == [line["text"] for line in lines]
+    assert [line.continues_discretionary_hyphen for line in repaired] == [False, False]
 
 
 def test_running_band_rejects_nonsequential_page_like_notice() -> None:
