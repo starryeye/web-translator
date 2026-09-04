@@ -51,6 +51,7 @@ _TEXT_BLOCK_KINDS = {
     "footer",
     "page-number",
 }
+_DISCRETIONARY_HYPHENS = "\u00ad\u2010\u2011\u2012\u2013\u2014\u2015"
 
 
 class PdfExtractionError(RuntimeError):
@@ -496,7 +497,7 @@ def classify_document_lines(
                 line.page_width if line.page_width is not None else max(1.0, line.x1),
                 height,
             )
-            for line in lines
+            for line in repair_line_fragments(lines)
         ]
         for lines, height in pages
     ]
@@ -551,6 +552,60 @@ def classify_document_lines(
                 classified.append(replace(line, kind="paragraph"))
         result.append(classified)
     return result
+
+
+def repair_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
+    """Join wrapped fragments that are geometrically part of one text run."""
+    repaired: list[PdfLine] = []
+    for line in lines:
+        if repaired and _is_wrapped_token_continuation(repaired[-1], line):
+            repaired[-1] = _join_wrapped_lines(repaired[-1], line)
+        else:
+            repaired.append(line)
+    return repaired
+
+
+def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
+    if not previous.words or not current.words:
+        return False
+    if split_list_marker(current.text) is not None:
+        return False
+    if abs(previous.x0 - current.x0) > max(previous.size, current.size):
+        return False
+    if current.top < previous.bottom - 1e-9:
+        return False
+    leading = current.top - previous.bottom
+    if leading > max(previous.size, current.size) * _PARAGRAPH_GAP_FONT_MULTIPLIER:
+        return False
+    if abs(previous.size - current.size) > max(previous.size, current.size) * 0.15:
+        return False
+    first_character = current.text.lstrip()[:1]
+    if not first_character or not first_character.isalpha() or not first_character.islower():
+        return False
+    final_character = previous.text.rstrip()[-1:]
+    return final_character in _DISCRETIONARY_HYPHENS or final_character.isalpha()
+
+
+def _join_wrapped_lines(previous: PdfLine, current: PdfLine) -> PdfLine:
+    final_word = previous.words[-1]
+    words = previous.words
+    if final_word.text[-1:] in _DISCRETIONARY_HYPHENS:
+        continuation = current.words[0]
+        words = (
+            *words[:-1],
+            replace(
+                final_word,
+                text=final_word.text[:-1] + continuation.text,
+                x1=max(final_word.x1, continuation.x1),
+                bottom=max(final_word.bottom, continuation.bottom),
+                character_count=(
+                    final_word.character_count + continuation.character_count
+                ),
+            ),
+            *current.words[1:],
+        )
+        return replace(previous, words=words)
+    return replace(previous, words=(*words, *current.words))
 
 
 def _has_heading_spacing(lines: Sequence[PdfLine], index: int) -> bool:
@@ -704,6 +759,22 @@ def _classify_running_bands(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         if _is_sequential_running_band(locations)
         for page_index, line_index, _value, _side in locations
     }
+    for (band, label), locations in occurrences.items():
+        if not _is_sequential_running_band(locations):
+            continue
+        for left, right in zip(sorted(locations), sorted(locations)[1:]):
+            left_page, _left_line, left_value, _left_side = left
+            right_page, _right_line, right_value, _right_side = right
+            if right_page - left_page != 2 or right_value - left_value != 2:
+                continue
+            missing_page = left_page + 1
+            for line_index, line in enumerate(pages[missing_page]):
+                if (
+                    line.kind is None
+                    and _edge_band(line) == band
+                    and _normalized_text(line.text) == label
+                ):
+                    running_band_locations.add((missing_page, line_index))
     return [
         [
             replace(

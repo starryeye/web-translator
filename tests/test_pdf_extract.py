@@ -812,6 +812,105 @@ def test_running_band_classification_handles_alternating_page_number_sides() -> 
     assert [lines[1].text for lines in classified[:3]] == footer_texts[:3]
 
 
+def test_running_band_inherits_one_missing_composite_page_from_neighbors() -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    footer_texts = [
+        "26 | Chapter 2: Data Models and Query Languages",
+        "Chapter 2: Data Models and Query Languages | 27",
+        "28 | Chapter 2: Data Models and Query Languages",
+    ]
+    pages = []
+    for page_number, footer_text in enumerate(footer_texts, start=1):
+        footer_x0, footer_x1 = (
+            (10, 90) if footer_text.startswith(("26", "28")) else (110, 190)
+        )
+        lines = group_words_into_lines(
+            [
+                _word(f"Body {page_number}", x0=20, x1=100, top=50, bottom=60),
+                _word(footer_text, x0=footer_x0, x1=footer_x1, top=185, bottom=195),
+            ]
+        )
+        pages.append(([line.with_page_geometry(200, 200) for line in lines], 200.0))
+
+    classified = classify_document_lines(pages)
+
+    assert [page[-1].kind for page in classified] == ["footer", "footer", "footer"]
+
+
+def test_running_band_inherits_one_page_token_free_label_from_neighbors() -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    footer_texts = [
+        "26 | Chapter 2: Data Models and Query Languages",
+        "Chapter 2: Data Models and Query Languages",
+        "28 | Chapter 2: Data Models and Query Languages",
+    ]
+    pages = []
+    for page_number, footer_text in enumerate(footer_texts, start=1):
+        footer_x0, footer_x1 = (10, 90)
+        lines = group_words_into_lines(
+            [
+                _word(f"Body {page_number}", x0=20, x1=100, top=50, bottom=60),
+                _word(
+                    footer_text,
+                    x0=footer_x0,
+                    x1=footer_x1,
+                    top=185,
+                    bottom=195,
+                ),
+            ]
+        )
+        pages.append(([line.with_page_geometry(200, 200) for line in lines], 200.0))
+
+    classified = classify_document_lines(pages)
+
+    assert [page[-1].kind for page in classified] == ["footer", "footer", "footer"]
+
+
+def test_repair_line_fragments_joins_discretionary_hyphen_and_font_run() -> None:
+    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+
+    lines = group_words_into_lines(
+        [
+            _word("Post‐", x0=90, x1=118, top=10, bottom=20),
+            _word("greSQL [6, 7].", x0=90, x1=170, top=22, bottom=32),
+        ]
+    )
+
+    repaired = repair_line_fragments(lines)
+
+    assert [line.text for line in repaired] == ["PostgreSQL [6, 7]."]
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [
+            _word("Left column", x0=10, x1=80, top=10, bottom=20),
+            _word("continuation", x0=120, x1=190, top=22, bottom=32),
+        ],
+        [
+            _word("Paragraph", x0=20, x1=100, top=10, bottom=20),
+            _word("- item", x0=20, x1=80, top=22, bottom=32),
+        ],
+        [
+            _word("well-", x0=20, x1=70, top=10, bottom=20),
+            _word("known", x0=20, x1=80, top=22, bottom=32),
+        ],
+    ],
+    ids=["separate-columns", "list-marker", "ordinary-hyphen"],
+)
+def test_repair_line_fragments_preserves_noncontinuations(
+    lines: list[dict[str, object]],
+) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+
+    repaired = repair_line_fragments(group_words_into_lines(lines))
+
+    assert [line.text for line in repaired] == [line["text"] for line in lines]
+
+
 def test_running_band_rejects_nonsequential_page_like_notice() -> None:
     from web_translator.pdf_layout import (
         classify_document_lines,
