@@ -47,6 +47,36 @@ def test_pdf_document_upgrades_schema_1_blocks_to_body_role() -> None:
     assert [block.semantic_role for block in loaded.blocks] == ["body"]
 
 
+def test_pdf_block_preserves_legacy_positional_constructor_order() -> None:
+    block = PdfBlock(
+        "pdf:page-0001:block-0001", 1, 0, "paragraph",
+        (72.0, 72.0, 540.0, 96.0), make_pdf_block_style(),
+        "Legacy positional text", "seg-000001", None, None, None, 1, 1,
+        None, None, None, None,
+    )
+    assert block.source_text == "Legacy positional text"
+    assert block.semantic_role == "body"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.pop("blocks"),
+        lambda payload: payload.__setitem__("blocks", ["not-a-block"]),
+    ],
+)
+def test_pdf_document_rejects_malformed_schema_1_root_or_nested_shape(
+    mutate,
+) -> None:
+    payload = make_pdf_document().to_dict()
+    payload["schema_version"] = "1.0"
+    for block in payload.get("blocks", []):
+        block.pop("semantic_role", None)
+    mutate(payload)
+    with pytest.raises(PdfContractError):
+        PdfDocument.from_dict(payload)
+
+
 def _link_evidence() -> PdfLinkEvidence:
     return PdfLinkEvidence(
         id="pdf:page-0001:link-0001",

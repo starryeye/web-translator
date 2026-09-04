@@ -261,7 +261,6 @@ class PdfBlock:
     kind: PdfBlockKind
     bbox: BBox
     style: PdfBlockStyle
-    semantic_role: PdfSemanticRole = "body"
     source_text: str = ""
     segment_id: str | None = None
     table_id: str | None = None
@@ -273,6 +272,7 @@ class PdfBlock:
     caption_id: str | None = None
     uri: str | None = None
     destination: str | None = None
+    semantic_role: PdfSemanticRole = "body"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -533,6 +533,10 @@ class PdfDocument:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PdfDocument:
         context = "PdfDocument"
+        data = _require_exact_fields(
+            data, context,
+            {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
+        )
         root_version = _require_string(data, "schema_version", context)
         if root_version == "1.0":
             data = upgrade_pdf_document_v1(data)
@@ -540,10 +544,6 @@ class PdfDocument:
             raise PdfContractError(
                 f"{context}.schema_version must be {PDF_DOCUMENT_SCHEMA_VERSION}"
             )
-        data = _require_exact_fields(
-            data, context,
-            {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
-        )
         pages = [PdfPage.from_dict(_require_mapping(item, f"{context}.pages[{index}]")) for index, item in enumerate(_require_list(data, "pages", context))]
         page_count = _require_positive_int(data, "page_count", context)
         if [page.number for page in pages] != list(range(1, page_count + 1)):
@@ -834,11 +834,18 @@ def _require_pdf_document_schema_version(data: Mapping[str, Any], context: str) 
 
 
 def upgrade_pdf_document_v1(data: Mapping[str, Any]) -> dict[str, Any]:
+    context = "PdfDocument"
+    data = _require_exact_fields(
+        data, context,
+        {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
+    )
+    blocks = _require_list(data, "blocks", context)
     upgraded = dict(data)
     upgraded["schema_version"] = PDF_DOCUMENT_SCHEMA_VERSION
     upgraded["blocks"] = [
-        {**dict(block), "semantic_role": dict(block).get("semantic_role", "body")}
-        for block in data["blocks"]
+        {**dict(_require_mapping(block, f"{context}.blocks[{index}]")),
+         "semantic_role": dict(block).get("semantic_role", "body")}
+        for index, block in enumerate(blocks)
     ]
     return upgraded
 
