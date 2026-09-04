@@ -289,7 +289,7 @@ def extract_pdf(
         warnings.warn(message, PdfExtractionWarning, stacklevel=2)
     blocks, segments = _build_segments(blocks)
     document = PdfDocument(
-        schema_version="1.0",
+        schema_version="1.1",
         source_sha256=_sha256(source),
         page_count=inspection.page_count,
         selectable_characters=inspection.selectable_characters,

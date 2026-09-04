@@ -30,6 +30,23 @@ from web_translator.pdf_models import (
 )
 
 
+def test_pdf_block_requires_a_supported_semantic_role() -> None:
+    payload = make_pdf_block().to_dict()
+    payload["semantic_role"] = "magazine-sidebar"
+    with pytest.raises(PdfContractError, match="semantic_role is not supported"):
+        PdfBlock.from_dict(payload)
+
+
+def test_pdf_document_upgrades_schema_1_blocks_to_body_role() -> None:
+    payload = make_pdf_document().to_dict()
+    payload["schema_version"] = "1.0"
+    for block in payload["blocks"]:
+        block.pop("semantic_role", None)
+    loaded = PdfDocument.from_dict(payload)
+    assert loaded.schema_version == "1.1"
+    assert [block.semantic_role for block in loaded.blocks] == ["body"]
+
+
 def _link_evidence() -> PdfLinkEvidence:
     return PdfLinkEvidence(
         id="pdf:page-0001:link-0001",
@@ -117,7 +134,7 @@ def test_pdf_source_record_requires_sorted_unique_warning_evidence() -> None:
 
 def test_pdf_document_round_trip_rejects_unknown_fields() -> None:
     document = PdfDocument(
-        schema_version="1.0",
+        schema_version="1.1",
         source_sha256="a" * 64,
         page_count=1,
         selectable_characters=42,

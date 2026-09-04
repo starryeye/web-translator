@@ -22,6 +22,7 @@ class PdfContractError(ValueError):
 
 
 _SCHEMA_VERSION = "1.0"
+PDF_DOCUMENT_SCHEMA_VERSION = "1.1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _BLOCK_ID = re.compile(
     r"pdf:page-(?P<page>\d{4}):(?:block-\d{4}|table-\d{4}:row-\d{4}:cell-\d{4})\Z"
@@ -36,6 +37,19 @@ _BLOCK_KINDS = {
 }
 _ALIGNMENTS = {"left", "center", "right", "justify"}
 _VERDICTS = {"pass", "required-fix"}
+_SEMANTIC_ROLES = {
+    "body", "toc-title", "toc-part", "toc-chapter", "toc-entry",
+    "dedication", "epigraph", "epigraph-attribution", "part-label",
+    "part-title", "chapter-label", "chapter-title", "callout-title",
+    "callout-body", "reference-heading", "reference-entry",
+}
+
+PdfSemanticRole = Literal[
+    "body", "toc-title", "toc-part", "toc-chapter", "toc-entry",
+    "dedication", "epigraph", "epigraph-attribution", "part-label",
+    "part-title", "chapter-label", "chapter-title", "callout-title",
+    "callout-body", "reference-heading", "reference-entry",
+]
 
 
 def font_size_bucket(value: float) -> int:
@@ -247,6 +261,7 @@ class PdfBlock:
     kind: PdfBlockKind
     bbox: BBox
     style: PdfBlockStyle
+    semantic_role: PdfSemanticRole = "body"
     source_text: str = ""
     segment_id: str | None = None
     table_id: str | None = None
@@ -267,6 +282,7 @@ class PdfBlock:
             "kind": self.kind,
             "bbox": list(self.bbox),
             "style": self.style.to_dict(),
+            "semantic_role": self.semantic_role,
             "source_text": self.source_text,
             "segment_id": self.segment_id,
             "table_id": self.table_id,
@@ -286,7 +302,7 @@ class PdfBlock:
         data = _require_exact_fields(
             data, context,
             {"id", "page_number", "order", "kind", "bbox", "style", "source_text", "segment_id",
-             "table_id", "row", "column", "row_span", "column_span", "media_path", "caption_id", "uri", "destination"},
+             "semantic_role", "table_id", "row", "column", "row_span", "column_span", "media_path", "caption_id", "uri", "destination"},
         )
         identifier = _require_string(data, "id", context)
         match = _BLOCK_ID.fullmatch(identifier)
@@ -298,6 +314,9 @@ class PdfBlock:
         kind = _require_string(data, "kind", context)
         if kind not in _BLOCK_KINDS:
             raise PdfContractError(f"{context}.kind is not supported")
+        semantic_role = _require_string(data, "semantic_role", context)
+        if semantic_role not in _SEMANTIC_ROLES:
+            raise PdfContractError(f"{context}.semantic_role is not supported")
         segment_id = _require_optional_string(data, "segment_id", context)
         if segment_id is not None and not _SEGMENT_ID.fullmatch(segment_id):
             raise PdfContractError(f"{context}.segment_id must be a stable segment ID")
@@ -336,6 +355,7 @@ class PdfBlock:
             kind=kind,
             bbox=_require_bbox(data, context),
             style=PdfBlockStyle.from_dict(_require_mapping_value(data, "style", context)),
+            semantic_role=semantic_role,
             source_text=_require_string(data, "source_text", context),
             segment_id=segment_id,
             table_id=table_id,
@@ -513,6 +533,13 @@ class PdfDocument:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PdfDocument:
         context = "PdfDocument"
+        root_version = _require_string(data, "schema_version", context)
+        if root_version == "1.0":
+            data = upgrade_pdf_document_v1(data)
+        elif root_version != PDF_DOCUMENT_SCHEMA_VERSION:
+            raise PdfContractError(
+                f"{context}.schema_version must be {PDF_DOCUMENT_SCHEMA_VERSION}"
+            )
         data = _require_exact_fields(
             data, context,
             {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
@@ -585,7 +612,7 @@ class PdfDocument:
                 f"{context}.extraction_warnings must be sorted and unique"
             )
         return cls(
-            schema_version=_require_schema_version(data, context),
+            schema_version=_require_pdf_document_schema_version(data, context),
             source_sha256=_require_sha256(data, "source_sha256", context),
             page_count=page_count,
             selectable_characters=_require_nonnegative_int(data, "selectable_characters", context),
@@ -795,6 +822,25 @@ def _require_schema_version(data: Mapping[str, Any], context: str) -> str:
     if value != _SCHEMA_VERSION:
         raise PdfContractError(f"{context}.schema_version must be {_SCHEMA_VERSION}")
     return value
+
+
+def _require_pdf_document_schema_version(data: Mapping[str, Any], context: str) -> str:
+    value = _require_string(data, "schema_version", context)
+    if value != PDF_DOCUMENT_SCHEMA_VERSION:
+        raise PdfContractError(
+            f"{context}.schema_version must be {PDF_DOCUMENT_SCHEMA_VERSION}"
+        )
+    return value
+
+
+def upgrade_pdf_document_v1(data: Mapping[str, Any]) -> dict[str, Any]:
+    upgraded = dict(data)
+    upgraded["schema_version"] = PDF_DOCUMENT_SCHEMA_VERSION
+    upgraded["blocks"] = [
+        {**dict(block), "semantic_role": dict(block).get("semantic_role", "body")}
+        for block in data["blocks"]
+    ]
+    return upgraded
 
 
 def _require_rotation(data: Mapping[str, Any], context: str) -> int:

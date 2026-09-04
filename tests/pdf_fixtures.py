@@ -66,7 +66,7 @@ def make_pdf_block_style() -> PdfBlockStyle:
     return PdfBlockStyle(12.0, False, "left", 0.0, 8.0)
 
 
-def make_pdf_block(*, order: int = 0) -> PdfBlock:
+def make_pdf_block(*, order: int = 0, semantic_role: str = "body") -> PdfBlock:
     return PdfBlock(
         id=f"pdf:page-0001:block-{order + 1:04d}",
         page_number=1,
@@ -74,6 +74,7 @@ def make_pdf_block(*, order: int = 0) -> PdfBlock:
         kind="paragraph",
         bbox=(72.0, 72.0 + order * 24.0, 540.0, 96.0 + order * 24.0),
         style=make_pdf_block_style(),
+        semantic_role=semantic_role,
         source_text="Selectable text",
         segment_id=f"seg-{order + 1:06d}",
     )
@@ -99,7 +100,7 @@ def make_pdf_table_cell() -> PdfTableCell:
 
 def make_pdf_document() -> PdfDocument:
     return PdfDocument(
-        schema_version="1.0",
+        schema_version="1.1",
         source_sha256="a" * 64,
         page_count=1,
         selectable_characters=42,
