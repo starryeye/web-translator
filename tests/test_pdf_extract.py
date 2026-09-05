@@ -1440,8 +1440,14 @@ def test_semantic_classification_preserves_mixed_toc_hierarchy_and_continuation(
 
     raw_pages = [
         [
-            _word("CONTENTS", x0=65, x1=135, top=20, bottom=40, size=20, fontname="Helvetica-Bold"),
-            _word("PART I Foundations", x0=20, x1=115, top=55, bottom=67, size=12, fontname="Helvetica-Bold"),
+            _word(
+                "CONTENTS", x0=65, x1=135, top=20, bottom=40,
+                size=20, fontname="Helvetica-Bold",
+            ),
+            _word(
+                "PART I Foundations", x0=20, x1=115, top=55, bottom=67,
+                size=12, fontname="Helvetica-Bold",
+            ),
             _word("1. First chapter", x0=20, x1=105, top=80, bottom=92, size=12),
             _word("1", x0=178, x1=188, top=80, bottom=92, size=12),
             _word("Nested topic", x0=40, x1=105, top=100, bottom=112, size=10),
@@ -1484,6 +1490,43 @@ def test_semantic_classification_preserves_mixed_toc_hierarchy_and_continuation(
         "Continuing nested topic 18",
         "Another nested topic 19",
     ]
+
+
+def test_semantic_classification_preserves_paired_and_unpaired_toc_part_evidence() -> None:
+    from web_translator.pdf_layout import (
+        classify_document_lines,
+        classify_semantic_roles,
+        group_words_into_lines,
+    )
+
+    lines = group_words_into_lines(
+        [
+            _word("CONTENTS", x0=65, x1=135, top=20, bottom=40, size=20, fontname="Helvetica-Bold"),
+            _word("PART I Foundations", x0=20, x1=115, top=55, bottom=67, size=12, fontname="Helvetica-Bold"),
+            _word("1", x0=178, x1=188, top=55, bottom=67, size=12),
+            _word("1. First chapter", x0=20, x1=105, top=80, bottom=92, size=12),
+            _word("10", x0=174, x1=188, top=80, bottom=92, size=12),
+            _word(
+                "PART II Operations", x0=20, x1=115, top=110, bottom=122,
+                size=12, fontname="Helvetica-Bold",
+            ),
+        ]
+    )
+    page = [line.with_page_geometry(200, 300) for line in lines]
+    source_character_count = sum(line.character_count for line in page)
+    source_word_ids = sorted(id(word) for line in page for word in line.words)
+
+    classified = classify_document_lines([(page, 300)])
+    classified = classify_semantic_roles(classified)[0]
+
+    assert [(line.text, line.semantic_role) for line in classified] == [
+        ("CONTENTS", "toc-title"),
+        ("PART I Foundations 1", "toc-part"),
+        ("1. First chapter 10", "toc-chapter"),
+        ("PART II Operations", "toc-part"),
+    ]
+    assert sum(line.character_count for line in classified) == source_character_count
+    assert sorted(id(word) for line in classified for word in line.words) == source_word_ids
 
 
 def test_semantic_classification_does_not_treat_numeric_table_as_toc() -> None:

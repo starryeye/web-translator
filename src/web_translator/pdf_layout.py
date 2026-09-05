@@ -1049,11 +1049,12 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             if index == title_index:
                 page_result.append(replace(line, semantic_role="toc-title"))
                 continue
-            if index in part_rows:
-                page_result.append(replace(line, semantic_role="toc-part"))
-                continue
             number_index = pair_by_left.get(index)
-            if number_index is None and index not in whole_rows:
+            if (
+                number_index is None
+                and index not in whole_rows
+                and index not in part_rows
+            ):
                 page_result.append(line)
                 continue
             words = line.words
