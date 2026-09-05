@@ -158,7 +158,7 @@ def make_publication_structure_pdf(path: Path) -> Path:
     canvas.setFont("Helvetica-Oblique", 12)
     canvas.drawCentredString(306, 438, "Structure makes difficult reading feel inevitable.")
     canvas.setFont("Helvetica", 11)
-    canvas.drawRightString(456, 408, "- A patient typesetter")
+    canvas.drawRightString(456, 408, "—A patient typesetter")
     canvas.showPage()
 
     canvas.setFont("Helvetica-Bold", 15)
@@ -179,12 +179,12 @@ def make_publication_structure_pdf(path: Path) -> Path:
     canvas.drawString(72, 674, "[1] Ada North. Deterministic Document Structure.")
     canvas.drawString(90, 658, "Archive Press, 2024.")
     canvas.drawString(72, 622, "[2] Ben South. Evidence Before Reconstruction.")
-    canvas.drawString(90, 606, "Layout Review Quarterly 18(2), 2025.")
     canvas.showPage()
 
     canvas.setFont("Helvetica", 11)
-    canvas.drawString(72, 714, "[3] Cora West. Preserving Logical Reading Order.")
-    canvas.drawString(90, 698, "Proceedings of Reliable Publishing, 2026.")
+    canvas.drawString(90, 714, "Layout Review Quarterly 18(2), 2025.")
+    canvas.drawString(72, 682, "[3] Cora West. Preserving Logical Reading Order.")
+    canvas.drawString(90, 666, "Proceedings of Reliable Publishing, 2026.")
     canvas.showPage()
     canvas.save()
     return path

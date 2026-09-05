@@ -273,6 +273,7 @@ class PdfBlock:
     uri: str | None = None
     destination: str | None = None
     semantic_role: PdfSemanticRole = "body"
+    continuation_of: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -283,6 +284,7 @@ class PdfBlock:
             "bbox": list(self.bbox),
             "style": self.style.to_dict(),
             "semantic_role": self.semantic_role,
+            "continuation_of": self.continuation_of,
             "source_text": self.source_text,
             "segment_id": self.segment_id,
             "table_id": self.table_id,
@@ -299,11 +301,17 @@ class PdfBlock:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PdfBlock:
         context = "PdfBlock"
-        data = _require_exact_fields(
-            data, context,
-            {"id", "page_number", "order", "kind", "bbox", "style", "source_text", "segment_id",
-             "semantic_role", "table_id", "row", "column", "row_span", "column_span", "media_path", "caption_id", "uri", "destination"},
-        )
+        fields = {
+            "id", "page_number", "order", "kind", "bbox", "style",
+            "source_text", "segment_id", "semantic_role", "continuation_of",
+            "table_id", "row", "column", "row_span", "column_span",
+            "media_path", "caption_id", "uri", "destination",
+        }
+        data = _require_mapping(data, context)
+        if set(data) == fields - {"continuation_of"}:
+            data = {**data, "continuation_of": None}
+        else:
+            data = _require_exact_fields(data, context, fields)
         identifier = _require_string(data, "id", context)
         match = _BLOCK_ID.fullmatch(identifier)
         if match is None:
@@ -320,6 +328,11 @@ class PdfBlock:
         segment_id = _require_optional_string(data, "segment_id", context)
         if segment_id is not None and not _SEGMENT_ID.fullmatch(segment_id):
             raise PdfContractError(f"{context}.segment_id must be a stable segment ID")
+        continuation_of = _require_optional_string(data, "continuation_of", context)
+        if continuation_of is not None and _BLOCK_ID.fullmatch(continuation_of) is None:
+            raise PdfContractError(
+                f"{context}.continuation_of must be a stable block ID"
+            )
         table_id = _require_optional_string(data, "table_id", context)
         table_match = _TABLE_ID.fullmatch(table_id) if table_id is not None else None
         if table_id is not None and table_match is None:
@@ -356,6 +369,7 @@ class PdfBlock:
             bbox=_require_bbox(data, context),
             style=PdfBlockStyle.from_dict(_require_mapping_value(data, "style", context)),
             semantic_role=semantic_role,
+            continuation_of=continuation_of,
             source_text=_require_string(data, "source_text", context),
             segment_id=segment_id,
             table_id=table_id,
@@ -577,6 +591,19 @@ class PdfDocument:
         if len({link.id for link in links}) != len(links):
             raise PdfContractError(f"{context}.links must have unique IDs")
         by_id = {block.id: block for block in blocks}
+        for block in blocks:
+            if block.continuation_of is None:
+                continue
+            owner = by_id.get(block.continuation_of)
+            if (
+                owner is None
+                or owner.order >= block.order
+                or owner.semantic_role != "reference-entry"
+            ):
+                raise PdfContractError(
+                    f"{context}.blocks continuation_of must refer to an earlier "
+                    "reference-entry block"
+                )
         for link in links:
             if link.page_number > page_count:
                 raise PdfContractError(f"{context}.links must refer to source pages")
@@ -844,7 +871,8 @@ def upgrade_pdf_document_v1(data: Mapping[str, Any]) -> dict[str, Any]:
     upgraded["schema_version"] = PDF_DOCUMENT_SCHEMA_VERSION
     upgraded["blocks"] = [
         {**dict(_require_mapping(block, f"{context}.blocks[{index}]")),
-         "semantic_role": dict(block).get("semantic_role", "body")}
+         "semantic_role": dict(block).get("semantic_role", "body"),
+         "continuation_of": dict(block).get("continuation_of")}
         for index, block in enumerate(blocks)
     ]
     return upgraded

@@ -64,6 +64,9 @@ from web_translator.protection import protect_fragment
 _MIN_PAGE_POINTS = 36.0
 _MAX_PAGE_POINTS = 14_400.0
 _MAX_PAGE_COUNT = 500
+_REFERENCE_ENTRY_MARKER_PATTERN = re.compile(
+    r"\s*(?:\[(?:\d+|[A-Za-z]+)\]|\d+[.)])\s+\S"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +223,14 @@ def extract_pdf(
         classified_pages = classify_document_lines(
             [(material.lines, material.page_height) for material in materials]
         )
-        classified_pages = classify_semantic_roles(classified_pages)
+        with warnings.catch_warnings(record=True) as semantic_warning_records:
+            warnings.simplefilter("always", PdfExtractionWarning)
+            classified_pages = classify_semantic_roles(classified_pages)
+        semantic_warnings = tuple(
+            str(record.message)
+            for record in semantic_warning_records
+            if issubclass(record.category, PdfExtractionWarning)
+        )
 
         blocks: list[PdfBlock] = []
         table_cells: list[PdfTableCell] = []
@@ -284,10 +294,14 @@ def extract_pdf(
 
         _validate_character_assignment(inspection, assigned_by_page)
         blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
+        blocks = _attach_reference_continuations(blocks)
         _validate_peer_overlap(blocks)
         link_evidence = extract_link_evidence(logical_source, blocks)
         blocks = list(link_evidence.blocks)
-    for message in link_evidence.warnings:
+    extraction_warnings = sorted(
+        set((*semantic_warnings, *link_evidence.warnings))
+    )
+    for message in extraction_warnings:
         warnings.warn(message, PdfExtractionWarning, stacklevel=2)
     blocks, segments = _build_segments(blocks)
     document = PdfDocument(
@@ -310,7 +324,7 @@ def extract_pdf(
         blocks=blocks,
         table_cells=table_cells,
         links=list(link_evidence.links),
-        extraction_warnings=list(link_evidence.warnings),
+        extraction_warnings=extraction_warnings,
     )
     try:
         PdfDocument.from_dict(document.to_dict())
@@ -337,6 +351,24 @@ def extract_pdf(
     except (OSError, UnicodeError, ValueError) as error:
         raise PdfExtractionError(f"cannot write PDF extraction outputs: {error}") from error
     return document
+
+
+def _attach_reference_continuations(blocks: Sequence[PdfBlock]) -> list[PdfBlock]:
+    """Expose page-local reference blocks that belong to an earlier entry."""
+    result: list[PdfBlock] = []
+    owner: PdfBlock | None = None
+    for block in blocks:
+        if block.semantic_role == "reference-heading":
+            owner = None
+        elif block.semantic_role == "reference-entry":
+            if _REFERENCE_ENTRY_MARKER_PATTERN.match(block.source_text) is not None:
+                owner = block
+            elif owner is not None and block.page_number > owner.page_number:
+                block = replace(block, continuation_of=owner.id)
+        elif block.kind not in {"header", "footer", "page-number"}:
+            owner = None
+        result.append(block)
+    return result
 
 
 def _extract_page_materials(

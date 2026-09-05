@@ -41,8 +41,13 @@ _HEADING_NUMBER_PATTERN = re.compile(r"^(?P<number>\d+(?:\.\d+)*)[.)]?\s+")
 _PAGE_NUMBER_PATTERN = re.compile(r"\d+\Z")
 _RUNNING_PAGE_TOKEN_PATTERN = re.compile(r"(?:\d+|[ivxlcdm]+)\Z", re.IGNORECASE)
 _TOC_DOT_LEADER_PATTERN = re.compile(
-    r"^\s*\d+(?:\.\d+)*[.)]?\s+\S.*(?:\.\s*){3,}\d+\s*\Z"
+    r"^\s*(?P<label>\S.*?)\s*(?:\.\s*){3,}(?P<page>\d+)\s*\Z"
 )
+_TOC_NUMBERED_CHAPTER_PATTERN = re.compile(r"^\d+(?:\.\d+)*[.)]\s+\S")
+_TOC_PART_ROW_PATTERN = re.compile(
+    r"^(?:part|book)\s+(?:\d+|[ivxlcdm]+)(?:\b|[.:])", re.IGNORECASE
+)
+_TOC_TITLES = {"contents", "table of contents"}
 _PART_LABEL_PATTERN = re.compile(
     r"(?:part|book)\s+(?:\d+|[ivxlcdm]+)\Z", re.IGNORECASE
 )
@@ -89,6 +94,18 @@ class LinkEvidenceResult:
     blocks: tuple[PdfBlock, ...]
     links: tuple[PdfLinkEvidence, ...]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TocPageEvidence:
+    pairs: tuple[tuple[int, int], ...]
+    whole_rows: tuple[int, ...]
+    title_index: int | None
+    part_rows: tuple[int, ...]
+
+    @property
+    def row_count(self) -> int:
+        return len(self.pairs) + len(self.whole_rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -908,8 +925,8 @@ def _classify_toc_entries(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
 
 
 def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
-    result: list[list[PdfLine]] = []
-    for lines in pages:
+    evidence: list[_TocPageEvidence] = []
+    for page_index, lines in enumerate(pages):
         numeric = [
             (index, line)
             for index, line in enumerate(lines)
@@ -918,7 +935,6 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             and line.page_width is not None
             and line.x0 >= line.page_width * 0.70
             and _PAGE_NUMBER_PATTERN.fullmatch(line.text.strip()) is not None
-            and _edge_band(line) is None
         ]
         pairs: list[tuple[int, int]] = []
         claimed_left: set[int] = set()
@@ -940,40 +956,92 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             claimed_left.add(left_index)
             pairs.append((left_index, number_index))
         aligned_numbers = (
-            len(pairs) >= 3
+            len(pairs) >= 2
             and max(lines[right].x1 for _left, right in pairs)
             - min(lines[right].x1 for _left, right in pairs)
             <= max(lines[right].size for _left, right in pairs)
         )
-        if not aligned_numbers:
-            if len(numeric) >= 3 and pairs:
-                warnings.warn(
-                    "conflicting TOC row evidence; retaining body roles",
-                    PdfExtractionWarning,
-                    stacklevel=2,
-                )
-            result.append(list(lines))
-            continue
-
-        pair_by_left = {left: right for left, right in pairs}
-        removed = {right for _left, right in pairs}
-        first_entry_top = min(lines[left].top for left, _right in pairs)
-        entry_size = max(lines[left].size for left, _right in pairs)
-        page_width = lines[pairs[0][0]].page_width
+        whole_rows = [
+            index
+            for index, line in enumerate(lines)
+            if line.semantic_role == "body"
+            and line.kind not in {"header", "footer", "page-number"}
+            and _TOC_DOT_LEADER_PATTERN.fullmatch(line.text) is not None
+        ]
         title_index = next(
             (
-                index
-                for index, line in sorted(
-                    enumerate(lines), key=lambda item: item[1].top, reverse=True
-                )
-                if line.top < first_entry_top
-                and line.semantic_role == "body"
-                and line.size >= entry_size * 1.25
-                and page_width is not None
-                and abs(line.center_x - page_width / 2.0) <= page_width * 0.08
-            ),
-            None,
+                index for index, line in enumerate(lines)
+                if line.semantic_role == "body"
+                and _normalized_text(line.text) in _TOC_TITLES
+            ), None,
         )
+        usable_pairs = pairs if aligned_numbers else []
+        explicit_part_rows = [
+            index for index, line in enumerate(lines)
+            if line.semantic_role == "body"
+            and _TOC_PART_ROW_PATTERN.match(_normalized_text(line.text)) is not None
+            and _PAGE_NUMBER_PATTERN.fullmatch(line.text.strip()) is None
+        ]
+        if len(numeric) >= 3 and pairs and not aligned_numbers:
+            warnings.warn(
+                f"page {page_index + 1}: conflicting TOC row evidence; retaining body roles",
+                PdfExtractionWarning,
+                stacklevel=2,
+            )
+        evidence.append(
+            _TocPageEvidence(
+                pairs=tuple(usable_pairs),
+                whole_rows=tuple(whole_rows),
+                title_index=title_index,
+                part_rows=tuple(explicit_part_rows),
+            )
+        )
+
+    confirmed = {
+        page_index
+        for page_index, item in enumerate(evidence)
+        if item.row_count >= 2
+        and (
+            item.title_index is not None
+            or len(item.whole_rows) >= 2
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for page_index, item in enumerate(evidence):
+            if page_index in confirmed or item.row_count < 2:
+                continue
+            if page_index - 1 in confirmed or page_index + 1 in confirmed:
+                confirmed.add(page_index)
+                changed = True
+
+    hierarchy_rows = [
+        pages[page_index][line_index]
+        for page_index in confirmed
+        for line_index in (
+            list(evidence[page_index].whole_rows)
+            + [left for left, _right in evidence[page_index].pairs]
+            + list(evidence[page_index].part_rows)
+        )
+    ]
+    hierarchy_left = min((line.x0 for line in hierarchy_rows), default=0.0)
+    has_part_context = any(
+        evidence[page_index].part_rows for page_index in confirmed
+    )
+
+    result: list[list[PdfLine]] = []
+    for page_index, lines in enumerate(pages):
+        if page_index not in confirmed:
+            result.append(list(lines))
+            continue
+        item = evidence[page_index]
+        pairs = list(item.pairs)
+        whole_rows = set(item.whole_rows)
+        part_rows = set(item.part_rows)
+        pair_by_left = {left: right for left, right in pairs}
+        removed = {right for _left, right in pairs}
+        title_index = item.title_index
         page_result: list[PdfLine] = []
         for index, line in enumerate(lines):
             if index in removed:
@@ -981,28 +1049,51 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             if index == title_index:
                 page_result.append(replace(line, semantic_role="toc-title"))
                 continue
+            if index in part_rows:
+                page_result.append(replace(line, semantic_role="toc-part"))
+                continue
             number_index = pair_by_left.get(index)
-            if number_index is None:
+            if number_index is None and index not in whole_rows:
                 page_result.append(line)
                 continue
-            words = tuple(
-                sorted(
-                    (*line.words, *lines[number_index].words),
-                    key=lambda word: (word.x0, word.top, word.text),
+            words = line.words
+            if number_index is not None:
+                words = tuple(
+                    sorted(
+                        (*line.words, *lines[number_index].words),
+                        key=lambda word: (word.x0, word.top, word.text),
+                    )
                 )
+            role = _toc_row_role(
+                line,
+                hierarchy_left=hierarchy_left,
+                has_part_context=has_part_context,
             )
-            normalized = _normalized_text(line.text)
-            if _PART_LABEL_PATTERN.match(normalized):
-                role: PdfSemanticRole = "toc-part"
-            elif _CHAPTER_LABEL_PATTERN.match(normalized):
-                role = "toc-chapter"
-            else:
-                role = "toc-entry"
             page_result.append(
                 replace(line, words=words, spanning=True, semantic_role=role)
             )
         result.append(page_result)
     return result
+
+
+def _toc_row_role(
+    line: PdfLine, *, hierarchy_left: float, has_part_context: bool
+) -> PdfSemanticRole:
+    match = _TOC_DOT_LEADER_PATTERN.fullmatch(line.text)
+    label = match.group("label") if match is not None else line.text
+    normalized = _normalized_text(label)
+    if _TOC_PART_ROW_PATTERN.match(normalized) is not None:
+        return "toc-part"
+    if (
+        _CHAPTER_LABEL_PATTERN.match(normalized) is not None
+        or _TOC_NUMBERED_CHAPTER_PATTERN.match(normalized) is not None
+        or (
+            has_part_context
+            and line.x0 - hierarchy_left <= max(6.0, line.size * 0.75)
+        )
+    ):
+        return "toc-chapter"
+    return "toc-entry"
 
 
 def _classify_sparse_openers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
@@ -1014,15 +1105,10 @@ def _classify_sparse_openers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             if line.semantic_role == "body"
             and line.kind not in {"header", "footer", "page-number"}
         ]
-        if not 2 <= len(content) <= 4:
+        if len(content) < 2:
             continue
         height = next((line.page_height for _index, line in content if line.page_height), None)
         if height is None:
-            continue
-        occupied = max(line.bottom for _index, line in content) - min(
-            line.top for _index, line in content
-        )
-        if occupied > height * 0.30:
             continue
         for position, (label_index, label) in enumerate(content[:-1]):
             label_text = _normalized_text(label.text)
@@ -1030,23 +1116,49 @@ def _classify_sparse_openers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             is_chapter = _CHAPTER_LABEL_PATTERN.fullmatch(label_text) is not None
             if not (is_part or is_chapter):
                 continue
-            title_index, title = content[position + 1]
-            width = label.page_width or title.page_width
-            centered = (
-                width is not None
-                and abs(label.center_x - width / 2.0) <= width * 0.08
-                and abs(title.center_x - width / 2.0) <= width * 0.08
+            first_title_index, first_title = content[position + 1]
+            proximity = (
+                0.0 <= first_title.top - label.bottom
+                <= max(label.size, first_title.size) * 6
             )
-            proximity = 0.0 <= title.top - label.bottom <= max(label.size, title.size) * 6
-            large_type = label.size >= 12.0 and title.size >= max(18.0, label.size * 1.25)
-            if not (centered and proximity and large_type):
+            large_type = (
+                label.size >= 12.0
+                and first_title.size >= max(18.0, label.size * 1.20)
+            )
+            if not (proximity and large_type):
+                continue
+            title_lines = [(first_title_index, first_title)]
+            for title_index, title in content[position + 2:]:
+                previous = title_lines[-1][1]
+                if (
+                    title.size >= first_title.size * 0.85
+                    and -first_title.size * 0.25
+                    <= title.top - previous.bottom
+                    <= first_title.size * 1.25
+                ):
+                    title_lines.append((title_index, title))
+                    continue
+                break
+            following_position = position + 1 + len(title_lines)
+            following = (
+                content[following_position][1]
+                if following_position < len(content)
+                else None
+            )
+            whitespace_after = (
+                height - title_lines[-1][1].bottom
+                if following is None
+                else following.top - title_lines[-1][1].bottom
+            )
+            if whitespace_after < max(height * 0.08, first_title.size * 2.0):
                 continue
             result[page_index][label_index] = replace(
                 label, semantic_role="part-label" if is_part else "chapter-label"
             )
-            result[page_index][title_index] = replace(
-                title, semantic_role="part-title" if is_part else "chapter-title"
-            )
+            for title_index, title in title_lines:
+                result[page_index][title_index] = replace(
+                    title, semantic_role="part-title" if is_part else "chapter-title"
+                )
             break
     return result
 
@@ -1059,11 +1171,13 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         if any(line.semantic_role in {"part-label", "chapter-label"} for line in lines)
     ]
     first_opener = min(opener_pages, default=len(result))
-    for page_index, lines in enumerate(result[:first_opener]):
+    for page_index, lines in enumerate(result):
         content = [
             (index, line)
             for index, line in enumerate(lines)
-            if line.semantic_role == "body"
+            if line.semantic_role in {
+                "body", "part-label", "part-title", "chapter-label", "chapter-title"
+            }
             and line.kind not in {"header", "footer", "page-number"}
         ]
         if not content:
@@ -1072,45 +1186,94 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         width = next((line.page_width for _index, line in content if line.page_width), None)
         if height is None or width is None:
             continue
+        opener_title_bottoms = [
+            line.bottom for _index, line in content
+            if line.semantic_role in {"part-title", "chapter-title"}
+        ]
+        for position, (attribution_index, attribution) in enumerate(content):
+            if (
+                attribution.semantic_role != "body"
+                or attribution.kind == "list-item"
+                or not attribution.text.lstrip().startswith(("-", "\u2013", "\u2014"))
+            ):
+                continue
+            quote_lines: list[tuple[int, PdfLine]] = []
+            for index, line in reversed(content[:position]):
+                if line.semantic_role != "body":
+                    break
+                following = quote_lines[0][1] if quote_lines else attribution
+                gap = following.top - line.bottom
+                if gap > max(line.size, following.size) * 2.0:
+                    break
+                quote_lines.insert(0, (index, line))
+            quote_evidence = quote_lines and (
+                any(_line_is_italic(line) for _index, line in quote_lines)
+                or quote_lines[0][1].text.lstrip().startswith(
+                    ("\"", "\u201c", "'", "\u2018")
+                )
+                or (
+                    opener_title_bottoms
+                    and quote_lines[0][1].top - max(opener_title_bottoms)
+                    >= height * 0.05
+                )
+            )
+            if not quote_evidence:
+                continue
+            attribution_lines = [(attribution_index, attribution)]
+            for index, line in content[position + 1:]:
+                previous = attribution_lines[-1][1]
+                if (
+                    line.semantic_role == "body"
+                    and line.x0 >= attribution.x0 - max(6.0, attribution.size)
+                    and 0.0 <= line.top - previous.bottom
+                    <= max(line.size, previous.size) * 2.0
+                ):
+                    attribution_lines.append((index, line))
+                    continue
+                break
+            for index, line in quote_lines:
+                result[page_index][index] = replace(line, semantic_role="epigraph")
+            for index, line in attribution_lines:
+                result[page_index][index] = replace(
+                    line, semantic_role="epigraph-attribution"
+                )
+            break
+
+        body = [
+            (index, line) for index, line in enumerate(result[page_index])
+            if line.semantic_role == "body"
+            and line.kind not in {"header", "footer", "page-number"}
+        ]
+        if page_index >= first_opener or not body:
+            continue
+        epigraph_tops = [
+            line.top for line in result[page_index]
+            if line.semantic_role == "epigraph"
+        ]
+        if epigraph_tops:
+            body = [(index, line) for index, line in body if line.top < min(epigraph_tops)]
+        if not body:
+            continue
         occupied = max(line.bottom for _index, line in content) - min(
             line.top for _index, line in content
         )
-        if occupied > height * 0.20:
-            continue
-        if len(content) == 1:
-            index, line = content[0]
-            centered = abs(line.center_x - width / 2.0) <= width * 0.08
-            italic = any(
-                marker in word.fontname.casefold()
-                for word in line.words
-                for marker in ("italic", "oblique")
-            )
-            middle = height * 0.30 <= line.top <= height * 0.70
-            if centered and italic and middle and line.character_count <= 120:
+        centered = all(abs(line.center_x - width / 2.0) <= width * 0.25 for _index, line in body)
+        middle = all(height * 0.10 <= line.top <= height * 0.75 for _index, line in body)
+        dedication_evidence = bool(epigraph_tops) or all(
+            _line_is_italic(line) for _index, line in body
+        )
+        if occupied <= height * 0.35 and centered and middle and dedication_evidence:
+            for index, line in body:
                 result[page_index][index] = replace(line, semantic_role="dedication")
-            continue
-        if not 2 <= len(content) <= 4:
-            continue
-        attribution_index, attribution = content[-1]
-        quote_lines = content[:-1]
-        attribution_evidence = (
-            attribution.text.lstrip().startswith(("-", "\u2013", "\u2014"))
-            or attribution.x0 > min(line.x0 for _index, line in quote_lines) + width * 0.10
-        )
-        quote_evidence = any(
-            marker in word.fontname.casefold()
-            for _index, line in quote_lines
-            for word in line.words
-            for marker in ("italic", "oblique")
-        ) or quote_lines[0][1].text.lstrip().startswith(("\"", "\u201c", "'", "\u2018"))
-        if not (attribution_evidence and quote_evidence):
-            continue
-        for index, line in quote_lines:
-            result[page_index][index] = replace(line, semantic_role="epigraph")
-        result[page_index][attribution_index] = replace(
-            attribution, semantic_role="epigraph-attribution"
-        )
     return result
+
+
+def _line_is_italic(line: PdfLine) -> bool:
+    return any(
+        marker in word.fontname.casefold()
+        for word in line.words
+        for marker in ("italic", "oblique", "-it")
+    )
 
 
 def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
@@ -1148,7 +1311,8 @@ def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLin
                 break
         if marker_count < 2:
             warnings.warn(
-                "reference-heading evidence has fewer than two entries; retaining body roles",
+                f"page {heading_page + 1}: reference-heading evidence has fewer "
+                "than two entries; retaining body roles",
                 PdfExtractionWarning,
                 stacklevel=2,
             )
@@ -1220,6 +1384,7 @@ def merge_contiguous_paragraph_lines(
                 or continues_reference
             )
             and merged[-1][1][-1].semantic_role == line.semantic_role
+            and not line.semantic_role.startswith("toc-")
             and _paragraphs_are_contiguous(merged[-1][1][-1], line)
             and not _has_side_by_side_successor(classified, index)
         ):

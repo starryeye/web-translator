@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import math
 from pathlib import Path
 
@@ -1398,7 +1399,7 @@ def test_extract_pdf_preserves_publication_semantic_roles(tmp_path: Path) -> Non
     assert roles.count("part-title") == 1
     assert roles.count("chapter-label") == 1
     assert roles.count("chapter-title") == 1
-    assert roles.count("reference-entry") == 3
+    assert roles.count("reference-entry") == 4
 
     toc_entries = [
         block.source_text
@@ -1411,15 +1412,194 @@ def test_extract_pdf_preserves_publication_semantic_roles(tmp_path: Path) -> Non
         "Publishing with Confidence 43",
     ]
     references = [
-        block.source_text
+        (block.source_text, block.continuation_of)
         for block in document.blocks
         if block.semantic_role == "reference-entry"
     ]
-    assert references == [
+    assert [text for text, owner in references if owner is None] == [
         "[1] Ada North. Deterministic Document Structure. Archive Press, 2024.",
-        "[2] Ben South. Evidence Before Reconstruction. Layout Review Quarterly 18(2), 2025.",
+        "[2] Ben South. Evidence Before Reconstruction.",
         "[3] Cora West. Preserving Logical Reading Order. Proceedings of Reliable Publishing, 2026.",
     ]
+    second_reference = next(
+        block for block in document.blocks if block.source_text.startswith("[2]")
+    )
+    assert references[2] == (
+        "Layout Review Quarterly 18(2), 2025.",
+        second_reference.id,
+    )
+
+
+def test_semantic_classification_preserves_mixed_toc_hierarchy_and_continuation() -> None:
+    from web_translator.pdf_layout import (
+        build_text_blocks,
+        classify_document_lines,
+        classify_semantic_roles,
+        group_words_into_lines,
+    )
+
+    raw_pages = [
+        [
+            _word("CONTENTS", x0=65, x1=135, top=20, bottom=40, size=20, fontname="Helvetica-Bold"),
+            _word("PART I Foundations", x0=20, x1=115, top=55, bottom=67, size=12, fontname="Helvetica-Bold"),
+            _word("1. First chapter", x0=20, x1=105, top=80, bottom=92, size=12),
+            _word("1", x0=178, x1=188, top=80, bottom=92, size=12),
+            _word("Nested topic", x0=40, x1=105, top=100, bottom=112, size=10),
+            _word("2", x0=178, x1=188, top=100, bottom=112, size=10),
+        ],
+        [
+            _word("2. Continuing chapter", x0=20, x1=125, top=30, bottom=42, size=12),
+            _word("17", x0=174, x1=188, top=30, bottom=42, size=12),
+            _word("Continuing nested topic", x0=40, x1=145, top=50, bottom=62, size=10),
+            _word("18", x0=174, x1=188, top=50, bottom=62, size=10),
+            _word("Another nested topic", x0=40, x1=135, top=70, bottom=82, size=10),
+            _word("19", x0=174, x1=188, top=70, bottom=82, size=10),
+        ],
+        [
+            _word("3. Dotted chapter . . . . . 31", x0=20, x1=188, top=30, bottom=42, size=12),
+            _word("Dotted nested topic . . . . . 32", x0=40, x1=188, top=50, bottom=62, size=10),
+        ],
+    ]
+    pages = [
+        [line.with_page_geometry(200, 300) for line in group_words_into_lines(words)]
+        for words in raw_pages
+    ]
+
+    classified = classify_document_lines([(page, 300) for page in pages])
+    classified = classify_semantic_roles(classified)
+
+    assert [[line.semantic_role for line in page] for page in classified] == [
+        ["toc-title", "toc-part", "toc-chapter", "toc-entry"],
+        ["toc-chapter", "toc-entry", "toc-entry"],
+        ["toc-chapter", "toc-entry"],
+    ]
+    blocks = build_text_blocks(classified[0], page_number=1)
+    chapter = next(block for block in blocks if block.semantic_role == "toc-chapter")
+    nested = next(block for block in blocks if block.semantic_role == "toc-entry")
+    assert chapter.style.indentation == 20
+    assert nested.style.indentation == 40
+    continuation_blocks = build_text_blocks(classified[1], page_number=2)
+    assert [block.source_text for block in continuation_blocks] == [
+        "2. Continuing chapter 17",
+        "Continuing nested topic 18",
+        "Another nested topic 19",
+    ]
+
+
+def test_semantic_classification_does_not_treat_numeric_table_as_toc() -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("Latency", x0=20, x1=75, top=40, bottom=50),
+            _word("12", x0=175, x1=190, top=40, bottom=50),
+            _word("Throughput", x0=20, x1=85, top=60, bottom=70),
+            _word("340", x0=168, x1=190, top=60, bottom=70),
+            _word("Errors", x0=20, x1=65, top=80, bottom=90),
+            _word("0", x0=182, x1=190, top=80, bottom=90),
+        ]
+    )
+    page = [line.with_page_geometry(200, 200) for line in lines]
+
+    classified = classify_semantic_roles([page])[0]
+
+    assert {line.semantic_role for line in classified} == {"body"}
+
+
+def test_semantic_classification_recognizes_right_aligned_multiline_opener_and_epigraph() -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("CHAPTER 2", x0=145, x1=190, top=20, bottom=38, size=16, fontname="Helvetica-Bold"),
+            _word("A MULTILINE", x0=105, x1=190, top=43, bottom=68, size=25, fontname="Helvetica-Bold"),
+            _word("TITLE", x0=145, x1=190, top=66, bottom=91, size=25, fontname="Helvetica-Bold"),
+            _word("The limits of language shape our world.", x0=45, x1=175, top=145, bottom=155, size=9),
+            _word("- A careful author", x0=110, x1=190, top=165, bottom=175, size=9),
+            *[
+                _word(f"Body line {index} carries ordinary prose.", x0=20, x1=180, top=220 + index * 12, bottom=230 + index * 12)
+                for index in range(8)
+            ],
+        ]
+    )
+    page = [line.with_page_geometry(200, 400) for line in lines]
+    original_words = [line.words for line in page]
+
+    classified = classify_semantic_roles([page])[0]
+
+    assert [line.semantic_role for line in classified[:5]] == [
+        "chapter-label",
+        "chapter-title",
+        "chapter-title",
+        "epigraph",
+        "epigraph-attribution",
+    ]
+    assert {line.semantic_role for line in classified[5:]} == {"body"}
+    assert [line.words for line in classified] == original_words
+
+
+def test_semantic_classification_splits_dedication_epigraph_and_attribution_on_one_page() -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    lines = group_words_into_lines(
+        [
+            _word("For everyone who preserves", x0=45, x1=155, top=80, bottom=90),
+            _word("meaning across formats.", x0=52, x1=148, top=92, bottom=102),
+            _word("And for patient readers.", x0=48, x1=152, top=118, bottom=128),
+            _word("Structure makes difficult reading", x0=40, x1=160, top=165, bottom=175, fontname="Book-It"),
+            _word("feel inevitable.", x0=65, x1=135, top=177, bottom=187, fontname="Book-It"),
+            _word("- A patient typesetter", x0=100, x1=190, top=197, bottom=207),
+        ]
+    )
+    page = [line.with_page_geometry(200, 400) for line in lines]
+    original_words = [line.words for line in page]
+
+    classified = classify_semantic_roles([page])[0]
+
+    assert [line.semantic_role for line in classified] == [
+        "dedication",
+        "dedication",
+        "dedication",
+        "epigraph",
+        "epigraph",
+        "epigraph-attribution",
+    ]
+    assert [line.words for line in classified] == original_words
+
+
+def test_extract_pdf_persists_semantic_warning_with_page_identity(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_layout import PdfExtractionWarning
+
+    source = tmp_path / "ambiguous-toc.pdf"
+    canvas = Canvas(str(source), pagesize=(200, 300))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawCentredString(100, 270, "CONTENTS")
+    canvas.setFont("Helvetica", 10)
+    for y, label, number_x, number in (
+        (230, "First contents entry", 145, "1"),
+        (205, "Second contents entry", 165, "17"),
+        (180, "Third contents entry", 185, "43"),
+    ):
+        canvas.drawString(20, y, label)
+        canvas.drawString(number_x, y, number)
+    for y in (120, 95, 70):
+        canvas.drawString(20, y, "Evidence remains.")
+    canvas.save()
+
+    with pytest.warns(PdfExtractionWarning, match="conflicting TOC row evidence"):
+        document = extract_pdf(
+            source,
+            tmp_path / "document.json",
+            tmp_path / "segments.jsonl",
+            tmp_path / "media",
+        )
+
+    assert document.extraction_warnings == [
+        "page 1: conflicting TOC row evidence; retaining body roles"
+    ]
+    persisted = json.loads((tmp_path / "document.json").read_text(encoding="utf-8"))
+    assert persisted["extraction_warnings"] == document.extraction_warnings
 
 
 def test_semantic_classification_warns_on_conflicting_toc_columns() -> None:

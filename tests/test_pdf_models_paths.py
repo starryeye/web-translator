@@ -37,6 +37,44 @@ def test_pdf_block_requires_a_supported_semantic_role() -> None:
         PdfBlock.from_dict(payload)
 
 
+def test_pdf_block_schema_1_1_missing_continuation_owner_remains_readable() -> None:
+    payload = make_pdf_block().to_dict()
+    payload.pop("continuation_of")
+
+    block = PdfBlock.from_dict(payload)
+
+    assert block.continuation_of is None
+    assert block.to_dict()["continuation_of"] is None
+
+
+def test_pdf_document_requires_continuation_owner_to_be_earlier_reference_entry() -> None:
+    payload = make_pdf_document().to_dict()
+    owner = payload["blocks"][0]
+    owner["semantic_role"] = "reference-entry"
+    continuation = make_pdf_block(order=1, semantic_role="reference-entry").to_dict()
+    continuation["continuation_of"] = owner["id"]
+    payload["blocks"].append(continuation)
+
+    loaded = PdfDocument.from_dict(payload)
+
+    assert loaded.blocks[1].continuation_of == owner["id"]
+
+    owner["semantic_role"] = "body"
+    with pytest.raises(
+        PdfContractError,
+        match="continuation_of must refer to an earlier reference-entry block",
+    ):
+        PdfDocument.from_dict(payload)
+
+    owner["semantic_role"] = "reference-entry"
+    continuation["continuation_of"] = continuation["id"]
+    with pytest.raises(
+        PdfContractError,
+        match="continuation_of must refer to an earlier reference-entry block",
+    ):
+        PdfDocument.from_dict(payload)
+
+
 def test_pdf_document_upgrades_schema_1_blocks_to_body_role() -> None:
     payload = make_pdf_document().to_dict()
     payload["schema_version"] = "1.0"
