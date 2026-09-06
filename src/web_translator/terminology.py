@@ -48,6 +48,7 @@ def normalize_terminology(
         protected_by_segment=protected_by_segment,
         first_format=first_format,
         later_format=later_format,
+        suppress_numeric_values=policy == "korean-first",
     )
 
 
@@ -79,6 +80,7 @@ def _normalize_policy_records(
     protected_by_segment: Mapping[str, Sequence[ProtectedToken]] | None,
     first_format: Callable[[str, str], str],
     later_format: Callable[[str, str], str],
+    suppress_numeric_values: bool,
 ) -> list[Translation]:
     records = list(ordered)
     if any(not isinstance(record, Translation) for record in records):
@@ -90,7 +92,7 @@ def _normalize_policy_records(
     replaceable_terms = [
         (term, gloss)
         for term, gloss in terms
-        if not any(character.isdigit() for character in term)
+        if not suppress_numeric_values or not _is_numeric_value(term)
     ]
     term_pattern: re.Pattern[str] | None = None
     if replaceable_terms:
@@ -121,6 +123,7 @@ def _normalize_policy_records(
                     transparent_tokens,
                     first_format,
                     later_format,
+                    suppress_numeric_values,
                 ),
             )
         )
@@ -135,6 +138,7 @@ def _normalize_record(
     transparent_tokens: set[str],
     first_format: Callable[[str, str], str],
     later_format: Callable[[str, str], str],
+    suppress_numeric_values: bool,
 ) -> str:
     """Normalize visible characters while retaining opaque tokens verbatim.
 
@@ -161,7 +165,7 @@ def _normalize_record(
 
     pair_candidates: list[tuple[int, int, str]] = []
     for term, gloss in canonical.items():
-        if any(character.isdigit() for character in term):
+        if suppress_numeric_values and _is_numeric_value(term):
             continue
         pair = f"{gloss}({term})"
         start = 0
@@ -225,11 +229,15 @@ def _normalize_record(
         )
         source_fragment = text[original_start:original_end]
         if kind == "pair":
-            replacement = (
-                first_format(term, gloss)
-                if first_occurrence
-                else later_format(term, gloss)
-            )
+            canonical_first = first_format(term, gloss)
+            if first_occurrence and projected[start:end] == canonical_first:
+                replacement = source_fragment
+            else:
+                replacement = (
+                    canonical_first
+                    if first_occurrence
+                    else later_format(term, gloss)
+                )
         else:
             replacement = (
                 first_format(source_fragment, gloss)
@@ -282,6 +290,13 @@ def _retain_placeholders(source: str, replacement: str) -> str:
         if match.group() not in replacement
     ]
     return replacement + "".join(missing)
+
+
+def _is_numeric_value(term: str) -> bool:
+    """Identify standalone numeric values without guessing about technical names."""
+    return any(character.isdigit() for character in term) and not any(
+        character.isalpha() for character in term
+    )
 
 
 def _exact_gloss_ranges(

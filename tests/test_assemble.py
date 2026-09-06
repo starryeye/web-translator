@@ -95,6 +95,15 @@ def test_english_first_policy_remains_backward_compatible() -> None:
     assert actual[0].text == "OAuth(권한 위임)"
 
 
+def test_first_use_keeps_digit_bearing_technical_term_compatibility() -> None:
+    actual = normalize_first_use(
+        [translation("a", "HTML5 evolves.")],
+        {"HTML5": "HTML5 표준"},
+    )
+
+    assert actual[0].text == "HTML5(HTML5 표준) evolves."
+
+
 def test_korean_first_is_idempotent_for_preexisting_korean_first_pair() -> None:
     records = [
         translation("a", "복제(replication)(선택 사항)를 사용한다."),
@@ -196,7 +205,7 @@ def test_korean_first_matches_across_transparent_tag_boundaries() -> None:
     close_tag = "⟦WT:000001⟧"
     records = [translation("a", f"data {open_tag}replication{close_tag}을 사용한다.")]
 
-    actual = normalize_terminology(
+    once = normalize_terminology(
         records,
         {"data replication": "데이터 복제"},
         policy="korean-first",
@@ -207,10 +216,42 @@ def test_korean_first_matches_across_transparent_tag_boundaries() -> None:
             ]
         },
     )
+    twice = normalize_terminology(
+        once,
+        {"data replication": "데이터 복제"},
+        policy="korean-first",
+        protected_by_segment={
+            "a": [
+                ProtectedToken(open_tag, "tag", "<em>"),
+                ProtectedToken(close_tag, "tag", "</em>"),
+            ]
+        },
+    )
 
-    assert actual[0].text == (
+    assert once[0].text == (
         f"데이터 복제(data {open_tag}replication{close_tag})을 사용한다."
     )
+    assert twice == once
+
+
+def test_korean_first_preserves_tags_in_direct_preexisting_pair() -> None:
+    open_tag = "⟦WT:000000⟧"
+    close_tag = "⟦WT:000001⟧"
+    pair = f"데이터 복제(data {open_tag}replication{close_tag})을 사용한다."
+
+    actual = normalize_terminology(
+        [translation("a", pair)],
+        {"data replication": "데이터 복제"},
+        policy="korean-first",
+        protected_by_segment={
+            "a": [
+                ProtectedToken(open_tag, "tag", "<em>"),
+                ProtectedToken(close_tag, "tag", "</em>"),
+            ]
+        },
+    )
+
+    assert actual[0].text == pair
 
 
 def test_first_use_is_longest_first_case_sensitive_and_boundary_aware() -> None:
