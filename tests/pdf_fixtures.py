@@ -35,7 +35,9 @@ from web_translator.pdf_models import (
 from web_translator.pdf_extract import extract_pdf
 
 
-def make_decorated_callout_pdf(path: Path, *, border: str = "rect") -> Path:
+def make_decorated_callout_pdf(
+    path: Path, *, border: str = "rect", labeled_icon: bool = False,
+) -> Path:
     """Original synthetic prose, an adjacent icon, and a labeled chart."""
     canvas = Canvas(str(path), pagesize=(612, 792))
     if border == "rect":
@@ -50,6 +52,9 @@ def make_decorated_callout_pdf(path: Path, *, border: str = "rect") -> Path:
     canvas.setFillColorRGB(0, 0, 0)
     canvas.rect(90, 675, 30, 35, fill=0)
     canvas.line(90, 675, 120, 710)
+    if labeled_icon:
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(100, 690, "A")
     canvas.setFont("Helvetica-Bold", 12)
     # Glyph top is 81.484, slightly above the icon's top of 82.
     canvas.drawString(138, 701, "Operational guidance")

@@ -493,11 +493,12 @@ def _graphic_text_evidence(
         bbox for item in getattr(page, "images", ())
         if (bbox := _object_bbox(item)) is not None
     ]
-    vector = [
-        bbox for name in ("lines", "rects", "curves")
+    primitives = [
+        (name, bbox) for name in ("lines", "rects", "curves")
         for item in getattr(page, name, ())
         if (bbox := _object_bbox(item)) is not None
     ]
+    vector = [bbox for _kind, bbox in primitives]
     lines = (
         group_words_into_lines(page.extract_words(
             return_chars=True, extra_attrs=["fontname", "size"],
@@ -525,16 +526,16 @@ def _graphic_text_evidence(
         enclosed = [line for line in lines if _line_inside(line, bbox)]
         # Interior grid rules and substantial artwork are not prose decoration.
         interior = [
-            item for item in vector if _inside_box(item, bbox)
-            and not _border_object(item, bbox)
+            item for kind, item in primitives if _inside_box(item, bbox)
+            and not (kind == "rects" and _same_box(item, bbox))
+            and not any(_same_box(item, side) for side in _box_sides(bbox))
         ]
+        interior_raster = [item for item in raster if _inside_box(item, bbox)]
+        border_only_text = bool(enclosed) and not interior and not interior_raster
         if (
-            _has_prose(enclosed)
+            (_has_prose(enclosed) or border_only_text)
             and not any(_large_inside_art(item, bbox) for item in interior)
-            and not any(
-                _inside_box(item, bbox) and _large_inside_art(item, bbox)
-                for item in raster
-            )
+            and not any(_large_inside_art(item, bbox) for item in interior_raster)
         ):
             decorated.append(bbox)
     # A small standalone symbol next to a styled title and aligned prose supplies
@@ -595,6 +596,32 @@ def _inside_box(inner: BBox, outer: BBox) -> bool:
         inner[0] >= outer[0] - 1e-6 and inner[1] >= outer[1] - 1e-6
         and inner[2] <= outer[2] + 1e-6 and inner[3] <= outer[3] + 1e-6
     )
+
+
+def _boxes_intersect(left: BBox, right: BBox) -> bool:
+    return (
+        min(left[2], right[2]) - max(left[0], right[0]) > 1e-6
+        and min(left[3], right[3]) - max(left[1], right[1]) > 1e-6
+    )
+
+
+def figure_owns_character(
+    character: Mapping[str, object], bbox: BBox, *, page_number: int,
+) -> bool:
+    """Own complete glyphs only; never split a glyph at a rendered crop edge."""
+    char_box = _object_bbox(character)
+    if char_box is None:
+        raise PdfMediaError(
+            f"page {page_number} graphic bounds {bbox}: invalid character geometry"
+        )
+    if _inside_box(char_box, bbox):
+        return True
+    if _boxes_intersect(char_box, bbox):
+        raise PdfMediaError(
+            f"page {page_number} graphic bounds {bbox}: "
+            "conflicting character ownership (partial glyph overlap)"
+        )
+    return False
 
 
 def _same_box(left: BBox, right: BBox) -> bool:
@@ -672,6 +699,17 @@ def partition_graphic_regions(
         },
         key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]),
     )
+    # Containers include their nested artwork. Only actual text runs outside
+    # accepted artwork supply translatable ownership, not the container's area.
+    word_boxes = [
+        (word.x0, word.top, word.x1, word.bottom)
+        for line in lines for word in line.words
+    ]
+    translatable_runs = [
+        word_box for word_box in word_boxes
+        if any(_inside_box(word_box, box) for box in decorated)
+        and not any(_inside_box(word_box, box) for box in semantic)
+    ]
     figures = []
     for bbox in semantic:
         owned_lines = [line for line in lines if _line_inside(line, bbox)]
@@ -695,8 +733,8 @@ def partition_graphic_regions(
             char_box = _object_bbox(character)
             if char_box is None or not str(character.get("text", "")).strip():
                 continue
-            if _excluded(char_box, [bbox]):
-                if any(_excluded(char_box, [box]) for box in decorated):
+            if figure_owns_character(character, bbox, page_number=page_number):
+                if any(_boxes_intersect(char_box, box) for box in translatable_runs):
                     raise PdfMediaError(
                         f"page {page_number} graphic bounds {bbox}: figure and translatable text overlap"
                     )

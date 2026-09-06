@@ -87,6 +87,44 @@ def test_short_callout_with_styled_title_and_one_prose_line_is_not_a_figure(
     assert [figure.bbox for figure in figures] == [(90.0, 122.0, 115.0, 152.0)]
 
 
+@pytest.mark.parametrize("border", ["rect", "lines"])
+def test_short_body_only_bordered_callout_is_never_rasterized(
+    tmp_path: Path, border: str,
+) -> None:
+    import pdfplumber
+    from web_translator.pdf_media import partition_graphic_regions
+
+    source = tmp_path / "short-body.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    if border == "rect":
+        canvas.rect(72, 580, 440, 100)
+    else:
+        for edge in ((72, 580, 512, 580), (512, 580, 512, 680),
+                     (512, 680, 72, 680), (72, 680, 72, 580)):
+            canvas.line(*edge)
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(90, 640, "Check first.")
+    canvas.save()
+    with pdfplumber.open(source) as document:
+        partition = partition_graphic_regions(document.pages[0], page_number=1)
+    assert partition.figures == []
+    assert partition.decorated_text_bboxes == [(72.0, 112.0, 512.0, 212.0)]
+
+
+def test_labeled_icon_inside_callout_retains_its_selectable_artwork_label(tmp_path: Path) -> None:
+    import pdfplumber
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_media import partition_graphic_regions
+
+    source = make_decorated_callout_pdf(tmp_path / "labeled.pdf", labeled_icon=True)
+    with pdfplumber.open(source) as document:
+        partition = partition_graphic_regions(document.pages[0], page_number=1)
+    assert [region.bbox for region in partition.figures] == [
+        (90.0, 82.0, 120.0, 117.0), (72.0, 392.0, 472.0, 492.0),
+    ]
+    assert [region.owned_selectable_characters for region in partition.figures] == [1, 8]
+
+
 def test_graphic_partition_rejects_prose_mixed_with_substantial_artwork(tmp_path: Path) -> None:
     import pdfplumber
     from tests.pdf_fixtures import make_decorated_callout_pdf

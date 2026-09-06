@@ -49,6 +49,7 @@ from web_translator.pdf_media import (
     PdfMediaError,
     crop_figure_regions,
     detect_decorated_text_bboxes,
+    figure_owns_character,
     partition_graphic_regions,
 )
 from web_translator.pdf_models import (
@@ -472,10 +473,13 @@ def _validate_graphic_word_ownership(
         if not isinstance(chars, list):
             raise PdfExtractionError(f"page {page_number}: missing word character evidence")
         for region in regions:
-            owned = [
-                _mapping_center_in_any_bbox(char, [region.bbox])
-                for char in chars if str(char.get("text", "")).strip()
-            ]
+            try:
+                owned = [
+                    figure_owns_character(char, region.bbox, page_number=page_number)
+                    for char in chars if str(char.get("text", "")).strip()
+                ]
+            except PdfMediaError as error:
+                raise PdfExtractionError(str(error)) from error
             word_owned = _word_in_any_bbox(word, [region.bbox])
             if (
                 (any(owned) and id(word) in prose_ids)

@@ -107,6 +107,58 @@ def test_extract_rejects_a_word_with_characters_on_both_sides_of_figure_boundary
         _extract_page_materials(source, inspect_pdf(source))
 
 
+@pytest.mark.parametrize(("glyph_x", "graphic_right"), [(185, 192), (190, 192), (610, 620)])
+def test_extract_rejects_single_glyph_crossing_figure_boundary(
+    tmp_path: Path, glyph_x: float, graphic_right: float,
+) -> None:
+    from web_translator.pdf_extract import _extract_page_materials
+
+    source = tmp_path / "partial-glyph.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.rect(72, 400, graphic_right - 72, 100)
+    canvas.line(72, 400, graphic_right, 500)
+    canvas.setFont("Helvetica", 10)
+    # W spans 9.44 points: centers inside/outside, plus the clipped page edge.
+    canvas.drawString(glyph_x, 440, "W")
+    canvas.save()
+    with pytest.raises(PdfExtractionError, match=r"page 1 graphic bounds .*partial glyph overlap"):
+        _extract_page_materials(source, inspect_pdf(source))
+
+
+@pytest.mark.parametrize(("glyph_x", "owned"), [(182.56, 1), (192, 0)])
+def test_extract_preserves_single_glyph_touching_figure_edge_without_crossing(
+    tmp_path: Path, glyph_x: float, owned: int,
+) -> None:
+    from web_translator.pdf_extract import _extract_page_materials
+
+    source = tmp_path / "edge-glyph.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.rect(72, 400, 120, 100)
+    canvas.line(72, 400, 192, 500)
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(glyph_x, 440, "W")
+    canvas.save()
+    material = _extract_page_materials(source, inspect_pdf(source))[0]
+    assert material.figure_character_count == owned
+    assert sum(line.character_count for line in material.lines) + owned == 1
+
+
+def test_labeled_callout_icon_and_prose_have_disjoint_character_owners(tmp_path: Path) -> None:
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_extract import _extract_page_materials
+
+    source = make_decorated_callout_pdf(tmp_path / "labeled.pdf", labeled_icon=True)
+    evidence = inspect_pdf(source)
+    material = _extract_page_materials(source, evidence)[0]
+    assert material.figure_character_count == 9  # A + 0Seconds
+    assert material.table_character_count == 0
+    assert not any(line.text == "A" for line in material.lines)
+    assert [line.semantic_role for line in material.lines[:5]] == [
+        "callout-title", "callout-body", "callout-body", "callout-body", "callout-body",
+    ]
+    assert sum(line.character_count for line in material.lines) + 9 == evidence.selectable_characters
+
+
 def test_callout_line_classification_keeps_original_word_and_geometry_evidence() -> None:
     from web_translator.pdf_layout import classify_graphic_text_lines, group_words_into_lines
 
