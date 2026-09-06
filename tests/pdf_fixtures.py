@@ -35,6 +35,48 @@ from web_translator.pdf_models import (
 from web_translator.pdf_extract import extract_pdf
 
 
+def make_decorated_callout_pdf(path: Path, *, border: str = "rect") -> Path:
+    """Original synthetic prose, an adjacent icon, and a labeled chart."""
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    if border == "rect":
+        canvas.setFillColorRGB(0.94, 0.94, 0.94)
+        canvas.rect(72, 582, 440, 150, fill=1, stroke=1)
+    elif border == "lines":
+        for x0, y0, x1, y1 in (
+            (72, 582, 512, 582), (512, 582, 512, 732),
+            (512, 732, 72, 732), (72, 732, 72, 582),
+        ):
+            canvas.line(x0, y0, x1, y1)
+    canvas.setFillColorRGB(0, 0, 0)
+    canvas.rect(90, 675, 30, 35, fill=0)
+    canvas.line(90, 675, 120, 710)
+    canvas.setFont("Helvetica-Bold", 12)
+    # Glyph top is 81.484, slightly above the icon's top of 82.
+    canvas.drawString(138, 701, "Operational guidance")
+    canvas.setFont("Helvetica", 11)
+    for index, text in enumerate((
+        "Keep every selectable sentence available for translation.",
+        "A decorative border provides emphasis around this prose.",
+        "The small symbol belongs beside these explanatory lines.",
+        "Source words and their geometry must remain unchanged.",
+    )):
+        canvas.drawString(138, 680 - index * 15, text)
+    canvas.drawString(72, 555, "Ordinary body begins after the indented callout has ended.")
+    canvas.rect(72, 300, 400, 100)
+    canvas.line(90, 320, 220, 365)
+    canvas.line(220, 365, 455, 330)
+    canvas.setFont("Helvetica", 9)
+    canvas.drawString(82, 307, "0")
+    canvas.drawString(410, 307, "Seconds")
+    canvas.setFont("Helvetica-Oblique", 10)
+    canvas.drawString(72, 283, "Figure 1. Measurements under controlled conditions show")
+    canvas.drawString(72, 270, "the changing rate across the complete observation period.")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 240, "This independent body paragraph must stay outside the caption.")
+    canvas.save()
+    return path
+
+
 def make_pdf_source_record() -> PdfSourceRecord:
     return PdfSourceRecord(
         schema_version="1.0",

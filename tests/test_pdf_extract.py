@@ -47,6 +47,103 @@ from web_translator.pdf_extract import (
 from web_translator.pdf_models import PdfBlock, PdfBlockStyle, PdfPageEvidence
 
 
+@pytest.mark.parametrize("border", ["rect", "lines", "none"])
+def test_extract_callout_prose_and_wrapped_caption_have_exact_ownership(
+    tmp_path: Path, border: str,
+) -> None:
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_extract import extract_pdf
+
+    source = make_decorated_callout_pdf(tmp_path / "callout.pdf", border=border)
+    document = extract_pdf(
+        source, tmp_path / "document.json", tmp_path / "segments.jsonl",
+        tmp_path / "media",
+    )
+    callout = [b for b in document.blocks if b.semantic_role.startswith("callout-")]
+    assert [b.semantic_role for b in callout] == ["callout-title", "callout-body"]
+    assert callout[0].source_text == "Operational guidance"
+    assert callout[1].source_text == (
+        "Keep every selectable sentence available for translation. "
+        "A decorative border provides emphasis around this prose. "
+        "The small symbol belongs beside these explanatory lines. "
+        "Source words and their geometry must remain unchanged."
+    )
+    assert callout[0].style.bold and not callout[1].style.bold
+    assert all(b.segment_id for b in callout)
+    assert document.blocks[callout[0].order - 1].bbox == (90.0, 82.0, 120.0, 117.0)
+    captions = [b for b in document.blocks if b.kind == "caption"]
+    assert len(captions) == 1
+    assert captions[0].source_text == (
+        "Figure 1. Measurements under controlled conditions show "
+        "the changing rate across the complete observation period."
+    )
+    assert next(b for b in document.blocks if b.id == captions[0].caption_id).bbox == (
+        72.0, 392.0, 472.0, 492.0,
+    )
+    assert next(b for b in document.blocks if b.source_text.startswith("Ordinary")).semantic_role == "body"
+    assert next(b for b in document.blocks if b.source_text.startswith("This independent")).kind == "paragraph"
+    with pdfplumber.open(source) as pdf:
+        source_letters = sorted(c["text"] for c in pdf.pages[0].chars if c["text"].strip())
+    extracted_letters = sorted(
+        c for b in document.blocks for c in b.source_text if not c.isspace()
+    )
+    assert sorted([*extracted_letters, *"0Seconds"]) == source_letters
+
+
+def test_extract_rejects_a_word_with_characters_on_both_sides_of_figure_boundary(
+    tmp_path: Path,
+) -> None:
+    from web_translator.pdf_extract import _extract_page_materials
+
+    source = tmp_path / "boundary.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.rect(72, 400, 120, 100)
+    canvas.line(72, 400, 192, 500)
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(175, 440, "Straddling")
+    canvas.drawString(72, 650, "Ordinary selectable text remains separate from chart labels.")
+    canvas.save()
+    with pytest.raises(PdfExtractionError, match=r"page 1 graphic bounds .*conflicting character ownership"):
+        _extract_page_materials(source, inspect_pdf(source))
+
+
+def test_callout_line_classification_keeps_original_word_and_geometry_evidence() -> None:
+    from web_translator.pdf_layout import classify_graphic_text_lines, group_words_into_lines
+
+    lines = group_words_into_lines([
+        _word("Note", x0=90, x1=120, top=100, bottom=112, size=12, fontname="Helvetica-Bold"),
+        _word("Keep", x0=90, x1=115, top=125, bottom=136, size=11),
+        _word("evidence", x0=120, x1=165, top=125, bottom=136, size=11),
+    ])
+    classified = classify_graphic_text_lines(lines, [(72, 90, 200, 150)])
+    assert [line.semantic_role for line in classified] == ["callout-title", "callout-body"]
+    assert all(original.words is result.words for original, result in zip(lines, classified, strict=True))
+    assert sum(line.character_count for line in classified) == 16
+
+
+def test_decorated_prose_is_excluded_before_text_table_detection(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import _extract_page_materials
+    from web_translator.pdf_layout import detect_tables
+
+    source = tmp_path / "false-table.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.rect(72, 580, 440, 140)
+    canvas.setFont("Helvetica", 11)
+    for y in (670, 652, 634):
+        canvas.drawString(90, y, "Every selectable source word remains available for translation.")
+    canvas.save()
+    with pdfplumber.open(source) as pdf:
+        # This fixture triggers the actual text-grid heuristic absent decoration.
+        assert detect_tables(pdf.pages[0], page_number=1).owned_character_count > 0
+    material = _extract_page_materials(source, inspect_pdf(source))[0]
+    assert material.table_blocks == ()
+    assert material.figure_regions == ()
+    assert [line.semantic_role for line in material.lines] == [
+        "callout-body", "callout-body", "callout-body",
+    ]
+    assert sum(line.character_count for line in material.lines) == 168
+
+
 def _word(
     text: str,
     *,

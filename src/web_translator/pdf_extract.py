@@ -35,6 +35,7 @@ from web_translator.pdf_layout import (
     TableDetectionResult,
     build_text_blocks,
     classify_document_lines,
+    classify_graphic_text_lines,
     classify_semantic_roles,
     detect_footnotes,
     detect_tables,
@@ -47,7 +48,8 @@ from web_translator.pdf_media import (
     FigureRegion,
     PdfMediaError,
     crop_figure_regions,
-    detect_figure_regions,
+    detect_decorated_text_bboxes,
+    partition_graphic_regions,
 )
 from web_translator.pdf_models import (
     PdfBlock,
@@ -282,6 +284,9 @@ def extract_pdf(
                 material.table_blocks,
                 page_figures,
             )
+            page_blocks = _order_callout_icons(
+                page_blocks, page_figures, material.figure_regions,
+            )
             page_blocks = detect_footnotes(
                 page_blocks,
                 material.characters,
@@ -380,16 +385,22 @@ def _extract_page_materials(
                 raise PdfExtractionError("PDF readers disagree on page count")
             result: list[_PageMaterial] = []
             for page, evidence in zip(document.pages, inspection.pages, strict=True):
-                tables = detect_tables(page, page_number=evidence.number)
                 try:
-                    regions = detect_figure_regions(
+                    decorated = detect_decorated_text_bboxes(page)
+                    table_page = (
+                        page.filter(
+                            lambda item: not _mapping_center_in_any_bbox(item, decorated)
+                        ) if decorated else page
+                    )
+                    tables = detect_tables(table_page, page_number=evidence.number)
+                    partition = partition_graphic_regions(
                         page,
                         page_number=evidence.number,
                         excluded_bboxes=tables.bboxes,
                     )
                     regions = [
                         _region_with_source_crop(region, evidence.rotation)
-                        for region in regions
+                        for region in partition.figures
                     ]
                 except PdfMediaError as error:
                     raise PdfExtractionError(str(error)) from error
@@ -415,23 +426,18 @@ def _extract_page_materials(
                 prose_words = [
                     word for word in raw_words if not _word_in_any_bbox(word, excluded)
                 ]
+                _validate_graphic_word_ownership(
+                    raw_words, prose_words, regions, evidence.number,
+                )
                 lines = [
                     line.with_page_geometry(float(page.width), float(page.height))
                     for line in group_words_into_lines(prose_words)
                 ]
-                lines = [
-                    replace(line, kind="caption")
-                    if re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", line.text, re.I)
-                    else line
-                    for line in lines
-                ]
+                lines = classify_graphic_text_lines(
+                    lines, partition.decorated_text_bboxes,
+                )
                 figure_character_count = sum(
-                    1
-                    for character in characters
-                    if str(character.get("text", "")).strip()
-                    and _mapping_center_in_any_bbox(
-                        character, [region.bbox for region in regions]
-                    )
+                    region.owned_selectable_characters for region in regions
                 )
                 result.append(
                     _PageMaterial(
@@ -451,6 +457,58 @@ def _extract_page_materials(
         raise
     except Exception as error:
         raise PdfExtractionError(f"cannot extract PDF words: {error}") from error
+
+
+def _validate_graphic_word_ownership(
+    raw_words: Sequence[Mapping[str, object]],
+    prose_words: Sequence[Mapping[str, object]],
+    regions: Sequence[FigureRegion],
+    page_number: int,
+) -> None:
+    """Reject words crossing artwork boundaries before losing or double-counting glyphs."""
+    prose_ids = {id(word) for word in prose_words}
+    for word in raw_words:
+        chars = word.get("chars")
+        if not isinstance(chars, list):
+            raise PdfExtractionError(f"page {page_number}: missing word character evidence")
+        for region in regions:
+            owned = [
+                _mapping_center_in_any_bbox(char, [region.bbox])
+                for char in chars if str(char.get("text", "")).strip()
+            ]
+            word_owned = _word_in_any_bbox(word, [region.bbox])
+            if (
+                (any(owned) and id(word) in prose_ids)
+                or (any(owned) and not all(owned))
+                or (word_owned and owned and not all(owned))
+            ):
+                raise PdfExtractionError(
+                    f"page {page_number} graphic bounds {region.bbox}: "
+                    "figure and translatable text have conflicting character ownership"
+                )
+
+
+def _order_callout_icons(
+    blocks: Sequence[PdfBlock], figures: Sequence[PdfBlock],
+    regions: Sequence[FigureRegion],
+) -> list[PdfBlock]:
+    result = list(blocks)
+    for figure, region in zip(figures, regions, strict=True):
+        bbox = region.decorated_text_bbox
+        if bbox is None:
+            continue
+        owners = [
+            block for block in result
+            if block.semantic_role.startswith("callout-")
+            and _bbox_inside(block.bbox, bbox)
+        ]
+        if not owners:
+            raise PdfExtractionError(
+                f"page {region.page_number} graphic bounds {region.bbox}: missing callout text owner"
+            )
+        result.remove(figure)
+        result.insert(min(result.index(owner) for owner in owners), figure)
+    return result
 
 
 def _exclude_tables_inside_figures(

@@ -599,6 +599,54 @@ def classify_semantic_roles(
     return classified
 
 
+def classify_graphic_text_lines(
+    lines: Sequence[PdfLine],
+    decorated_text_bboxes: Sequence[tuple[float, float, float, float]],
+) -> list[PdfLine]:
+    """Retain source words while marking callouts and conservative caption wraps."""
+    result = list(lines)
+    for bbox in decorated_text_bboxes:
+        indices = [
+            index for index, line in enumerate(result)
+            if line.x0 >= bbox[0] - 1e-6 and line.top >= bbox[1] - 1e-6
+            and line.x1 <= bbox[2] + 1e-6 and line.bottom <= bbox[3] + 1e-6
+        ]
+        if not indices:
+            continue
+        first = min(indices, key=lambda index: (result[index].top, result[index].x0))
+        body_sizes = [result[index].size for index in indices if index != first]
+        for index in indices:
+            line = result[index]
+            title = index == first and (
+                line.bold or (bool(body_sizes) and line.size > max(body_sizes) * 1.1)
+            )
+            result[index] = replace(
+                line, kind="paragraph",
+                semantic_role="callout-title" if title else "callout-body",
+            )
+    previous: PdfLine | None = None
+    for index in sorted(range(len(result)), key=lambda i: (result[i].top, result[i].x0)):
+        line = result[index]
+        if line.semantic_role != "body":
+            previous = None
+            continue
+        marker = re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", line.text, re.I)
+        wrapped = previous is not None and previous.kind == "caption" and (
+            not re.search(r"[.!?]\s*$", previous.text)
+            and 0 <= line.top - previous.bottom <= max(line.size, previous.size) * 0.7
+            and abs(line.x0 - previous.x0) <= line.size * 0.5
+            and abs(line.size - previous.size) <= 0.5
+            and {word.fontname for word in line.words}
+            == {word.fontname for word in previous.words}
+            and split_list_marker(line.text) is None
+        )
+        if marker or wrapped:
+            line = replace(line, kind="caption")
+            result[index] = line
+        previous = line
+    return result
+
+
 def repair_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
     """Mark proven discretionary-hyphen continuations without changing evidence."""
     repaired: list[PdfLine] = []
@@ -1382,6 +1430,10 @@ def merge_contiguous_paragraph_lines(
             merged
             and (
                 (kind == "paragraph" and merged[-1][0] == "paragraph")
+                or (
+                    kind == "caption" and merged[-1][0] == "caption"
+                    and re.match(r"^\s*(?:figure|fig\.)\s*\d+\b", line.text, re.I) is None
+                )
                 or continues_reference
             )
             and merged[-1][1][-1].semantic_role == line.semantic_role

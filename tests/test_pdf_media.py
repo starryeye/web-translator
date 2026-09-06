@@ -11,6 +11,103 @@ import pytest
 from reportlab.pdfgen.canvas import Canvas
 
 
+@pytest.mark.parametrize("border", ["rect", "lines", "none"])
+def test_detect_figure_regions_excludes_selectable_text_inside_vector_box(
+    tmp_path: Path, border: str,
+) -> None:
+    import pdfplumber
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_media import detect_figure_regions
+
+    source = make_decorated_callout_pdf(tmp_path / "callout.pdf", border=border)
+    with pdfplumber.open(source) as document:
+        figures = detect_figure_regions(document.pages[0], page_number=1)
+    assert [figure.bbox for figure in figures] == [
+        (90.0, 82.0, 120.0, 117.0), (72.0, 392.0, 472.0, 492.0),
+    ]
+
+
+def test_raster_chart_preserves_labels_in_source_pixels(tmp_path: Path) -> None:
+    import pdfplumber
+    from PIL import ImageDraw
+    from web_translator.pdf_media import crop_figure_regions, detect_figure_regions
+
+    raster = Image.new("RGB", (200, 100), "white")
+    ImageDraw.Draw(raster).text((15, 60), "Time 0 10 20", fill="black")
+    raster.save(tmp_path / "chart.png")
+    source = tmp_path / "raster-chart.pdf"
+    canvas = Canvas(str(source), pagesize=(300, 200))
+    canvas.drawImage(str(tmp_path / "chart.png"), 50, 50, 200, 100)
+    canvas.save()
+    with pdfplumber.open(source) as document:
+        figures = detect_figure_regions(document.pages[0], page_number=1)
+    assert [figure.bbox for figure in figures] == [(50.0, 50.0, 250.0, 150.0)]
+    crops = crop_figure_regions(source, figures, tmp_path / "media", dpi=72)
+    with Image.open(crops[0]) as cropped:
+        assert cropped.crop((15, 60, 90, 75)).getextrema()[0][0] < 100
+
+
+@pytest.mark.parametrize("border", ["rect", "lines", "none"])
+def test_graphic_partition_records_only_artwork_character_ownership(
+    tmp_path: Path, border: str,
+) -> None:
+    import pdfplumber
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_media import partition_graphic_regions
+
+    source = make_decorated_callout_pdf(tmp_path / "partition.pdf", border=border)
+    with pdfplumber.open(source) as document:
+        partition = partition_graphic_regions(document.pages[0], page_number=1)
+    assert [figure.owned_selectable_characters for figure in partition.figures] == [0, 8]
+    assert len(partition.decorated_text_bboxes) == 1
+    assert partition.figures[0].decorated_text_bbox == partition.decorated_text_bboxes[0]
+    assert partition.figures[1].decorated_text_bbox is None
+    if border != "none":
+        assert partition.decorated_text_bboxes == [(72.0, 60.0, 512.0, 210.0)]
+
+
+def test_short_callout_with_styled_title_and_one_prose_line_is_not_a_figure(
+    tmp_path: Path,
+) -> None:
+    import pdfplumber
+    from web_translator.pdf_media import detect_figure_regions
+
+    source = tmp_path / "short-callout.pdf"
+    canvas = Canvas(str(source), pagesize=(612, 792))
+    canvas.rect(72, 590, 440, 110)
+    canvas.rect(90, 640, 25, 30)
+    canvas.line(90, 640, 115, 670)
+    canvas.setFont("Helvetica-Bold", 12)
+    canvas.drawString(138, 670, "Note")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(138, 650, "This explanatory sentence must remain available for translation.")
+    canvas.save()
+    with pdfplumber.open(source) as document:
+        figures = detect_figure_regions(document.pages[0], page_number=1)
+    assert [figure.bbox for figure in figures] == [(90.0, 122.0, 115.0, 152.0)]
+
+
+def test_graphic_partition_rejects_prose_mixed_with_substantial_artwork(tmp_path: Path) -> None:
+    import pdfplumber
+    from tests.pdf_fixtures import make_decorated_callout_pdf
+    from web_translator.pdf_media import PdfMediaError, partition_graphic_regions
+
+    source = make_decorated_callout_pdf(tmp_path / "mixed.pdf")
+    # Overlay a substantial connected drawing through the prose container.
+    overlay = tmp_path / "overlay.pdf"
+    canvas = Canvas(str(overlay), pagesize=(612, 792))
+    canvas.line(72, 700, 500, 610)
+    canvas.save()
+    writer = PdfWriter()
+    writer.clone_document_from_reader(PdfReader(source))
+    writer.pages[0].merge_page(PdfReader(overlay).pages[0])
+    with source.open("wb") as stream:
+        writer.write(stream)
+    with pdfplumber.open(source) as document:
+        with pytest.raises(PdfMediaError, match=r"page 1 graphic bounds .*cannot partition selectable prose"):
+            partition_graphic_regions(document.pages[0], page_number=1)
+
+
 def _graphic_pdf(path: Path) -> Path:
     canvas = Canvas(str(path), pagesize=(200, 100))
     canvas.setFillColorRGB(0.1, 0.3, 0.8)

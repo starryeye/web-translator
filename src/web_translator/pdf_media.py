@@ -19,6 +19,8 @@ from PIL import ImageDraw, ImageFont
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
+from web_translator.pdf_layout import PdfLine, group_words_into_lines
+
 
 _POPPLER_TIMEOUT_SECONDS = 600
 _GRAPHIC_JOIN_TOLERANCE = 6.0
@@ -32,6 +34,7 @@ MAX_RENDERED_PIXELS_PER_PAGE = 36_000_000
 MAX_RENDERED_PIXELS_TOTAL = 2_000_000_000
 MAX_RENDERED_PNG_BYTES_PER_PAGE = 64 * 1024 * 1024
 MAX_RENDERED_PNG_BYTES_TOTAL = 4 * 1024 * 1024 * 1024
+BBox = tuple[float, float, float, float]
 
 
 class PdfMediaError(RuntimeError):
@@ -53,6 +56,14 @@ class FigureRegion:
     page_width: float
     page_height: float
     crop_bbox: tuple[float, float, float, float] | None = None
+    owned_selectable_characters: int = 0
+    decorated_text_bbox: tuple[float, float, float, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GraphicPartition:
+    figures: Sequence[FigureRegion]
+    decorated_text_bboxes: Sequence[tuple[float, float, float, float]]
 
 
 def find_poppler() -> PopplerTools:
@@ -459,24 +470,174 @@ def detect_figure_regions(
     page_number: int,
     excluded_bboxes: Sequence[tuple[float, float, float, float]] = (),
 ) -> list[FigureRegion]:
-    """Group raster objects and connected vector objects into graphical regions."""
+    """Return source-rendered artwork after separating selectable decoration."""
+    return list(
+        partition_graphic_regions(
+            page, page_number=page_number, excluded_bboxes=excluded_bboxes,
+        ).figures
+    )
+
+
+def detect_decorated_text_bboxes(
+    page: object,
+) -> list[tuple[float, float, float, float]]:
+    """Find prose decoration before table detection can claim its characters."""
+    _, _, _, decorated = _graphic_text_evidence(page)
+    return decorated
+
+
+def _graphic_text_evidence(
+    page: object,
+) -> tuple[list[BBox], list[BBox], list[PdfLine], list[BBox]]:
+    raster = [
+        bbox for item in getattr(page, "images", ())
+        if (bbox := _object_bbox(item)) is not None
+    ]
+    vector = [
+        bbox for name in ("lines", "rects", "curves")
+        for item in getattr(page, name, ())
+        if (bbox := _object_bbox(item)) is not None
+    ]
+    lines = (
+        group_words_into_lines(page.extract_words(
+            return_chars=True, extra_attrs=["fontname", "size"],
+        ))
+        if getattr(page, "chars", ()) else []
+    )
+    rectangles = [
+        bbox for item in getattr(page, "rects", ())
+        if (bbox := _object_bbox(item)) is not None and _valid_bbox(bbox)
+    ]
+    edges = [
+        bbox for item in getattr(page, "lines", ())
+        if (bbox := _object_bbox(item)) is not None
+        and (bbox[2] - bbox[0] <= 1 or bbox[3] - bbox[1] <= 1)
+    ]
+    for group in _connected_groups(edges):
+        bbox = _union_bbox(group)
+        if _valid_bbox(bbox) and all(
+            any(_same_box(edge, side) for edge in group)
+            for side in _box_sides(bbox)
+        ):
+            rectangles.append(bbox)
+    decorated = []
+    for bbox in rectangles:
+        enclosed = [line for line in lines if _line_inside(line, bbox)]
+        # Interior grid rules and substantial artwork are not prose decoration.
+        interior = [
+            item for item in vector if _inside_box(item, bbox)
+            and not _border_object(item, bbox)
+        ]
+        if (
+            _has_prose(enclosed)
+            and not any(_large_inside_art(item, bbox) for item in interior)
+            and not any(
+                _inside_box(item, bbox) and _large_inside_art(item, bbox)
+                for item in raster
+            )
+        ):
+            decorated.append(bbox)
+    # A small standalone symbol next to a styled title and aligned prose supplies
+    # the same evidence without an enclosing border.
+    artwork = [
+        *raster,
+        *(_union_bbox(group) for group in _connected_groups(vector) if len(group) >= 2),
+    ]
+    for icon in artwork:
+        if not _small_icon(icon) or any(_inside_box(icon, box) for box in decorated):
+            continue
+        titles = [
+            line for line in lines
+            if line.bold and 0 <= line.x0 - icon[2] <= 24
+            and abs(line.top - icon[1]) <= line.size
+        ]
+        if len(titles) != 1:
+            continue
+        title = titles[0]
+        group = [title]
+        for line in sorted(lines, key=lambda item: (item.top, item.x0)):
+            if line.top <= title.top:
+                continue
+            if (
+                abs(line.x0 - title.x0) > title.size * 0.5
+                or line.top - group[-1].bottom > max(line.size, title.size) * 1.6
+                or line.top < group[-1].bottom or line.bold
+            ):
+                break
+            group.append(line)
+        if _has_prose(group):
+            decorated.append(_union_bbox([
+                (line.x0, line.top, line.x1, line.bottom) for line in group
+            ]))
+    return raster, vector, lines, sorted(set(decorated), key=lambda box: (box[1], box[0]))
+
+
+def _has_prose(lines: Sequence[PdfLine]) -> bool:
+    prose = [
+        line for line in lines
+        if len(line.text.split()) >= 4 and line.character_count >= 24
+    ]
+    candidates = [line for line in lines if line in prose or line.bold]
+    return any(
+        0 <= second.top - first.bottom <= max(first.size, second.size) * 1.6
+        and abs(first.x0 - second.x0) <= max(first.size, second.size)
+        and second in prose
+        for first, second in zip(candidates, candidates[1:])
+    )
+
+
+def _line_inside(line: PdfLine, bbox: BBox) -> bool:
+    return _inside_box((line.x0, line.top, line.x1, line.bottom), bbox)
+
+
+def _inside_box(inner: BBox, outer: BBox) -> bool:
+    return (
+        inner[0] >= outer[0] - 1e-6 and inner[1] >= outer[1] - 1e-6
+        and inner[2] <= outer[2] + 1e-6 and inner[3] <= outer[3] + 1e-6
+    )
+
+
+def _same_box(left: BBox, right: BBox) -> bool:
+    return all(abs(a - b) <= 1 for a, b in zip(left, right, strict=True))
+
+
+def _box_sides(bbox: BBox) -> tuple[BBox, ...]:
+    x0, top, x1, bottom = bbox
+    return (
+        (x0, top, x1, top), (x0, bottom, x1, bottom),
+        (x0, top, x0, bottom), (x1, top, x1, bottom),
+    )
+
+
+def _border_object(item: BBox, bbox: BBox) -> bool:
+    return _same_box(item, bbox) or any(_same_box(item, side) for side in _box_sides(bbox))
+
+
+def _small_icon(bbox: BBox) -> bool:
+    return 12 <= bbox[2] - bbox[0] <= 72 and 12 <= bbox[3] - bbox[1] <= 72
+
+
+def _large_inside_art(item: BBox, container: BBox) -> bool:
+    return (
+        item[2] - item[0] > max(72, (container[2] - container[0]) * 0.5)
+        or item[3] - item[1] > max(72, (container[3] - container[1]) * 0.5)
+    )
+
+
+def partition_graphic_regions(
+    page: object, *, page_number: int,
+    excluded_bboxes: Sequence[tuple[float, float, float, float]] = (),
+) -> GraphicPartition:
+    """Partition decoration and artwork using source text and object geometry."""
     page_width = _positive_number(getattr(page, "width", None), "page width")
     page_height = _positive_number(getattr(page, "height", None), "page height")
     page_x0, page_top = _page_origin(page)
-    raster = [
-        bbox
-        for item in getattr(page, "images", ())
-        if (bbox := _object_bbox(item))
-        is not None
-        and not _excluded(bbox, excluded_bboxes)
-    ]
+    raster, vector, lines, decorated = _graphic_text_evidence(page)
+    decorated = [box for box in decorated if not _excluded(box, excluded_bboxes)]
+    raster = [box for box in raster if not _excluded(box, excluded_bboxes)]
     vector = [
-        bbox
-        for collection in ("lines", "rects", "curves")
-        for item in getattr(page, collection, ())
-        if (bbox := _object_bbox(item))
-        is not None
-        and not _excluded(bbox, excluded_bboxes)
+        box for box in vector if not _excluded(box, excluded_bboxes)
+        and not any(_border_object(box, decoration) for decoration in decorated)
     ]
     vector_groups = [
         group
@@ -511,8 +672,36 @@ def detect_figure_regions(
         },
         key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]),
     )
-    return [
-        FigureRegion(
+    figures = []
+    for bbox in semantic:
+        owned_lines = [line for line in lines if _line_inside(line, bbox)]
+        if _has_prose(owned_lines):
+            raise PdfMediaError(
+                f"page {page_number} graphic bounds {bbox}: cannot partition selectable prose"
+            )
+        associated = [
+            box for box in decorated if _small_icon(bbox) and (
+                _inside_box(bbox, box) or (
+                    0 <= box[0] - bbox[2] <= 24 and abs(box[1] - bbox[1]) <= 14
+                )
+            )
+        ]
+        if len(associated) > 1:
+            raise PdfMediaError(
+                f"page {page_number} graphic bounds {bbox}: ambiguous callout ownership"
+            )
+        owned = 0
+        for character in getattr(page, "chars", ()):
+            char_box = _object_bbox(character)
+            if char_box is None or not str(character.get("text", "")).strip():
+                continue
+            if _excluded(char_box, [bbox]):
+                if any(_excluded(char_box, [box]) for box in decorated):
+                    raise PdfMediaError(
+                        f"page {page_number} graphic bounds {bbox}: figure and translatable text overlap"
+                    )
+                owned += sum(not value.isspace() for value in str(character["text"]))
+        figures.append(FigureRegion(
             page_number,
             bbox,
             page_width,
@@ -526,9 +715,10 @@ def detect_figure_regions(
                     bbox[3] - page_top,
                 )
             ),
-        )
-        for bbox in semantic
-    ]
+            owned,
+            associated[0] if associated else None,
+        ))
+    return GraphicPartition(figures, decorated)
 
 
 def _run_poppler(command: list[str], action: str) -> None:
