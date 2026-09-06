@@ -45,8 +45,8 @@ _SEMANTIC_DIMENSIONS = {
     "protected_content",
 }
 _ZONE_FILE = re.compile(r"zone-\d{3}\.json\Z")
-_TERMINOLOGY_POLICY_ID = "english-technical-first-use-ko-gloss"
-_TERMINOLOGY_POLICY_VERSION = "1.0"
+_TERMINOLOGY_POLICY_ID = "korean-first-technical-terms"
+_TERMINOLOGY_POLICY_VERSION = "2.0"
 
 
 @dataclass(frozen=True, slots=True)

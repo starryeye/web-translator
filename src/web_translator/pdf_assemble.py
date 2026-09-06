@@ -67,7 +67,7 @@ from web_translator.pdf_models import (
     font_size_bucket,
 )
 from web_translator.protection import ProtectionError, restore_tokens
-from web_translator.terminology import TerminologyError, normalize_first_use
+from web_translator.terminology import TerminologyError, normalize_terminology
 
 
 REGULAR_FONT_NAME = "WT-NotoSansKR"
@@ -695,9 +695,10 @@ def _normalize_pdf_translations(
 
     ordered_records = [translation_map[segment.id] for _block, segment in ordered_pairs]
     try:
-        normalized = normalize_first_use(
+        normalized = normalize_terminology(
             ordered_records,
             glossary,
+            policy="korean-first",
             protected_by_segment={
                 segment.id: segment.protected for _block, segment in ordered_pairs
             },

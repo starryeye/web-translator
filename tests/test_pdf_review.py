@@ -73,8 +73,8 @@ def test_pdf_semantic_review_input_is_typed_canonical_and_deterministic(
         "schema_version": "1.0",
         "semantic_input_sha256": first.semantic_input_sha256,
         "terminology_policy": {
-            "policy_id": "english-technical-first-use-ko-gloss",
-            "policy_version": "1.0",
+            "policy_id": "korean-first-technical-terms",
+            "policy_version": "2.0",
         },
         "files": [record.to_dict() for record in first.files],
     }

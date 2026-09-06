@@ -102,7 +102,7 @@ def _assembly_run(
             kind="paragraph",
             bbox=(72.0, 108.0, 540.0, 144.0),
             style=style,
-            source_text="Korean body with OAuth and ⟦WT:000001⟧.",
+            source_text="Korean body with replication and ⟦WT:000001⟧.",
             segment_id="seg-000002",
         ),
         PdfBlock(
@@ -186,11 +186,11 @@ def _assembly_run(
     translations = {
         "seg-000001": Translation("seg-000001", "<안내 & 개요>"),
         "seg-000002": Translation(
-            "seg-000002", "한국어 본문 & OAuth ⟦WT:000001⟧."
+            "seg-000002", "한국어 본문 & replication ⟦WT:000001⟧."
         ),
         "seg-000003": Translation("seg-000003", "첫째 ⟦WT:000002⟧"),
     }
-    return run_dir, translations, {"OAuth": "권한 위임"}
+    return run_dir, translations, {"replication": "복제"}
 
 
 def _rich_assembly_run(
@@ -1314,7 +1314,7 @@ def test_assemble_pdf_stages_selectable_korean_without_publishing(
     text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
     expected = [
         "<안내 & 개요>",
-        "한국어 본문 & OAuth(권한 위임) client<id>.",
+        "한국어 본문 & 복제(replication) client<id>.",
         "첫째 <둘째>",
         "Source: 기술 보고서.pdf",
         "Generated: ",

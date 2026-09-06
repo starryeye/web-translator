@@ -8,7 +8,11 @@ import pytest
 from web_translator.assemble import AssemblyError, assemble_page
 from web_translator.extract import extract_segments
 from web_translator.models import ProtectedToken, Segment, Translation
-from web_translator.terminology import TerminologyError, normalize_first_use
+from web_translator.terminology import (
+    TerminologyError,
+    normalize_first_use,
+    normalize_terminology,
+)
 
 
 TOKEN = "⟦WT:000000⟧"
@@ -63,6 +67,150 @@ def test_first_use_keeps_english_and_adds_one_korean_gloss() -> None:
     assert normalized[1].text == "OAuth is reused."
     assert normalized[0].notes == "reviewed"
     assert normalized[0].glossary_observations == {"OAuth": "consistent"}
+
+
+def test_korean_first_uses_bilingual_first_occurrence_then_korean() -> None:
+    records = [
+        translation("a", "replication 기능을 사용한다."),
+        translation("b", "replication 기능이 작동한다."),
+    ]
+
+    actual = normalize_terminology(
+        records, {"replication": "복제"}, policy="korean-first"
+    )
+
+    assert [item.text for item in actual] == [
+        "복제(replication) 기능을 사용한다.",
+        "복제 기능이 작동한다.",
+    ]
+
+
+def test_english_first_policy_remains_backward_compatible() -> None:
+    actual = normalize_terminology(
+        [translation("a", "OAuth")],
+        {"OAuth": "권한 위임"},
+        policy="english-first",
+    )
+
+    assert actual[0].text == "OAuth(권한 위임)"
+
+
+def test_korean_first_is_idempotent_for_preexisting_korean_first_pair() -> None:
+    records = [
+        translation("a", "복제(replication)(선택 사항)를 사용한다."),
+        translation("b", "replication 결과를 검토한다."),
+    ]
+
+    once = normalize_terminology(
+        records, {"replication": "복제"}, policy="korean-first"
+    )
+    twice = normalize_terminology(
+        once, {"replication": "복제"}, policy="korean-first"
+    )
+
+    assert [item.text for item in once] == [
+        "복제(replication)(선택 사항)를 사용한다.",
+        "복제 결과를 검토한다.",
+    ]
+    assert twice == once
+
+
+def test_korean_first_converts_english_first_gloss_without_losing_qualification() -> None:
+    records = [
+        translation("a", "replication(복제)(선택 사항)을 사용한다."),
+        translation("b", "replication(기존 방식)을 비교한다."),
+    ]
+
+    actual = normalize_terminology(
+        records, {"replication": "복제"}, policy="korean-first"
+    )
+
+    assert [item.text for item in actual] == [
+        "복제(replication)(선택 사항)을 사용한다.",
+        "복제(기존 방식)을 비교한다.",
+    ]
+
+
+def test_korean_first_handles_overlapping_terms_without_nested_glosses() -> None:
+    records = [
+        translation("a", "data replication을 사용한다."),
+        translation("b", "replication을 반복한다."),
+    ]
+    glossary = {"data replication": "데이터 복제", "replication": "복제"}
+
+    once = normalize_terminology(records, glossary, policy="korean-first")
+    twice = normalize_terminology(once, glossary, policy="korean-first")
+
+    assert [item.text for item in once] == [
+        "데이터 복제(data replication)을 사용한다.",
+        "복제(replication)을 반복한다.",
+    ]
+    assert twice == once
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [
+        ("identifier", "PostgreSQL"),
+        ("identifier", "OAuth"),
+        ("identifier", "client_id"),
+        ("url", "https://example.com/replication"),
+        ("code", "replication()"),
+    ],
+    ids=["product", "acronym", "identifier", "url", "code"],
+)
+def test_korean_first_keeps_protected_values_opaque(kind: str, value: str) -> None:
+    records = [
+        translation("a", f"{TOKEN} 값을 유지한다."),
+        translation("b", "replication 개념을 설명한다."),
+    ]
+
+    actual = normalize_terminology(
+        records,
+        {"replication": "복제", value: "보호값"},
+        policy="korean-first",
+        protected_by_segment={
+            "a": [ProtectedToken(TOKEN, kind, value)],
+            "b": [],
+        },
+    )
+
+    assert actual[0].text == f"{TOKEN} 값을 유지한다."
+    assert actual[1].text == "복제(replication) 개념을 설명한다."
+
+
+def test_korean_first_preserves_numbers_even_if_glossary_matches_one() -> None:
+    records = [translation("a", "2024년에 replication을 2회 수행한다.")]
+
+    actual = normalize_terminology(
+        records,
+        {"2024": "이천이십사", "replication": "복제"},
+        policy="korean-first",
+    )
+
+    assert actual[0].text == "2024년에 복제(replication)을 2회 수행한다."
+
+
+def test_korean_first_matches_across_transparent_tag_boundaries() -> None:
+    open_tag = "⟦WT:000000⟧"
+    close_tag = "⟦WT:000001⟧"
+    records = [translation("a", f"data {open_tag}replication{close_tag}을 사용한다.")]
+
+    actual = normalize_terminology(
+        records,
+        {"data replication": "데이터 복제"},
+        policy="korean-first",
+        protected_by_segment={
+            "a": [
+                ProtectedToken(open_tag, "tag", "<em>"),
+                ProtectedToken(close_tag, "tag", "</em>"),
+            ]
+        },
+    )
+
+    assert actual[0].text == (
+        f"데이터 복제(data {open_tag}replication{close_tag})을 사용한다."
+    )
 
 
 def test_first_use_is_longest_first_case_sensitive_and_boundary_aware() -> None:

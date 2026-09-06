@@ -14,8 +14,8 @@ import stat
 from typing import Any
 
 
-TERMINOLOGY_POLICY_ID = "english-technical-first-use-ko-gloss"
-TERMINOLOGY_POLICY_VERSION = "1.0"
+TERMINOLOGY_POLICY_ID = "korean-first-technical-terms"
+TERMINOLOGY_POLICY_VERSION = "2.0"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _ZONE = re.compile(r"zone-\d{3}\Z")
 _REPARSE_POINT = 0x400
