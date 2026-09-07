@@ -1009,8 +1009,11 @@ def _append_callout_group(
     if icon is None:
         data, widths = [[paragraphs]], [frame[2]]
     else:
-        image = _figure_flowable(icon, media_payloads[icon.id], frame, records, part_counters)
         icon_width = min(icon.bbox[2] - icon.bbox[0] + 16, frame[2] * 0.25)
+        image = _figure_flowable(
+            icon, media_payloads[icon.id], frame, records, part_counters,
+            max_width=icon_width - 16,
+        )
         data, widths = [[image, paragraphs]], [icon_width, frame[2] - icon_width]
     table = Table(
         data, colWidths=widths, hAlign="LEFT", splitByRow=1, splitInRow=1,
@@ -2068,6 +2071,8 @@ def _figure_flowable(
     frame: tuple[float, float, float, float],
     records: list[PdfFlowableLayout],
     part_counters: dict[str, int],
+    *,
+    max_width: float | None = None,
 ) -> TrackedFlowable:
     try:
         with PillowImage.open(io.BytesIO(payload)) as image:
@@ -2088,7 +2093,8 @@ def _figure_flowable(
         raise PdfAssemblyError(f"figure media dimensions do not match source bounds: {block.id}")
     natural_width = pixel_width * 72.0 / _FIGURE_RENDER_DPI
     natural_height = pixel_height * 72.0 / _FIGURE_RENDER_DPI
-    scale = min(1.0, frame[2] / natural_width, frame[3] / natural_height)
+    available_width = frame[2] if max_width is None else min(frame[2], max_width)
+    scale = min(1.0, available_width / natural_width, frame[3] / natural_height)
     width = natural_width * scale
     height = natural_height * scale
     image = Image(io.BytesIO(payload), width=width, height=height)

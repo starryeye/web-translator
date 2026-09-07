@@ -695,6 +695,51 @@ def test_callout_icon_title_body_adjacency_and_split_continuation(
     assert all(text.count(f"word{i:04d}") == 1 for i in range(650 if long_body else 20))
 
 
+@pytest.mark.parametrize("source_height", [50, 320], ids=["wide", "tall"])
+def test_callout_capped_icon_fits_cell_without_overlap_or_resampling(
+    tmp_path: Path, source_height: int,
+) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "callout-title", "Practical guidance"),
+        (1, "callout-body", "Selectable explanation beside the original artwork."),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    icon = PdfBlock(
+        "pdf:page-0001:block-0099", 1, 0, "figure", (72, 54, 232, 54 + source_height),
+        PdfBlockStyle(11, False, "left", 0, 0), "", None, media_path="media/icon.png",
+    )
+    data["blocks"].insert(0, icon.to_dict())
+    for index, block in enumerate(data["blocks"]):
+        block["order"] = index
+    data["blocks"][1]["bbox"] = [250, 54, 432, 72]
+    data["blocks"][2]["bbox"] = [250, 78, 432, 140]
+    path.write_text(json.dumps(data))
+    (run_dir / "media").mkdir()
+    image_path = run_dir / "media/icon.png"
+    Image.new("RGB", (320, source_height * 2), (42, 120, 196)).save(image_path)
+    original_digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+
+    output = _assemble_publication(run_dir, tmp_path / "out")
+
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    icon_record, title, body = records
+    assert icon_record.page_number == title.page_number == body.page_number
+    assert icon_record.bounds[0] + icon_record.bounds[2] <= title.bounds[0]
+    # 396pt frame, capped at 99pt for the icon column, minus 8pt padding each side.
+    assert icon_record.bounds[2] == pytest.approx(83)
+    assert icon_record.bounds[3] == pytest.approx(source_height * 83 / 160)
+    assert icon_record.frame == title.frame == body.frame
+    assert icon_record.frame[2] == 396
+    assert hashlib.sha256(image_path.read_bytes()).hexdigest() == original_digest
+    assert PdfReader(output).pages[0].images[0].image.size == (320, source_height * 2)
+    with pdfplumber.open(output) as pdf:
+        drawn = pdf.pages[0].images[0]
+        assert drawn["x0"] == pytest.approx(icon_record.bounds[0])
+        assert drawn["width"] == pytest.approx(icon_record.bounds[2])
+        assert drawn["height"] == pytest.approx(icon_record.bounds[3])
+
+
 def test_layout_semantic_role_legacy_diagnostics_and_strict_new_schema(tmp_path: Path) -> None:
     run_dir = _publication_assembly_run(tmp_path, [(1, "chapter-title", "A new chapter")])
     _assemble_publication(run_dir, tmp_path / "out")
