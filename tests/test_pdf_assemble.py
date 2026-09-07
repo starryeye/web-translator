@@ -536,6 +536,203 @@ def _heading_font_sizes(path: Path, labels: list[str]) -> list[float]:
     return [found[label] for label in labels]
 
 
+def _publication_assembly_run(tmp_path: Path, rows: list[tuple[int, str, str]]) -> Path:
+    run_dir, _, _ = _assembly_run(tmp_path, width=504, height=661.5)
+    blocks, segments = [], []
+    for index, (page, role, text) in enumerate(rows):
+        identifier = f"pdf:page-{page:04d}:block-{index + 1:04d}"
+        segment_id = f"seg-{index + 1:06d}"
+        heading = role.endswith(("title", "label", "heading"))
+        block = PdfBlock(
+            identifier, page, index, "heading" if heading else "paragraph",
+            (72, 100 + index * 12, 396, 110 + index * 12),
+            PdfBlockStyle(18 if heading else 11, heading, "center" if role in {
+                "dedication", "epigraph", "epigraph-attribution", "part-title",
+            } else "left", 0, 8), text, segment_id, semantic_role=role,
+        )
+        blocks.append(block)
+        segments.append(Segment(segment_id, identifier, block.kind, [], text, [], [], True))
+    count = max(page for page, _, _ in rows)
+    document = PdfDocument("1.1", "a" * 64, count, 100, [],
+        [PdfPage(page, 504, 661.5, 0) for page in range(1, count + 1)], blocks, [])
+    (run_dir / "document.json").write_text(json.dumps(document.to_dict()), encoding="utf-8")
+    (run_dir / "segments.jsonl").unlink()
+    write_segments(run_dir / "segments.jsonl", segments)
+    return run_dir
+
+
+def _assemble_publication(run_dir: Path, output: Path) -> Path:
+    translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    return assemble_pdf(run_dir=run_dir, translations=translations, glossary={}, output_dir=output)
+
+
+def test_source_trim_opener_and_epigraph_groups_preserve_source_page_structure(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "body", "Before."),
+        (2, "dedication", "For our readers."),
+        (2, "epigraph", "A thought to carry forward."),
+        (2, "epigraph-attribution", "The author"),
+        (3, "body", "After the dedication."),
+        (4, "part-label", "PART I"),
+        (4, "part-title", "Foundations"),
+        (5, "body", "After the part opener."),
+        (6, "chapter-label", "CHAPTER 2"),
+        (6, "chapter-title", "Reliable Systems"),
+        (6, "body", "Introductory prose shares this opener."),
+    ])
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    reader = PdfReader(output)
+    assert float(reader.pages[0].mediabox.width) == pytest.approx(504)
+    assert float(reader.pages[0].mediabox.height) == pytest.approx(661.5)
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    assert [r.page_number for r in records] == [1, 2, 2, 2, 3, 4, 4, 5, 6, 6, 6]
+    assert [r.semantic_role for r in records][1:4] == ["dedication", "epigraph", "epigraph-attribution"]
+    # The front-matter group is vertically composed below the body-frame top.
+    assert records[1].bounds[1] + records[1].bounds[3] < records[1].frame[1] + records[1].frame[3] - 60
+    with pdfplumber.open(output) as pdf:
+        words = pdf.pages[1].extract_words()
+        assert min(w["x0"] for w in words) > 100
+
+
+@pytest.mark.parametrize("sizes,want", [
+    ([(504, 661.5), (661.5, 504)], (504, 661.5)),
+    ([(661.5, 504), (720, 540), (720, 540)], (720, 540)),
+    ([(480, 640), (504, 661.5), (504, 661.5)], (504, 661.5)),
+])
+def test_source_trim_uses_observed_dominant_portrait_when_present(tmp_path: Path, sizes: list, want: tuple) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [(1, "body", "Canvas dimensions.")])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    data["pages"] = [PdfPage(i + 1, w, h, 0).to_dict() for i, (w, h) in enumerate(sizes)]
+    data["page_count"] = len(sizes)
+    path.write_text(json.dumps(data))
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    page = PdfReader(output).pages[0]
+    assert (float(page.mediabox.width), float(page.mediabox.height)) == pytest.approx(want)
+    assert read_pdf_layout(run_dir / "layout.json").page_size.name == "SOURCE"
+
+
+@pytest.mark.parametrize("rich", [False, True])
+def test_visible_provenance_is_metadata_only(tmp_path: Path, rich: bool) -> None:
+    if rich:
+        run_dir, translations, glossary, _ = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
+    else:
+        run_dir, translations, glossary = _assembly_run(tmp_path)
+    reader = PdfReader(assemble_pdf(run_dir, translations, glossary, tmp_path / "out"))
+    text = "\n".join(page.extract_text() for page in reader.pages)
+    assert "Source:" not in text and "Generated:" not in text
+    source = json.loads((run_dir / "source.json").read_text())
+    assert source["final_source"] in reader.metadata.subject
+    assert "Generated:" in reader.metadata.subject
+
+
+def test_reference_entries_use_hanging_indent_and_explicit_continuations(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "reference-heading", "References"),
+        (1, "reference-entry", "[1] " + "Reference details for a useful book. " * 5),
+        (2, "reference-entry", "Continued publication details."),
+        (2, "reference-entry", "[2] Another independent reference."),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    data["blocks"][2]["continuation_of"] = data["blocks"][1]["id"]
+    path.write_text(json.dumps(data))
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    with pdfplumber.open(output) as pdf:
+        words = pdf.pages[0].extract_words()
+        marker = next(w for w in words if w["text"] == "[1]")
+        wrapped = next(w for w in words if w["top"] > marker["top"] + 5)
+        continued = next(w for w in words if w["text"] == "Continued")
+        other = next(w for w in words if w["text"] == "[2]")
+        assert wrapped["x0"] >= marker["x0"] + 14
+        assert continued["x0"] >= marker["x0"] + 14
+        assert other["x0"] == pytest.approx(marker["x0"])
+
+
+@pytest.mark.parametrize("long_body", [False, True])
+@pytest.mark.parametrize("prior_repetitions", [80, 180])
+def test_callout_icon_title_body_adjacency_and_split_continuation(
+    tmp_path: Path, long_body: bool, prior_repetitions: int,
+) -> None:
+    body = " ".join(f"word{i:04d}" for i in range(650 if long_body else 20))
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "body", "Prior prose. " * prior_repetitions),
+        (1, "callout-title", "Practical guidance"),
+        (1, "callout-body", body),
+        (1, "body", "Following ordinary prose."),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    icon = PdfBlock("pdf:page-0001:block-0099", 1, 1, "figure", (89, 54, 127, 104),
+                    PdfBlockStyle(11, False, "left", 0, 0), "", None,
+                    media_path="media/icon.png")
+    data["blocks"].insert(1, icon.to_dict())
+    for index, block in enumerate(data["blocks"]):
+        block["order"] = index
+    data["blocks"][2]["bbox"] = [136.8, 54, 396, 72]
+    data["blocks"][3]["bbox"] = [136.8, 78, 396, 140.8]
+    path.write_text(json.dumps(data))
+    (run_dir / "media").mkdir()
+    Image.new("RGB", (76, 100), (42, 120, 196)).save(run_dir / "media/icon.png")
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    icon_record = next(r for r in records if r.block_id == icon.id)
+    title = next(r for r in records if r.semantic_role == "callout-title")
+    bodies = [r for r in records if r.semantic_role == "callout-body"]
+    assert sum(r.block_id == icon.id for r in records) == 1
+    assert sum(r.semantic_role == "callout-title" for r in records) == 1
+    assert icon_record.page_number == title.page_number == bodies[0].page_number
+    assert icon_record.bounds[0] + icon_record.bounds[2] <= title.bounds[0]
+    if prior_repetitions == 180:
+        assert title.page_number > records[0].page_number
+    if long_body:
+        assert len({r.page_number for r in bodies}) >= 2
+        with pdfplumber.open(output) as pdf:
+            assert any(line.get("dash") and line["dash"][0] for page in pdf.pages[1:] for line in page.lines)
+    else:
+        assert len(bodies) == 1
+    text = " ".join(page.extract_text() for page in PdfReader(output).pages)
+    assert all(text.count(f"word{i:04d}") == 1 for i in range(650 if long_body else 20))
+
+
+def test_layout_semantic_role_legacy_diagnostics_and_strict_new_schema(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [(1, "chapter-title", "A new chapter")])
+    _assemble_publication(run_dir, tmp_path / "out")
+    path = run_dir / "layout.json"
+    data = json.loads(path.read_text())
+    assert data["schema_version"] == "1.1"
+    assert data["flowables"][0]["semantic_role"] == "chapter-title"
+    data["flowables"][0]["semantic_role"] = "invented"
+    path.write_text(json.dumps(data))
+    with pytest.raises(PdfAssemblyError, match="semantic_role"):
+        read_pdf_layout(path)
+    del data["flowables"][0]["semantic_role"]
+    path.write_text(json.dumps(data))
+    with pytest.raises(PdfAssemblyError, match="semantic_role"):
+        read_pdf_layout(path)
+    data["schema_version"] = "1.0"
+    data["page_size"]["name"] = "LETTER"
+    path.write_text(json.dumps(data))
+    assert read_pdf_layout(path).flowables[0].semantic_role == "body"
+
+
+@pytest.mark.parametrize("with_title", [False, True])
+def test_callout_without_artwork_keeps_korean_text_selectable(tmp_path: Path, with_title: bool) -> None:
+    rows = [(1, "callout-title", "실무 지침")] if with_title else []
+    rows += [(1, "callout-body", "번역된 설명을 읽을 수 있습니다. " * 10),
+             (1, "body", "일반 본문이 이어집니다.")]
+    run_dir = _publication_assembly_run(tmp_path, rows)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    reader = PdfReader(output)
+    assert "번역된 설명을 읽을 수 있습니다." in reader.pages[0].extract_text()
+    assert not reader.pages[0].images
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    assert [r.semantic_role for r in records] == [role for _, role, _ in rows]
+    with pdfplumber.open(output) as pdf:
+        assert len(pdf.pages[0].lines) >= 4
+        assert len({record.page_number for record in records[:-1]}) == 1
+
+
 def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> None:
     asset_root = files("web_translator").joinpath("font_assets")
     provenance = json.loads(asset_root.joinpath("PROVENANCE.json").read_text("utf-8"))
@@ -1316,8 +1513,6 @@ def test_assemble_pdf_stages_selectable_korean_without_publishing(
         "<안내 & 개요>",
         "한국어 본문 & 복제(replication) client<id>.",
         "첫째 <둘째>",
-        "Source: 기술 보고서.pdf",
-        "Generated: ",
     ]
     positions = [text.index(value) for value in expected]
     assert positions == sorted(positions)
@@ -1328,10 +1523,10 @@ def test_assemble_pdf_stages_selectable_korean_without_publishing(
     assert any("Bold" in name for name in programs)
 
     layout = read_pdf_layout(run_dir / "layout.json")
-    assert layout.schema_version == "1.0"
+    assert layout.schema_version == "1.1"
     assert layout.reserved_output_dir == str(final_output)
     assert layout.staged_pdf_sha256 == hashlib.sha256(staged.read_bytes()).hexdigest()
-    assert layout.page_size.name == "LETTER"
+    assert layout.page_size.name == "SOURCE"
     assert layout.minimum_font_size == 9.0
     assert [(item.block_id, item.kind, item.source_order) for item in layout.flowables] == [
         ("pdf:page-0001:block-0001", "heading", 0),
@@ -1560,7 +1755,7 @@ def test_assemble_pdf_rejects_repeated_identical_composite_footer(tmp_path: Path
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
-def test_assemble_pdf_chooses_a4_for_a4_like_source_pages(tmp_path: Path) -> None:
+def test_assemble_pdf_preserves_a4_source_pages(tmp_path: Path) -> None:
     run_dir, translations, glossary = _assembly_run(
         tmp_path, width=595.275590551, height=841.88976378
     )
@@ -1570,7 +1765,7 @@ def test_assemble_pdf_chooses_a4_for_a4_like_source_pages(tmp_path: Path) -> Non
     page = PdfReader(staged).pages[0]
     assert float(page.mediabox.width) == pytest.approx(595.2756, abs=0.01)
     assert float(page.mediabox.height) == pytest.approx(841.8898, abs=0.01)
-    assert read_pdf_layout(run_dir / "layout.json").page_size.name == "A4"
+    assert read_pdf_layout(run_dir / "layout.json").page_size.name == "SOURCE"
 
 
 def test_pdf_layout_reader_rejects_unknown_fields(tmp_path: Path) -> None:

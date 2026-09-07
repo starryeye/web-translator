@@ -10,11 +10,11 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, get_args
 
 from reportlab.platypus import Flowable
 
-from web_translator.pdf_models import PdfContractError, PdfLinkEvidence
+from web_translator.pdf_models import PdfContractError, PdfLinkEvidence, PdfSemanticRole
 
 
 _BLOCK_ID = re.compile(
@@ -32,7 +32,7 @@ _KINDS = {
     "footer",
     "page-number",
 }
-_PAGE_NAMES = {"A4", "LETTER"}
+_PAGE_NAMES = {"A4", "LETTER", "SOURCE"}
 _IS_WINDOWS = os.name == "nt"
 
 
@@ -42,7 +42,7 @@ class PdfAssemblyError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PdfPageSize:
-    name: Literal["A4", "LETTER"]
+    name: Literal["A4", "LETTER", "SOURCE"]
     width: float
     height: float
 
@@ -54,7 +54,7 @@ class PdfPageSize:
         data = _exact_mapping(value, "page_size", {"height", "name", "width"})
         name = _string(data, "name", "page_size")
         if name not in _PAGE_NAMES:
-            raise PdfAssemblyError("page_size.name must be A4 or LETTER")
+            raise PdfAssemblyError("page_size.name must be A4, LETTER or SOURCE")
         return cls(
             name=name,  # type: ignore[arg-type]
             width=_positive_number(data, "width", "page_size"),
@@ -83,6 +83,7 @@ class PdfFlowableLayout:
     bounds: tuple[float, float, float, float]
     frame: tuple[float, float, float, float]
     font_size: float
+    semantic_role: PdfSemanticRole = "body"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -94,10 +95,13 @@ class PdfFlowableLayout:
             "page_number": self.page_number,
             "source_order": self.source_order,
             "split_part": self.split_part,
+            "semantic_role": self.semantic_role,
         }
 
     @classmethod
-    def from_dict(cls, value: object, index: int) -> PdfFlowableLayout:
+    def from_dict(
+        cls, value: object, index: int, *, schema_version: str = "1.1",
+    ) -> PdfFlowableLayout:
         context = f"flowables[{index}]"
         data = _exact_mapping(
             value,
@@ -111,8 +115,13 @@ class PdfFlowableLayout:
                 "page_number",
                 "source_order",
                 "split_part",
-            },
+            } | ({"semantic_role"} if schema_version == "1.1" else set()),
         )
+        semantic_role = (
+            _string(data, "semantic_role", context) if schema_version == "1.1" else "body"
+        )
+        if semantic_role not in get_args(PdfSemanticRole):
+            raise PdfAssemblyError(f"{context}.semantic_role is not supported")
         block_id = _string(data, "block_id", context)
         if _BLOCK_ID.fullmatch(block_id) is None:
             raise PdfAssemblyError(f"{context}.block_id is not a stable PDF block ID")
@@ -131,6 +140,7 @@ class PdfFlowableLayout:
             bounds=bounds,
             frame=frame,
             font_size=_positive_number(data, "font_size", context),
+            semantic_role=semantic_role,  # type: ignore[arg-type]
         )
 
 
@@ -146,7 +156,13 @@ class PdfAssemblyLayout:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "flowables": [item.to_dict() for item in self.flowables],
+            "flowables": [
+                {
+                    key: value for key, value in item.to_dict().items()
+                    if self.schema_version != "1.0" or key != "semantic_role"
+                }
+                for item in self.flowables
+            ],
             "links": [item.to_dict() for item in self.links],
             "minimum_font_size": self.minimum_font_size,
             "page_size": self.page_size.to_dict(),
@@ -172,8 +188,8 @@ class PdfAssemblyLayout:
             root_message="layout fields must be exactly",
         )
         schema_version = _string(data, "schema_version", "layout")
-        if schema_version != "1.0":
-            raise PdfAssemblyError("layout.schema_version must be '1.0'")
+        if schema_version not in {"1.0", "1.1"}:
+            raise PdfAssemblyError("layout.schema_version must be '1.0' or '1.1'")
         digest = _string(data, "staged_pdf_sha256", "layout")
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise PdfAssemblyError("layout.staged_pdf_sha256 must be lowercase SHA-256")
@@ -181,7 +197,7 @@ class PdfAssemblyLayout:
         if not isinstance(raw_flowables, list):
             raise PdfAssemblyError("layout.flowables must be an array")
         flowables = tuple(
-            PdfFlowableLayout.from_dict(item, index)
+            PdfFlowableLayout.from_dict(item, index, schema_version=schema_version)
             for index, item in enumerate(raw_flowables)
         )
         raw_links = data.get("links")
@@ -259,6 +275,7 @@ class TrackedFlowable(Flowable):
         part_counters: dict[str, int] | None = None,
         anchor_name: str | None = None,
         on_draw: Callable[[Any, int], None] | None = None,
+        semantic_role: PdfSemanticRole = "body",
     ) -> None:
         super().__init__()
         self._content = content
@@ -272,6 +289,8 @@ class TrackedFlowable(Flowable):
         self._part_counters = part_counters
         self._anchor_name = anchor_name
         self._on_draw = on_draw
+        self._semantic_role = semantic_role
+        self.hAlign = getattr(content, "hAlign", "LEFT")
         self.width = 0.0
         self.height = 0.0
 
@@ -296,6 +315,7 @@ class TrackedFlowable(Flowable):
                 part_counters=self._part_counters,
                 anchor_name=self._anchor_name,
                 on_draw=self._on_draw,
+                semantic_role=self._semantic_role,
             )
             for index, part in enumerate(parts)
         ]
@@ -306,7 +326,11 @@ class TrackedFlowable(Flowable):
     def getSpaceAfter(self) -> float:
         return float(self._content.getSpaceAfter())
 
+    def getKeepWithNext(self) -> bool:
+        return bool(self._content.getKeepWithNext())
+
     def drawOn(self, canvas: Any, x: float, y: float, _sW: float = 0) -> None:
+        x = self._hAlignAdjust(x, _sW)
         corners = [
             canvas.absolutePosition(point_x, point_y)
             for point_x, point_y in (
@@ -336,7 +360,7 @@ class TrackedFlowable(Flowable):
             )
         if self._on_draw is not None:
             self._on_draw(canvas, page_number)
-        self._content.drawOn(canvas, x, y, _sW)
+        self._content.drawOn(canvas, x, y)
         if self._part_counters is None:
             split_part = self._split_part
         else:
@@ -352,6 +376,7 @@ class TrackedFlowable(Flowable):
                 bounds=bounds,
                 frame=self._frame_bounds,
                 font_size=self._font_size,
+                semantic_role=self._semantic_role,
             )
         )
 

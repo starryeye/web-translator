@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
@@ -24,7 +25,7 @@ from xml.sax.saxutils import escape, quoteattr
 from PIL import Image as PillowImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
-from reportlab.lib.pagesizes import A4, LETTER, landscape
+from reportlab.lib.pagesizes import landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -106,6 +107,9 @@ _PAGE_LOCAL_FOOTNOTE_HEIGHT = 60.0
 _URI_CHARACTERS = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*\Z")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _HTTP_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_OPENER_ROLES = {"part-label", "part-title", "chapter-label", "chapter-title"}
+_EPIGRAPH_ROLES = {"dedication", "epigraph", "epigraph-attribution"}
+_CALLOUT_ROLES = {"callout-title", "callout-body"}
 
 
 @dataclass(slots=True)
@@ -317,7 +321,9 @@ def assemble_pdf(
             "translated.pdf",
         )
         uses_rich_layout = bool(document.links) or any(
-            block.kind in _RICH_KINDS or block.kind in _IGNORED_KINDS
+            block.kind in _RICH_KINDS
+            or block.kind in _IGNORED_KINDS
+            or block.semantic_role != "body"
             for block in document.blocks
         )
         if uses_rich_layout:
@@ -344,7 +350,7 @@ def assemble_pdf(
         temporary_pdf.stream.close()
         temporary_staging_anchor.verify_visible()
         layout = PdfAssemblyLayout(
-            schema_version="1.0",
+            schema_version="1.1",
             reserved_output_dir=str(output_dir),
             staged_pdf_sha256=digest,
             page_size=page_size,
@@ -898,6 +904,147 @@ def _anchor_name(block_id: str) -> str:
     return "wt-" + re.sub(r"[^A-Za-z0-9_.-]", "-", block_id)
 
 
+def _consume_role_group(
+    blocks: Sequence[PdfBlock], start: int, roles: set[str],
+) -> list[PdfBlock]:
+    group: list[PdfBlock] = []
+    first = blocks[start]
+    for block in blocks[start:]:
+        if block.page_number != first.page_number or block.semantic_role not in roles:
+            break
+        # A new label/title starts a distinct callout or opener, even on one page.
+        if group and (
+            block.semantic_role == "callout-title"
+            or block.semantic_role.endswith("-label")
+        ):
+            break
+        group.append(block)
+    return group
+
+
+def _role_paragraph(
+    block: PdfBlock, translated: Mapping[str, str],
+    links: Mapping[str, Sequence[PdfLinkEvidence]],
+    frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
+    counters: dict[str, int], style: ParagraphStyle,
+    callbacks: Mapping[str, Callable[[Any, int], None]],
+) -> TrackedFlowable:
+    return TrackedFlowable(
+        Paragraph(_linked_markup(block, translated[block.id], links.get(block.id, ())), style),
+        block_id=block.id, kind=block.kind, source_order=block.order, split_part=0,
+        font_size=style.fontSize, frame=frame, records=records, part_counters=counters,
+        anchor_name=_anchor_name(block.id), semantic_role=block.semantic_role,
+        on_draw=callbacks.get(block.id),
+    )
+
+
+def _append_opener_group(
+    story: list[Any], blocks: Sequence[PdfBlock], translated: Mapping[str, str],
+    links: Mapping[str, Sequence[PdfLinkEvidence]],
+    frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
+    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int], None]],
+) -> None:
+    contents: list[Any] = [Spacer(1, frame[3] * 0.16)]
+    for block in blocks:
+        label = block.semantic_role.endswith("-label")
+        style = ParagraphStyle(
+            f"WT-{block.semantic_role}", fontName=BOLD_FONT_NAME,
+            fontSize=14 if label else 24, leading=20 if label else 34,
+            alignment=_ALIGNMENTS[block.style.alignment], spaceAfter=14 if label else 24,
+        )
+        contents.append(_role_paragraph(
+            block, translated, links, frame, records, part_counters, style, callbacks,
+        ))
+    if story and not isinstance(story[-1], PageBreak):
+        story.append(PageBreak())
+    story.append(KeepTogether(contents))
+
+
+def _append_epigraph_group(
+    story: list[Any], blocks: Sequence[PdfBlock], translated: Mapping[str, str],
+    links: Mapping[str, Sequence[PdfLinkEvidence]],
+    frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
+    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int], None]],
+) -> None:
+    contents: list[Any] = [Spacer(1, frame[3] * 0.25)]
+    for block in blocks:
+        attribution = block.semantic_role == "epigraph-attribution"
+        style = ParagraphStyle(
+            f"WT-{block.semantic_role}", fontName=REGULAR_FONT_NAME,
+            fontSize=10 if attribution else 12, leading=16 if attribution else 20,
+            alignment=_ALIGNMENTS[block.style.alignment],
+            leftIndent=24, rightIndent=24,
+            spaceBefore=18 if block.semantic_role == "epigraph" else 0,
+            spaceAfter=8,
+        )
+        contents.append(_role_paragraph(
+            block, translated, links, frame, records, part_counters, style, callbacks,
+        ))
+    if story and not isinstance(story[-1], PageBreak):
+        story.append(PageBreak())
+    story.append(KeepTogether(contents))
+
+
+def _append_callout_group(
+    story: list[Any], blocks: Sequence[PdfBlock], translated: Mapping[str, str],
+    links: Mapping[str, Sequence[PdfLinkEvidence]],
+    frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
+    part_counters: dict[str, int], *, media_payloads: Mapping[str, bytes],
+    callbacks: Mapping[str, Callable[[Any, int], None]],
+) -> None:
+    icon = blocks[0] if blocks[0].kind == "figure" else None
+    paragraphs: list[TrackedFlowable] = []
+    for block in blocks:
+        if block is icon:
+            continue
+        title = block.semantic_role == "callout-title"
+        style = ParagraphStyle(
+            f"WT-{block.semantic_role}", fontName=BOLD_FONT_NAME if title else REGULAR_FONT_NAME,
+            fontSize=12 if title else BODY_FONT_SIZE, leading=18 if title else 16,
+            spaceAfter=6, keepWithNext=title,
+        )
+        paragraphs.append(_role_paragraph(
+            block, translated, links, frame, records, part_counters, style, callbacks,
+        ))
+    if icon is None:
+        data, widths = [[paragraphs]], [frame[2]]
+    else:
+        image = _figure_flowable(icon, media_payloads[icon.id], frame, records, part_counters)
+        icon_width = min(icon.bbox[2] - icon.bbox[0] + 16, frame[2] * 0.25)
+        data, widths = [[image, paragraphs]], [icon_width, frame[2] - icon_width]
+    table = Table(
+        data, colWidths=widths, hAlign="LEFT", splitByRow=1, splitInRow=1,
+        spaceBefore=8, spaceAfter=10,
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F5F7")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#8B969F")),
+        ("LINEABOVE", (0, "splitfirst"), (-1, "splitfirst"),
+         0.6, colors.HexColor("#8B969F"), 1, (2, 2)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(KeepTogether([table]))
+
+
+def _reference_style(block: PdfBlock) -> ParagraphStyle:
+    return ParagraphStyle(
+        f"WT-Reference-{block.order}", fontName=REGULAR_FONT_NAME,
+        fontSize=BODY_FONT_SIZE, leading=16, leftIndent=18,
+        firstLineIndent=0 if block.continuation_of else -18,
+        spaceBefore=0 if block.continuation_of else 3, spaceAfter=4,
+    )
+
+
+def _embed_font_faces(canvas: Any, _doc: Any) -> None:
+    # Keep the resource contract even when no visible block uses one face.
+    for name in (REGULAR_FONT_NAME, BOLD_FONT_NAME):
+        pdfmetrics.getFont(name).getSubsetInternalName(0, canvas._doc)
+
+
 def _build_basic_document(
     document: PdfDocument,
     ordered: Sequence[tuple[PdfBlock, Segment, str]],
@@ -956,10 +1103,9 @@ def _build_basic_document(
                         font_size=font_size,
                         frame=frame,
                         records=records,
+                        semantic_role=block.semantic_role,
                     )
                 )
-            story.append(Spacer(1.0, 16.0))
-            story.append(_source_attribution(source))
             pdf = SimpleDocTemplate(
                 destination,
                 pagesize=(page_size.width, page_size.height),
@@ -969,9 +1115,9 @@ def _build_basic_document(
                 bottomMargin=bottom_margin,
                 title="Reviewed Korean translation",
                 author="web-translator",
-                subject="Selectable Korean PDF translation",
+                subject=_provenance_metadata(source),
             )
-            pdf.build(story)
+            pdf.build(story, onFirstPage=_embed_font_faces)
     except PdfAssemblyError:
         raise
     except Exception as error:
@@ -1068,6 +1214,7 @@ def _build_rich_document(
     }
 
     def draw_running(canvas: Any, _doc: BaseDocTemplate, *, orientation: str) -> None:
+        _embed_font_faces(canvas, _doc)
         width, height = (
             portrait_size if orientation == "portrait" else landscape_size
         )
@@ -1264,6 +1411,8 @@ def _build_rich_document(
     emitted_tables: set[str] = set()
     emitted_figures: set[str] = set()
     emitted_section_notes: set[str] = set()
+    emitted_block_ids: set[str] = set()
+    composition_page: int | None = None
 
     def append_text(block: PdfBlock, frame: tuple[float, float, float, float]) -> None:
         if block.id not in translated:
@@ -1309,6 +1458,7 @@ def _build_rich_document(
                 part_counters=part_counters,
                 anchor_name=_anchor_name(block.id),
                 on_draw=page_note_callbacks.get(block.id),
+                semantic_role=block.semantic_role,
             )
         )
 
@@ -1378,11 +1528,53 @@ def _build_rich_document(
     try:
         with ExitStack() as stack:
             _register_fonts(stack)
-            for block in document.blocks:
+            for index, block in enumerate(document.blocks):
                 if block.kind in _IGNORED_KINDS or block.id in page_local_notes:
+                    continue
+                if block.id in emitted_block_ids:
                     continue
                 if block.kind == "heading":
                     append_pending_section_notes(block.order)
+                if composition_page is not None and block.page_number != composition_page:
+                    if story and not isinstance(story[-1], PageBreak):
+                        story.append(PageBreak())
+                    composition_page = None
+                if block.semantic_role in _OPENER_ROLES | _EPIGRAPH_ROLES:
+                    opener = block.semantic_role in _OPENER_ROLES
+                    group = _consume_role_group(
+                        document.blocks, index, _OPENER_ROLES if opener else _EPIGRAPH_ROLES,
+                    )
+                    append_group = _append_opener_group if opener else _append_epigraph_group
+                    append_group(
+                        story, group, translated, links_by_block, portrait_frame,
+                        records, part_counters, callbacks=page_note_callbacks,
+                    )
+                    emitted_block_ids.update(item.id for item in group)
+                    composition_page = block.page_number
+                    continue
+                next_block = (
+                    document.blocks[index + 1] if index + 1 < len(document.blocks) else None
+                )
+                callout_icon = (
+                    block.kind == "figure" and block.caption_id is None
+                    and next_block is not None and next_block.semantic_role in _CALLOUT_ROLES
+                    and block.page_number == next_block.page_number
+                    and block.bbox[2] <= next_block.bbox[0]
+                    and block.bbox[1] < next_block.bbox[3] and block.bbox[3] > next_block.bbox[1]
+                )
+                if block.semantic_role in _CALLOUT_ROLES or callout_icon:
+                    group = _consume_role_group(
+                        document.blocks, index + int(callout_icon), _CALLOUT_ROLES,
+                    )
+                    if callout_icon:
+                        group.insert(0, block)
+                    _append_callout_group(
+                        story, group, translated, links_by_block, portrait_frame,
+                        records, part_counters, media_payloads=media_payloads,
+                        callbacks=page_note_callbacks,
+                    )
+                    emitted_block_ids.update(item.id for item in group)
+                    continue
                 if block.kind == "table-cell":
                     assert block.table_id is not None
                     if block.table_id in emitted_tables:
@@ -1434,8 +1626,6 @@ def _build_rich_document(
                     continue
                 append_text(block, portrait_frame)
             append_pending_section_notes(None)
-            story.append(Spacer(1.0, 16.0))
-            story.append(_source_attribution(source))
             pdf = BaseDocTemplate(
                 destination,
                 pagesize=(
@@ -1447,7 +1637,7 @@ def _build_rich_document(
                 bottomMargin=bottom_margin,
                 title="Reviewed Korean translation",
                 author="web-translator",
-                subject="Selectable Korean PDF translation",
+                subject=_provenance_metadata(source),
             )
             templates = (
                 [landscape_template, portrait_template]
@@ -1917,26 +2107,11 @@ def _figure_flowable(
     )
 
 
-def _source_attribution(source: PdfSourceRecord) -> Paragraph:
-    attribution_style = ParagraphStyle(
-        "WT-SourceAttribution",
-        fontName=REGULAR_FONT_NAME,
-        fontSize=MINIMUM_FONT_SIZE,
-        leading=11.0,
-        textColor="#444444",
-        spaceBefore=6.0,
-        spaceAfter=0.0,
-    )
+def _provenance_metadata(source: PdfSourceRecord) -> str:
     generated = datetime.now(UTC).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
-    return Paragraph(
-        f'<font name="{BOLD_FONT_NAME}">Source:</font> '
-        f"{escape(source.final_source)}<br/>"
-        f'<font name="{BOLD_FONT_NAME}">Generated:</font> '
-        f"{escape(generated)}",
-        attribution_style,
-    )
+    return f"Selectable Korean PDF translation; Source: {source.final_source}; Generated: {generated}"
 
 
 def _style_for_block(
@@ -1945,6 +2120,8 @@ def _style_for_block(
     heading_sizes: Sequence[int],
     list_level: int,
 ) -> tuple[float, ParagraphStyle]:
+    if block.semantic_role == "reference-entry":
+        return BODY_FONT_SIZE, _reference_style(block)
     if block.kind == "heading":
         alignment = _ALIGNMENTS[block.style.alignment]
         level = _normalized_heading_level(block, heading_sizes)
@@ -2096,18 +2273,10 @@ def _register_fonts(stack: ExitStack) -> None:
 
 
 def _select_page_size(document: PdfDocument) -> PdfPageSize:
-    ratios = sorted(min(page.width, page.height) / max(page.width, page.height) for page in document.pages)
-    midpoint = len(ratios) // 2
-    median = (
-        ratios[midpoint]
-        if len(ratios) % 2
-        else (ratios[midpoint - 1] + ratios[midpoint]) / 2.0
-    )
-    a4_ratio = min(A4) / max(A4)
-    letter_ratio = min(LETTER) / max(LETTER)
-    name, values = ("A4", A4) if abs(median - a4_ratio) <= abs(median - letter_ratio) else ("LETTER", LETTER)
-    width, height = sorted(float(value) for value in values)
-    return PdfPageSize(name=name, width=width, height=height)  # type: ignore[arg-type]
+    pages = [page for page in document.pages if page.width <= page.height] or document.pages
+    counts = Counter((page.width, page.height) for page in pages)
+    width, height = counts.most_common(1)[0][0]
+    return PdfPageSize(name="SOURCE", width=width, height=height)
 
 
 def _validate_destinations(

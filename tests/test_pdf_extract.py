@@ -511,6 +511,21 @@ def test_order_page_lines_rejects_unbalanced_three_column_evidence(
         order_page_lines(lines, 200)
 
 
+@pytest.mark.parametrize("gap", [2.1, 8.1])
+def test_paragraph_boundaries_follow_same_font_column_spacing_evidence(gap: float) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    tops = [100, 112.6, 125.2, 143.8, 156.4, 169.0] if gap == 2.1 else [100, 118.6, 137.2, 155.8, 174.4, 193.0]
+    lines = group_words_into_lines([
+        _word(text, x0=72, x1=396, top=top, bottom=top + 10.5, size=10.5)
+        for text, top in zip(["Opening sentence.", "Still this paragraph.", "Its final line.",
+                              "Another paragraph.", "Its next sentence.", "Its final line."], tops)
+    ])
+    blocks = build_text_blocks(lines, page_number=1)
+    assert len(blocks) == (2 if gap == 2.1 else 1)
+    assert blocks[0].source_text.startswith("Opening sentence. Still this paragraph.")
+
+
 def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
 
@@ -528,6 +543,23 @@ def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
         ("paragraph", "First line continues"),
         ("list-item", "- item"),
     ]
+
+
+def test_paragraph_spacing_evidence_does_not_cross_font_families() -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    words = [
+        _word("Compact prose", x0=72, x1=396, top=top, bottom=top + 10.5,
+              size=10.5, fontname="Helvetica")
+        for top in (100, 112.6, 125.2, 137.8)
+    ] + [
+        _word("Loose prose", x0=72, x1=396, top=top, bottom=top + 10.5,
+              size=10.5, fontname="Times-Roman")
+        for top in (200, 218.6, 237.2)
+    ]
+    blocks = build_text_blocks(group_words_into_lines(words), page_number=1)
+    assert len(blocks) == 2
+    assert blocks[1].source_text == "Loose prose Loose prose Loose prose"
 
 
 def test_build_text_blocks_does_not_merge_a_side_by_side_row_into_prior_prose() -> None:

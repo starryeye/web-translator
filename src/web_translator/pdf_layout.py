@@ -1439,6 +1439,7 @@ def merge_contiguous_paragraph_lines(
             and merged[-1][1][-1].semantic_role == line.semantic_role
             and not line.semantic_role.startswith("toc-")
             and _paragraphs_are_contiguous(merged[-1][1][-1], line)
+            and not _source_paragraph_gap(classified, index)
             and not _has_side_by_side_successor(classified, index)
         ):
             previous_kind, previous_lines = merged[-1]
@@ -1446,6 +1447,51 @@ def merge_contiguous_paragraph_lines(
         else:
             merged.append((kind, (line,)))
     return merged
+
+
+def _source_paragraph_gap(
+    classified: Sequence[tuple[PdfBlockKind, PdfLine]], index: int,
+) -> bool:
+    """Require repeated local same-font/column leading before inferring a break."""
+    if index == 0:
+        return False
+    previous, current = classified[index - 1][1], classified[index][1]
+    if previous.semantic_role != "body" or current.semantic_role != "body":
+        return False
+    if abs(previous.size - current.size) > 0.5:
+        return False
+
+    def dominant_font(line: PdfLine) -> str:
+        weights: Counter[str] = Counter()
+        for word in line.words:
+            weights[word.fontname] += len(word.text)
+        return weights.most_common(1)[0][0]
+
+    font = dominant_font(current)
+    if dominant_font(previous) != font:
+        return False
+    gaps = []
+    for offset in range(max(1, index - 12), min(len(classified), index + 13)):
+        left_kind, left = classified[offset - 1]
+        right_kind, right = classified[offset]
+        if (
+            left_kind == right_kind == "paragraph"
+            and left.semantic_role == right.semantic_role == "body"
+            and abs(left.size - current.size) <= 0.5
+            and abs(right.size - current.size) <= 0.5
+            and dominant_font(left) == font
+            and dominant_font(right) == font
+            and abs(left.x0 - current.x0) <= current.size
+            and abs(right.x0 - current.x0) <= current.size
+            and _paragraphs_are_contiguous(left, right)
+        ):
+            gaps.append(right.top - left.bottom)
+    if len(gaps) < 3:
+        return False
+    normal = min(gaps)
+    if sum(abs(gap - normal) <= current.size * 0.15 for gap in gaps) < 3:
+        return False
+    return current.top - previous.bottom > max(normal * 1.8, normal + current.size * 0.4)
 
 
 def _has_side_by_side_successor(
