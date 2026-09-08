@@ -566,6 +566,296 @@ def _assemble_publication(run_dir: Path, output: Path) -> Path:
     return assemble_pdf(run_dir=run_dir, translations=translations, glossary={}, output_dir=output)
 
 
+def test_toc_prints_output_anchor_page_after_korean_reflow(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-title", "Contents"), (1, "toc-chapter", "2. Models ... 47"),
+        (2, "body", "이 문장은 한국어 재배치로 여러 페이지를 채웁니다. " * 180),
+        (3, "chapter-label", "CHAPTER 2"), (3, "chapter-title", "Models"),
+    ])
+    translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    translations["seg-000002"] = Translation("seg-000002", "2. 모델 ... 47")
+    output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    chapter = next(item for item in layout.flowables if item.semantic_role == "chapter-title")
+    with pdfplumber.open(output) as pdf:
+        text = pdf.pages[0].extract_text()
+    assert f"2. 모델" in text
+    assert "..." in text
+    assert f" {chapter.page_number}" in text and "47" not in text
+    assert len(layout.toc_entries) == 1
+    entry = layout.toc_entries[0]
+    assert entry.source_reference == "47"
+    assert entry.target_block_id == chapter.block_id
+    assert entry.output_page == chapter.page_number
+    assert PdfReader(output).pages[0].get("/Annots")
+    assert len([r for r in layout.flowables if r.block_id == entry.block_id]) == 1
+
+
+@pytest.mark.parametrize("footer_page", [2, 3])
+def test_toc_does_not_link_later_summary_to_same_title_in_current_chapter(tmp_path: Path, footer_page: int) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-entry", "Summary ... 90"), (2, "reference-heading", "Summary"),
+        (footer_page, "body", "End of supplied excerpt"),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    data["blocks"].append(PdfBlock(
+        f"pdf:page-{footer_page:04d}:block-0004", footer_page, 3, "page-number", (72, 630, 90, 641),
+        PdfBlockStyle(9, False, "left", 0, 0), "28", None,
+    ).to_dict())
+    path.write_text(json.dumps(data))
+    _assemble_publication(run_dir, tmp_path / "out")
+    entry = read_pdf_layout(run_dir / "layout.json").toc_entries[0]
+    assert entry.target_block_id is None
+    assert entry.warning == "toc-target-outside-input"
+
+
+@pytest.mark.parametrize("titles", [["Missing"], ["Models", "Models"]])
+def test_toc_ambiguous_or_unproven_missing_target_fails_closed(tmp_path: Path, titles: list[str]) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [(1, "toc-entry", "Models ... 2")] + [
+        (2, "chapter-title", title) for title in titles
+    ])
+    with pytest.raises(PdfAssemblyError, match="TOC"):
+        _assemble_publication(run_dir, tmp_path / "out")
+    assert not (run_dir / "layout.json").exists()
+    assert not (run_dir / "staged-output").exists()
+
+
+def test_toc_source_annotation_links_translated_label_to_nested_callout_anchor(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-entry", "Source topic ... 9"),
+        (2, "callout-title", "Different visible heading"), (2, "callout-body", "설명 " * 500),
+    ])
+    path = run_dir / "document.json"
+    document = PdfDocument.from_dict(json.loads(path.read_text()))
+    entry, target = document.blocks[:2]
+    document = replace(document, links=[PdfLinkEvidence(
+        "pdf:page-0001:link-0001", 1, entry.id, (0, 12), entry.bbox, "Source topic",
+        None, target.id, True, None,
+    )])
+    path.write_text(json.dumps(document.to_dict()))
+    translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    translations[entry.segment_id] = Translation(entry.segment_id, "번역된 주제 ... 9")
+    output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    resolved = layout.toc_entries[0]
+    first = next(r for r in layout.flowables if r.block_id == target.id)
+    assert resolved.output_page == first.page_number
+    assert resolved.evidence == "source-internal-destination"
+    assert dict(layout.anchor_pages)[pdf_assemble_module._anchor_name(target.id)] == first.page_number
+    assert PdfReader(output).pages[0].get("/Annots")
+
+
+def test_toc_unnumbered_parts_link_present_and_evidence_absent_without_page_column(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-part", "Part I. Foundations"), (1, "toc-chapter", "1. Models ... 1"),
+        (1, "toc-part", "Part II. Distributed Data"), (1, "toc-chapter", "2. Later ... 145"),
+        (2, "part-label", "PART I"), (2, "part-title", "Foundations"),
+        (3, "chapter-label", "CHAPTER 1"), (3, "chapter-title", "Models"),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    data["blocks"].append(PdfBlock(
+        "pdf:page-0003:block-0009", 3, 8, "page-number", (72, 630, 90, 641),
+        PdfBlockStyle(9, False, "left", 0, 0), "1", None,
+    ).to_dict())
+    path.write_text(json.dumps(data))
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    entries = read_pdf_layout(run_dir / "layout.json").toc_entries
+    assert entries[0].source_reference is None and entries[0].output_page == 2
+    assert entries[2].source_reference is None and entries[2].output_page is None
+    assert entries[2].warning == "toc-target-outside-input"
+    assert "following-chapter-reference-145" in entries[2].evidence
+    with pdfplumber.open(output) as pdf:
+        lines = pdf.pages[0].extract_text().splitlines()
+    assert "Part I. Foundations" in lines
+    assert "Part II. Distributed Data" in lines
+
+
+def test_toc_outside_input_retains_source_reference_with_evidence(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-entry", "Later topic ... 90"), (2, "body", "Current text"),
+    ])
+    path = run_dir / "document.json"
+    data = json.loads(path.read_text())
+    data["blocks"].append(PdfBlock(
+        "pdf:page-0002:block-0003", 2, 2, "page-number", (72, 630, 90, 641),
+        PdfBlockStyle(9, False, "left", 0, 0), "28", None,
+    ).to_dict())
+    path.write_text(json.dumps(data))
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert layout.toc_entries[0].warning == "toc-target-outside-input"
+    assert layout.toc_entries[0].source_reference == "90"
+    assert layout.toc_entries[0].target_block_id is None
+    assert "90" in PdfReader(output).pages[0].extract_text()
+    assert not PdfReader(output).pages[0].get("/Annots")
+
+
+def test_footnote_continuation_preserves_text_and_owner_without_overlap(tmp_path: Path) -> None:
+    run_dir, translations, glossary, ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
+    document = PdfDocument.from_dict(json.loads((run_dir / "document.json").read_text()))
+    note = next(b for b in document.blocks if b.id == ids["page_note"])
+    text = " ".join(f"각주문장{index:04d}" for index in range(900))
+    translations[note.segment_id] = Translation(note.segment_id, text)
+    output = assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    parts = [r for r in layout.flowables if r.block_id == note.id]
+    owner = next(r for r in layout.flowables if r.block_id == ids["owner"])
+    assert parts[0].page_number == owner.page_number
+    assert len(parts) > 1
+    assert [p.split_part for p in parts] == list(range(len(parts)))
+    extracted = " ".join(p.extract_text() for p in PdfReader(output).pages)
+    assert "각주 계속" in extracted
+    for token in text.split():
+        assert extracted.count(token) == 1
+    assert len(layout.footnote_continuations) == len(parts) - 1
+    for note_part in parts:
+        for body in layout.flowables:
+            if body.page_number == note_part.page_number and body.kind not in {"footnote", "header", "footer", "page-number"}:
+                assert body.bounds[1] >= note_part.bounds[1] + note_part.bounds[3]
+
+
+def _footnote_publication_run(tmp_path: Path, *, preceding_lines: int, note_words: int) -> Path:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "body", "앞선 문장입니다.") for _ in range(preceding_lines)
+    ] + [(1, "body", "소유 문장 1"), (1, "body", " ".join(f"주석{n:04d}" for n in range(note_words)))])
+    path = run_dir / "document.json"
+    document = PdfDocument.from_dict(json.loads(path.read_text()))
+    blocks = list(document.blocks)
+    blocks[-2] = replace(blocks[-2], destination=blocks[-1].id)
+    blocks[-1] = replace(blocks[-1], kind="footnote")
+    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    segments_path = run_dir / "segments.jsonl"
+    segments = read_segments(segments_path)
+    segments[-1] = replace(segments[-1], semantic_type="footnote")
+    segments_path.unlink()
+    write_segments(segments_path, segments)
+    return run_dir
+
+
+def test_footnote_terminal_continuations_have_no_empty_page_or_repeated_text(tmp_path: Path) -> None:
+    run_dir = _footnote_publication_run(tmp_path, preceding_lines=0, note_words=1600)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    reader = PdfReader(output)
+    assert len(reader.pages) >= 3
+    for page in reader.pages[1:]:
+        text = page.extract_text()
+        assert "각주 계속" in text and "주석" in text
+    text = " ".join(page.extract_text() for page in reader.pages)
+    for n in range(1600):
+        assert text.count(f"주석{n:04d}") == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    notes = [r for r in layout.flowables if r.kind == "footnote"]
+    assert len(reader.pages) <= 4
+    for part in notes[1:]:
+        assert part.bounds[1] + part.bounds[3] > 580
+    assert notes[1].bounds[3] > 500
+
+
+def test_footnote_owner_near_bottom_converges_without_empty_reservation(tmp_path: Path) -> None:
+    # 23 * (15pt leading + 8pt spacing) leaves room for the owner only without its note reserve.
+    run_dir = _footnote_publication_run(tmp_path, preceding_lines=23, note_words=120)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    owner, note = layout.flowables[-2:]
+    assert owner.page_number == note.page_number == 2
+    assert len(PdfReader(output).pages) == 2
+    assert all(r.frame[1] == 42 for r in layout.flowables if r.page_number == 1)
+
+
+def test_long_owner_marker_near_bottom_does_not_move_whole_paragraph_to_empty_page(tmp_path: Path) -> None:
+    run_dir = _footnote_publication_run(tmp_path, preceding_lines=0, note_words=120)
+    path = run_dir / "document.json"
+    document = PdfDocument.from_dict(json.loads(path.read_text()))
+    blocks = list(document.blocks)
+    blocks[-1] = replace(blocks[-1], source_text="1 " + blocks[-1].source_text)
+    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    segments_path = run_dir / "segments.jsonl"
+    segments = read_segments(segments_path)
+    segments[-1] = replace(segments[-1], source_text=blocks[-1].source_text)
+    segments_path.unlink()
+    write_segments(segments_path, segments)
+    translations = {s.id: Translation(s.id, s.source_text) for s in segments}
+    translations[segments[0].id] = Translation(segments[0].id, "긴 소유 문장입니다. " * 140 + "1")
+    output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    owners = [r for r in layout.flowables if r.block_id == blocks[0].id]
+    note = next(r for r in layout.flowables if r.kind == "footnote")
+    assert owners[0].page_number == 1
+    assert owners[-1].page_number == note.page_number == 2
+    assert len(PdfReader(output).pages) == 2
+    assert all((page.extract_text() or "").strip() for page in PdfReader(output).pages)
+
+
+def test_footnote_ownership_evidence_distinguishes_protected_marker_and_legacy_block(tmp_path: Path) -> None:
+    run_dir, translations, glossary, ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
+    path = run_dir / "segments.jsonl"
+    segments = read_segments(path)
+    for index, segment in enumerate(segments):
+        if segment.locator == ids["owner"]:
+            token = ProtectedToken("⟦WT:000000⟧", "footnote-marker", "1")
+            segments[index] = replace(segment, source_text=segment.source_text[:-1] + token.token, protected=[token])
+            translations[segment.id] = Translation(segment.id, "페이지 지역 표지 " + token.token)
+    path.unlink()
+    write_segments(path, segments)
+    assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+    note = next(r for r in read_pdf_layout(run_dir / "layout.json").flowables if r.block_id == ids["page_note"])
+    assert note.footnote_owner_id == ids["owner"]
+    assert note.footnote_ownership == "protected-footnote-marker"
+    legacy = _footnote_publication_run(tmp_path / "legacy", preceding_lines=0, note_words=10)
+    _assemble_publication(legacy, tmp_path / "legacy-out")
+    assert read_pdf_layout(legacy / "layout.json").flowables[-1].footnote_ownership == "block-only-legacy"
+
+
+def test_footnote_repeated_translated_marker_fails_closed(tmp_path: Path) -> None:
+    run_dir, translations, glossary, ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
+    owner = next(s for s in read_segments(run_dir / "segments.jsonl") if s.locator == ids["owner"])
+    translations[owner.id] = Translation(owner.id, "표지 1 반복 1")
+    with pytest.raises(PdfAssemblyError, match="marker is not unique"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+    assert not (run_dir / "layout.json").exists()
+
+
+def test_publication_nonconverging_index_is_bounded_and_never_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", "One entry")])
+    monkeypatch.setattr(pdf_assemble_module._PublicationIndex, "isSatisfied", lambda self: False)
+    with pytest.raises(PdfAssemblyError, match="not resolved after 8 passes"):
+        _assemble_publication(run_dir, tmp_path / "out")
+    assert not (run_dir / "layout.json").exists()
+    assert not (run_dir / "staged-output").exists()
+
+
+def test_note_free_rich_page_uses_body_space_without_reserved_bottom_band(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", "끝까지 채우는 본문입니다.") for _ in range(27)])
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert len(PdfReader(output).pages) == 1
+    assert min(record.bounds[1] for record in layout.flowables) < 100
+
+
+def test_toc_hierarchy_and_wrapped_label_keep_numeric_column_aligned(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-part", "Part I. Foundations"),
+        (1, "toc-chapter", "1. Models ... 1"),
+        (1, "toc-entry", "Nested topic ... 2"),
+        (2, "part-title", "Foundations"), (3, "chapter-title", "Models"),
+        (4, "reference-heading", "Nested topic"),
+    ])
+    translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    translations["seg-000003"] = Translation("seg-000003", "하위 제목 " * 20 + " ... 2")
+    output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
+    with pdfplumber.open(output) as pdf:
+        chars = pdf.pages[0].chars
+        part_x = next(c["x0"] for c in chars if c["text"] == "P")
+        chapter_x = next(c["x0"] for c in chars if c["text"] == "1")
+        entry_x = next(c["x0"] for c in chars if c["text"] == "하")
+        assert part_x < chapter_x < entry_x
+        pages = [c for c in chars if c["text"] in {"3", "4"} and c["x0"] > 400]
+        assert len(pages) == 2
+        assert abs(pages[0]["x1"] - pages[1]["x1"]) < 0.01
+
+
 def test_source_trim_opener_and_epigraph_groups_preserve_source_page_structure(tmp_path: Path) -> None:
     run_dir = _publication_assembly_run(tmp_path, [
         (1, "body", "Before."),
@@ -650,7 +940,7 @@ def test_reference_entries_use_hanging_indent_and_explicit_continuations(tmp_pat
 
 
 @pytest.mark.parametrize("long_body", [False, True])
-@pytest.mark.parametrize("prior_repetitions", [80, 180])
+@pytest.mark.parametrize("prior_repetitions", [80, 210])
 def test_callout_icon_title_body_adjacency_and_split_continuation(
     tmp_path: Path, long_body: bool, prior_repetitions: int,
 ) -> None:
@@ -683,7 +973,7 @@ def test_callout_icon_title_body_adjacency_and_split_continuation(
     assert sum(r.semantic_role == "callout-title" for r in records) == 1
     assert icon_record.page_number == title.page_number == bodies[0].page_number
     assert icon_record.bounds[0] + icon_record.bounds[2] <= title.bounds[0]
-    if prior_repetitions == 180:
+    if prior_repetitions == 210:
         assert title.page_number > records[0].page_number
     if long_body:
         assert len({r.page_number for r in bodies}) >= 2
@@ -3253,7 +3543,7 @@ def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
     assert owner.segment_id is not None
     translations[owner.segment_id] = Translation(
         owner.segment_id,
-        "페이지 지역 표지 1 " * 250,
+        "페이지 지역 표지 " * 250 + "1",
     )
 
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
@@ -3269,7 +3559,7 @@ def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
         item for item in layout.flowables if item.block_id == identifiers["page_note"]
     )
     assert len(owner_parts) > 1
-    assert page_note.page_number == owner_parts[0].page_number
+    assert page_note.page_number == owner_parts[-1].page_number
 
 
 def test_page_local_footnote_owned_by_repeated_table_cell_is_emitted_once(

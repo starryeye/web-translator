@@ -30,9 +30,12 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    ActionFlowable,
     BaseDocTemplate,
     Frame,
+    Flowable,
     Image,
+    IndexingFlowable,
     KeepTogether,
     NextPageTemplate,
     PageBreak,
@@ -55,7 +58,9 @@ from web_translator.pdf_flowables import (
     PdfAssemblyError,
     PdfAssemblyLayout,
     PdfFlowableLayout,
+    PdfFootnoteContinuation,
     PdfPageSize,
+    PdfTocResolution,
     TrackedFlowable,
 )
 from web_translator.pdf_layout import split_list_marker
@@ -103,7 +108,6 @@ _RICH_KINDS = {"table-cell", "figure", "caption", "footnote"}
 _TABLE_COLUMN_MINIMUM = 54.0
 _TABLE_CELL_PADDING = 5.0
 _FIGURE_RENDER_DPI = 144.0
-_PAGE_LOCAL_FOOTNOTE_HEIGHT = 60.0
 _URI_CHARACTERS = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*\Z")
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _HTTP_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
@@ -276,6 +280,7 @@ def assemble_pdf(
             consumed_translations,
             consumed_glossary,
         )
+        toc_resolutions = _resolve_toc_targets(document)
         document = replace(
             document,
             links=list(_translated_link_evidence(document, ordered)),
@@ -326,6 +331,7 @@ def assemble_pdf(
             or block.semantic_role != "body"
             for block in document.blocks
         )
+        publication_evidence: dict[str, Any] = {}
         if uses_rich_layout:
             records = _build_rich_document(
                 document,
@@ -334,6 +340,8 @@ def assemble_pdf(
                 temporary_pdf.stream,
                 page_size,
                 media_payloads,
+                toc_resolutions=toc_resolutions,
+                publication_evidence=publication_evidence,
             )
         else:
             records = _build_basic_document(
@@ -357,6 +365,9 @@ def assemble_pdf(
             minimum_font_size=MINIMUM_FONT_SIZE,
             flowables=tuple(records),
             links=tuple(document.links),
+            toc_entries=tuple(publication_evidence.get("toc_entries", ())),
+            footnote_continuations=tuple(publication_evidence.get("footnote_continuations", ())),
+            anchor_pages=tuple(sorted(publication_evidence.get("anchor_pages", {}).items())),
         )
         # Validate every field before either run-visible artifact is published.
         PdfAssemblyLayout.from_dict(layout.to_dict())
@@ -927,7 +938,7 @@ def _role_paragraph(
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     counters: dict[str, int], style: ParagraphStyle,
-    callbacks: Mapping[str, Callable[[Any, int], None]],
+    callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
 ) -> TrackedFlowable:
     return TrackedFlowable(
         Paragraph(_linked_markup(block, translated[block.id], links.get(block.id, ())), style),
@@ -942,7 +953,7 @@ def _append_opener_group(
     story: list[Any], blocks: Sequence[PdfBlock], translated: Mapping[str, str],
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
-    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int], None]],
+    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
 ) -> None:
     contents: list[Any] = [Spacer(1, frame[3] * 0.16)]
     for block in blocks:
@@ -964,7 +975,7 @@ def _append_epigraph_group(
     story: list[Any], blocks: Sequence[PdfBlock], translated: Mapping[str, str],
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
-    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int], None]],
+    part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
 ) -> None:
     contents: list[Any] = [Spacer(1, frame[3] * 0.25)]
     for block in blocks:
@@ -990,7 +1001,7 @@ def _append_callout_group(
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     part_counters: dict[str, int], *, media_payloads: Mapping[str, bytes],
-    callbacks: Mapping[str, Callable[[Any, int], None]],
+    callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
 ) -> None:
     icon = blocks[0] if blocks[0].kind == "figure" else None
     paragraphs: list[TrackedFlowable] = []
@@ -1132,6 +1143,220 @@ def _build_basic_document(
     return records
 
 
+_TOC_REFERENCE = re.compile(r"^(.*?)\s+(\d+|[ivxlcdm]+)\s*$", re.IGNORECASE)
+
+
+def _toc_parts(text: str) -> tuple[str, str]:
+    match = _TOC_REFERENCE.fullmatch(text)
+    if match is None:
+        raise PdfAssemblyError(f"TOC entry has no unambiguous page column: {text!r}")
+    return match[1].rstrip(" .·…"), match[2]
+
+
+def _toc_heading_key(text: str) -> str:
+    text = re.sub(r"^(?:(?:chapter|part)\s+)?(?:\d+|[IVX]+)[. :]+", "", text, flags=re.IGNORECASE)
+    return " ".join(re.findall(r"\w+", text.casefold()))
+
+
+def _resolve_toc_targets(document: PdfDocument) -> dict[str, PdfTocResolution]:
+    """Resolve using source annotations/titles and printed furniture, never PDF indices."""
+    entries = [b for b in document.blocks if b.semantic_role in {"toc-part", "toc-chapter", "toc-entry"}]
+    if not entries:
+        return {}
+    targets = [b for b in document.blocks if b.kind == "heading" and not b.semantic_role.startswith("toc-")]
+    target_titles = {block.id: block.source_text for block in targets}
+    # A wrapped chapter title may occupy several adjacent semantic blocks.
+    for index, block in enumerate(document.blocks):
+        if block.semantic_role not in {"chapter-title", "part-title"}:
+            continue
+        group = _consume_role_group(document.blocks, index, {block.semantic_role})
+        if len(group) > 1:
+            target_titles[block.id] = " ".join(item.source_text for item in group)
+    printed: dict[int, int] = {}
+    for block in document.blocks:
+        if block.kind in {"footer", "page-number"}:
+            match = re.search(r"^\s*(\d+)(?:\s*\||\s*$)|\|\s*(\d+)\s*$", block.source_text)
+            if match:
+                number = int(match[1] or match[2])
+                if block.page_number in printed and printed[block.page_number] != number:
+                    raise PdfAssemblyError(f"ambiguous printed source page: {block.page_number}")
+                printed[block.page_number] = number
+    terminal_reference = printed.get(document.page_count)
+    if terminal_reference is not None and terminal_reference != max(printed.values()):
+        terminal_reference = None
+    result = {}
+    for index, entry in enumerate(entries):
+        if entry.semantic_role == "toc-part" and _TOC_REFERENCE.fullmatch(entry.source_text) is None:
+            title, reference = entry.source_text, None
+        else:
+            title, reference = _toc_parts(entry.source_text)
+        annotated = {link.destination for link in document.links if link.source_block_id == entry.id and link.reconstructed and link.destination}
+        if entry.destination:
+            annotated.add(entry.destination)
+        if len(annotated) > 1:
+            raise PdfAssemblyError(f"ambiguous TOC annotation destinations: {entry.id}")
+        matches = [b for b in targets if _toc_heading_key(title) in {
+            _toc_heading_key(target_titles[b.id]), _toc_heading_key(b.source_text),
+        }]
+        if reference is not None and reference.isdecimal():
+            matches = [b for b in matches if b.page_number not in printed or printed[b.page_number] == int(reference)]
+            if terminal_reference is not None and int(reference) > terminal_reference:
+                matches = []
+        following_reference = None
+        if reference is None:
+            following = next((b for b in entries[index + 1:] if b.semantic_role in {"toc-part", "toc-chapter"}), None)
+            if following is not None and following.semantic_role == "toc-chapter":
+                following_reference = _toc_parts(following.source_text)[1]
+        if annotated:
+            target = next(iter(annotated))
+            if target not in {b.id for b in document.blocks}:
+                raise PdfAssemblyError(f"TOC target missing from input: {entry.id}")
+            evidence = "source-internal-destination"
+        elif len(matches) == 1:
+            target = matches[0].id
+            evidence = "unique-source-heading-title"
+        elif len(matches) > 1:
+            raise PdfAssemblyError(f"ambiguous TOC heading target: {entry.id}")
+        elif reference is not None and reference.isdecimal() and terminal_reference is not None and int(reference) > terminal_reference:
+            target = None
+            evidence = f"source-reference-{reference}-beyond-observed-printed-page-{terminal_reference}-at-input-end"
+        elif following_reference and following_reference.isdecimal() and terminal_reference is not None and int(following_reference) > terminal_reference:
+            target = None
+            evidence = f"absent-source-part-title;following-chapter-reference-{following_reference}-beyond-observed-printed-page-{terminal_reference}-at-input-end"
+        else:
+            raise PdfAssemblyError(f"TOC target cannot be resolved or proven outside input: {entry.id}")
+        result[entry.id] = PdfTocResolution(entry.id, reference, target, None, evidence,
+            "toc-target-outside-input" if target is None else None)
+    return result
+
+
+class ResolvedTocEntry(TrackedFlowable, IndexingFlowable):
+    """A translated label with a separate, linked output-page column."""
+
+    def __init__(self, *, text: str, style: ParagraphStyle, resolution: PdfTocResolution,
+                 anchor_pages: dict[str, int], **kwargs: Any) -> None:
+        self.label, reference = _toc_parts(text) if resolution.source_reference is not None else (text, None)
+        if reference != resolution.source_reference:
+            raise PdfAssemblyError(f"translated TOC source reference changed: {resolution.block_id}")
+        self.resolution = resolution
+        self.anchor_pages = anchor_pages
+        self.style = style
+        self.style.endDots = "." if reference is not None else None
+        self._rendered_page: int | None = None
+        super().__init__(Paragraph("", style), **kwargs)
+
+    def beforeBuild(self) -> None:
+        self._rendered_page = self.anchor_pages.get(_anchor_name(self.resolution.target_block_id)) if self.resolution.target_block_id else None
+
+    def isSatisfied(self) -> bool:
+        return self.resolution.target_block_id is None or (
+            self._rendered_page is not None and self._rendered_page == self.anchor_pages.get(_anchor_name(self.resolution.target_block_id))
+        )
+
+    def wrap(self, available_width: float, available_height: float) -> tuple[float, float]:
+        page = str(self._rendered_page) if self._rendered_page else self.resolution.source_reference
+        label = escape(self.label)
+        if self.resolution.target_block_id:
+            href = quoteattr("#" + _anchor_name(self.resolution.target_block_id))
+            label = f"<link href={href}>{label}</link>"
+            page = f"<link href={href}>{page}</link>"
+        if self.resolution.source_reference is None:
+            self._content = Paragraph(label, self.style)
+            return super().wrap(available_width, available_height)
+        right = ParagraphStyle(self.style.name + "-page", parent=self.style, alignment=TA_RIGHT, leftIndent=0, endDots=None)
+        self._content = Table([[Paragraph(label, self.style), Paragraph(page, right)]],
+            colWidths=[available_width - 36, 36], style=TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+        return super().wrap(available_width, available_height)
+
+    def split(self, available_width: float, available_height: float) -> list[Any]:
+        return []
+
+
+class PublicationDocTemplate(BaseDocTemplate):
+    """Bounded indexing with nested draw anchors and final-pass-only evidence."""
+
+    def __init__(self, *args: Any, reset_pass: Callable[[], None], anchor_pages: dict[str, int],
+                 last_note_page: Callable[[], int], owner_page_floors: dict[str, int],
+                 body_frame: Callable[[tuple[float, float, float, float]], tuple[float, float, float, float]],
+                 **kwargs: Any) -> None:
+        self.reset_pass = reset_pass
+        self.anchor_pages = anchor_pages
+        self.last_note_page = last_note_page
+        self.owner_page_floors = owner_page_floors
+        self.body_frame = body_frame
+        super().__init__(*args, **kwargs)
+
+    def beforeDocument(self) -> None:
+        self.reset_pass()
+
+    def handle_noteTail(self) -> None:
+        while self.page < self.last_note_page():
+            self.handle_pageBreak()
+            self.clean_hanging()
+            # A continuation-only page is intentional content, not an empty page.
+            self._curPageFlowableCount += 1
+
+    def handle_ownerFloor(self, owners: Sequence[str]) -> None:
+        minimum = max((self.owner_page_floors.get(owner, 0) for owner in owners), default=0)
+        while self.page < minimum:
+            self.handle_pageBreak()
+            self.clean_hanging()
+
+
+class _PublicationIndex(IndexingFlowable):
+    def __init__(self, update: Callable[[], bool]) -> None:
+        super().__init__()
+        self.update = update
+        self.satisfied = False
+
+    def afterBuild(self) -> None:
+        self.satisfied = self.update()
+
+    def isSatisfied(self) -> bool:
+        return self.satisfied
+
+    def draw(self) -> None:
+        pass
+
+
+def _paragraph_fragment_text(content: Flowable) -> str:
+    """Read emitted lines: split Paragraph.getPlainText() can legitimately be empty."""
+    if not isinstance(content, Paragraph):
+        return ""
+    lines = getattr(getattr(content, "blPara", None), "lines", [])
+    return " ".join(
+        " ".join(line[1]) if isinstance(line, tuple)
+        else "".join(getattr(word, "text", "") for word in line.words)
+        for line in lines
+    )
+
+
+class _PageNoteCallback:
+    """Schedule on the evidenced marker fragment, or explicitly block-only legacy evidence."""
+
+    def __init__(self, owner_id: str, marker: re.Pattern[str] | None,
+                 schedule: Callable[[int], None], floors: dict[str, int], ownership: str) -> None:
+        self.owner_id = owner_id
+        self.marker = marker
+        self.schedule = schedule
+        self.floors = floors
+        self.ownership = ownership
+
+    def matches(self, content: Flowable) -> bool:
+        return self.marker is None or self.marker.search(_paragraph_fragment_text(content)) is not None
+
+    def minimum_page_for(self, content: Flowable) -> int:
+        return self.floors.get(self.owner_id, 0) if self.marker is not None and self.matches(content) else 0
+
+    def __call__(self, _canvas: Any, page_number: int, content: Flowable) -> None:
+        if self.matches(content):
+            self.schedule(page_number)
+
+
 def _build_rich_document(
     document: PdfDocument,
     ordered: Sequence[tuple[PdfBlock, Segment, str]],
@@ -1139,10 +1364,14 @@ def _build_rich_document(
     destination: BinaryIO,
     page_size: PdfPageSize,
     media_payloads: Mapping[str, bytes],
+    *,
+    toc_resolutions: Mapping[str, PdfTocResolution] | None = None,
+    publication_evidence: dict[str, Any] | None = None,
 ) -> list[PdfFlowableLayout]:
     records: list[PdfFlowableLayout] = []
     part_counters: dict[str, int] = {}
     translated = {block.id: text for block, _segment, text in ordered}
+    segments_by_block = {block.id: segment for block, segment, _text in ordered}
     block_by_id = {block.id: block for block in document.blocks}
     links_by_block = _links_by_block(document)
     left_margin = right_margin = 54.0
@@ -1151,32 +1380,98 @@ def _build_rich_document(
     portrait_size = (page_size.width, page_size.height)
     landscape_size = landscape(portrait_size)
 
-    def frames_for(size: tuple[float, float]) -> tuple[
-        tuple[float, float, float, float],
-        tuple[float, float, float, float],
-    ]:
+    def body_frame_for(size: tuple[float, float]) -> tuple[float, float, float, float]:
         width, height = size
-        footnote_frame = (
+        return (
             left_margin,
             bottom_margin,
             width - left_margin - right_margin,
-            _PAGE_LOCAL_FOOTNOTE_HEIGHT,
+            height - top_margin - bottom_margin,
         )
-        body_y = bottom_margin + _PAGE_LOCAL_FOOTNOTE_HEIGHT + 8.0
-        body_frame = (
-            left_margin,
-            body_y,
-            width - left_margin - right_margin,
-            height - top_margin - body_y,
-        )
-        return body_frame, footnote_frame
 
-    portrait_frame, portrait_footnote_frame = frames_for(portrait_size)
-    landscape_frame, landscape_footnote_frame = frames_for(landscape_size)
+    portrait_frame = body_frame_for(portrait_size)
+    landscape_frame = body_frame_for(landscape_size)
     page_local_notes, section_notes, owner_to_note = _classify_footnotes(document)
-    scheduled_page_notes: dict[int, list[str]] = {}
     scheduled_note_pages: dict[str, int] = {}
     drawn_page_notes: set[tuple[int, str]] = set()
+    anchor_pages: dict[str, int] = {}
+    note_plan: dict[int, list[tuple[str, int, Paragraph, float]]] = {}
+    note_only_pages: set[int] = set()
+    page_sizes: dict[int, tuple[float, float]] = {}
+    continuations: list[PdfFootnoteContinuation] = []
+    owner_page_floors: dict[str, int] = {}
+    previous_owner_pages: dict[str, int] = {}
+    note_owners = {note: owner for owner, note in owner_to_note.items()}
+
+    def reserve_for(page: int) -> float:
+        parts = note_plan.get(page, [])
+        return (8.0 + 4.0 + sum(height + (13.0 if part else 0) + 2.0
+            for _note, part, _paragraph, height in parts)) if parts else 0.0
+
+    def reset_pass() -> None:
+        records.clear()
+        part_counters.clear()
+        scheduled_note_pages.clear()
+        drawn_page_notes.clear()
+        anchor_pages.clear()
+        page_sizes.clear()
+        continuations.clear()
+
+    def update_note_plan() -> bool:
+        new_plan: dict[int, list[tuple[str, int, Paragraph, float]]] = {}
+        body_last_page = max((record.page_number for record in records
+            if record.kind not in _IGNORED_KINDS | {"footnote"}), default=0)
+        owners_stable = True
+        for note_id in sorted(page_local_notes, key=lambda identifier: block_by_id[identifier].order):
+            if note_id not in scheduled_note_pages:
+                raise PdfAssemblyError(f"footnote owner was not emitted: {note_id}")
+            block = block_by_id[note_id]
+            paragraph = Paragraph(_linked_markup(block, translated[note_id], links_by_block.get(note_id, ())), footnote_style)
+            page = scheduled_note_pages[note_id]
+            previous = previous_owner_pages.get(note_id, page)
+            owner = note_owners[note_id]
+            if page < previous:
+                owner_page_floors[owner] = max(owner_page_floors.get(owner, 0), previous)
+            previous_owner_pages[note_id] = page
+            if page < owner_page_floors.get(owner, 0):
+                owners_stable = False
+                page = owner_page_floors[owner]
+            part = 0
+            while paragraph is not None:
+                size = page_sizes.get(page, portrait_size)
+                width = size[0] - left_margin - right_margin
+                body_height = size[1] - top_margin - bottom_margin
+                capacity = (body_height if page > body_last_page else body_height / 2) - 12.0
+                occupied = sum(h + (13.0 if p else 0) + 2 for _n, p, _f, h in new_plan.get(page, []))
+                available = capacity - occupied - (13.0 if part else 0) - 2
+                _, height = paragraph.wrap(width, available)
+                if height <= available:
+                    first, remainder = paragraph, None
+                else:
+                    pieces = paragraph.split(width, available)
+                    if not pieces:
+                        if part == 0:
+                            raise PdfAssemblyError(f"footnote cannot start with owner on page {page}: {note_id}")
+                        page += 1
+                        continue
+                    first, remainder = pieces[0], pieces[1] if len(pieces) > 1 else None
+                    _, height = first.wrap(width, available)
+                new_plan.setdefault(page, []).append((note_id, part, first, height))
+                paragraph = remainder
+                part += 1
+                page += 1
+        def signature(plan: dict[int, list[tuple[str, int, Paragraph, float]]]) -> list[Any]:
+            return [(page, [(note, part, height) for note, part, _p, height in parts]) for page, parts in sorted(plan.items())]
+        new_note_only_pages = {page for page in new_plan if page > body_last_page}
+        satisfied = (owners_stable and signature(new_plan) == signature(note_plan)
+            and new_note_only_pages == note_only_pages)
+        if not satisfied:
+            note_plan.clear()
+            note_plan.update(new_plan)
+            note_only_pages.clear()
+            note_only_pages.update(new_note_only_pages)
+        return satisfied
+
     running_header = _running_block(document, "header")
     running_footer = _running_block(document, "footer")
     running_page_number = _running_block(
@@ -1201,20 +1496,55 @@ def _build_rich_document(
     )
 
     def schedule_page_note(note_id: str) -> Any:
-        def schedule(_canvas: Any, page_number: int) -> None:
+        owner_id = note_owners[note_id]
+        protected = [token.value for token in segments_by_block[owner_id].protected if token.kind == "footnote-marker"]
+        source_links = [link for link in document.links if link.source_block_id == owner_id
+            and link.destination == note_id and link.source_span is not None
+            and (link.reconstructed or link.reason == "translated-visible-label-not-unambiguous")]
+        authoritative_markers = set(protected)
+        ownership = "protected-footnote-marker" if protected else "block-only-legacy"
+        if not protected and source_links:
+            authoritative_markers = {block_by_id[owner_id].source_text[link.source_span[0]:link.source_span[1]] for link in source_links}
+            ownership = "source-link-marker-span"
+        if len(authoritative_markers) > 1:
+            raise PdfAssemblyError(f"ambiguous source footnote marker evidence: {owner_id}")
+        marker_match = re.match(r"^\s*(\d+|[*†‡])(?:\s|[.)])", block_by_id[note_id].source_text)
+        value = next(iter(authoritative_markers), None)
+        if value is None and marker_match:
+            value = marker_match[1]
+            ownership = "unique-source-marker"
+        marker = None
+        if value is not None:
+            # Korean particles may directly follow a restored numeric marker ("1이").
+            # Numeric boundaries still distinguish marker1 from page11 or identifier12.
+            boundary = r"\d" if value.isdecimal() and authoritative_markers else r"\w"
+            candidate = re.compile(r"(?<!" + boundary + ")" + re.escape(value) + r"(?!" + boundary + ")")
+            source_matches = list(candidate.finditer(block_by_id[owner_id].source_text))
+            if len(source_matches) == 1:
+                translated_matches = list(candidate.finditer(translated[owner_id]))
+                if len(translated_matches) != 1:
+                    raise PdfAssemblyError(f"footnote marker is not unique in translated owner: {owner_id}")
+                marker = candidate
+            elif authoritative_markers:
+                raise PdfAssemblyError(f"footnote marker is not unique in source owner: {owner_id}")
+        if marker is None:
+            ownership = "block-only-legacy"
+
+        def schedule(page_number: int) -> None:
             if note_id in scheduled_note_pages:
                 return
             scheduled_note_pages[note_id] = page_number
-            notes = scheduled_page_notes.setdefault(page_number, [])
-            notes.append(note_id)
 
-        return schedule
+        return _PageNoteCallback(owner_id, marker, schedule, owner_page_floors, ownership)
 
-    page_note_callbacks: dict[str, Callable[[Any, int], None]] = {
+    page_note_callbacks: dict[str, _PageNoteCallback] = {
         owner_id: schedule_page_note(note_id)
         for owner_id, note_id in owner_to_note.items()
         if note_id in page_local_notes
     }
+
+    def block_first_owners(blocks: Sequence[PdfBlock]) -> list[str]:
+        return [b.id for b in blocks if b.id in page_note_callbacks and page_note_callbacks[b.id].marker is None]
 
     def draw_running(canvas: Any, _doc: BaseDocTemplate, *, orientation: str) -> None:
         _embed_font_faces(canvas, _doc)
@@ -1222,6 +1552,13 @@ def _build_rich_document(
             portrait_size if orientation == "portrait" else landscape_size
         )
         page_number = int(canvas.getPageNumber())
+        page_sizes[page_number] = (width, height)
+        base_frame = portrait_frame if orientation == "portrait" else landscape_frame
+        reserve = reserve_for(page_number)
+        frame = _doc.pageTemplate.frames[0]
+        frame._y1 = base_frame[1] + reserve
+        frame._height = base_frame[3] - reserve
+        frame._geom()
         if running_header is not None:
             header_text = running_header.source_text
             if header_embeds_page_number:
@@ -1288,14 +1625,13 @@ def _build_rich_document(
         orientation: str,
     ) -> None:
         page_number = int(canvas.getPageNumber())
-        note_ids = scheduled_page_notes.get(page_number, [])
-        if not note_ids:
+        planned_parts = note_plan.get(page_number, [])
+        if not planned_parts:
             return
-        frame = (
-            portrait_footnote_frame
-            if orientation == "portrait"
-            else landscape_footnote_frame
-        )
+        width, height = portrait_size if orientation == "portrait" else landscape_size
+        note_height = (height - top_margin - bottom_margin
+            if page_number in note_only_pages else reserve_for(page_number) - 8)
+        frame = (left_margin, bottom_margin, width - left_margin - right_margin, note_height)
         cursor = frame[1] + frame[3]
         canvas.saveState()
         canvas.setStrokeColor(colors.HexColor("#888888"))
@@ -1303,25 +1639,29 @@ def _build_rich_document(
         canvas.line(frame[0], cursor, frame[0] + frame[2], cursor)
         canvas.restoreState()
         cursor -= 4.0
-        for note_id in note_ids:
+        for note_id, split_part, paragraph, height in planned_parts:
             if (page_number, note_id) in drawn_page_notes:
                 continue
             block = block_by_id[note_id]
-            paragraph = Paragraph(
-                _linked_markup(block, translated[note_id], links_by_block.get(block.id, ())),
-                footnote_style,
-            )
+            if split_part:
+                label = Paragraph("각주 계속", footnote_style)
+                label.wrapOn(canvas, frame[2], 13)
+                cursor -= 13
+                label.drawOn(canvas, frame[0], cursor)
+                continuations.append(PdfFootnoteContinuation(note_id, note_owners[note_id], split_part, page_number))
             flowable = TrackedFlowable(
                 paragraph,
                 block_id=block.id,
                 kind="footnote",
                 source_order=block.order,
-                split_part=0,
+                split_part=split_part,
                 font_size=MINIMUM_FONT_SIZE,
                 frame=frame,
                 records=records,
                 part_counters=part_counters,
                 anchor_name=_anchor_name(block.id),
+                footnote_owner_id=note_owners[note_id],
+                footnote_ownership=page_note_callbacks[note_owners[note_id]].ownership,
             )
             _width, height = flowable.wrapOn(canvas, frame[2], cursor - frame[1])
             cursor -= height
@@ -1330,6 +1670,7 @@ def _build_rich_document(
                     f"page-local footnotes exceed their frame on page {page_number}"
                 )
             flowable.drawOn(canvas, frame[0], cursor)
+            cursor -= 2
             drawn_page_notes.add((page_number, note_id))
 
     portrait_template = PageTemplate(
@@ -1418,6 +1759,8 @@ def _build_rich_document(
     composition_page: int | None = None
 
     def append_text(block: PdfBlock, frame: tuple[float, float, float, float]) -> None:
+        if block_first_owners([block]):
+            story.append(ActionFlowable(("ownerFloor", [block.id])))
         if block.id not in translated:
             raise PdfAssemblyError(f"translated text is missing for {block.id}")
         text = translated[block.id]
@@ -1442,6 +1785,26 @@ def _build_rich_document(
                 heading_sizes=heading_sizes,
                 list_level=list_levels.get(block.id, 0),
             )
+        if toc_resolutions and block.id in toc_resolutions:
+            entry_indent = min((item.style.indentation for item in document.blocks if item.semantic_role == "toc-entry"), default=0)
+            indent = {"toc-part": 0.0, "toc-chapter": 12.0, "toc-entry": 24.0}[block.semantic_role]
+            if block.semantic_role == "toc-entry":
+                indent += max(0.0, min(48.0, block.style.indentation - entry_indent))
+            style = ParagraphStyle(
+                f"WT-{block.semantic_role}-{block.order}", parent=style,
+                fontName=REGULAR_FONT_NAME if block.semantic_role == "toc-entry" else BOLD_FONT_NAME,
+                fontSize=BODY_FONT_SIZE, leading=15.0, leftIndent=indent,
+                alignment=TA_LEFT, keepWithNext=block.semantic_role == "toc-part",
+            )
+            font_size = BODY_FONT_SIZE
+            story.append(ResolvedTocEntry(
+                text=text, style=style, resolution=toc_resolutions[block.id],
+                anchor_pages=anchor_pages, block_id=block.id, kind=block.kind,
+                source_order=block.order, split_part=0, font_size=font_size,
+                frame=frame, records=records, part_counters=part_counters,
+                anchor_name=_anchor_name(block.id), semantic_role=block.semantic_role,
+            ))
+            return
         story.append(
             TrackedFlowable(
                 Paragraph(
@@ -1552,6 +1915,8 @@ def _build_rich_document(
                         story, group, translated, links_by_block, portrait_frame,
                         records, part_counters, callbacks=page_note_callbacks,
                     )
+                    if owners := block_first_owners(group):
+                        story.insert(len(story) - 1, ActionFlowable(("ownerFloor", owners)))
                     emitted_block_ids.update(item.id for item in group)
                     composition_page = block.page_number
                     continue
@@ -1571,6 +1936,8 @@ def _build_rich_document(
                     )
                     if callout_icon:
                         group.insert(0, block)
+                    if owners := block_first_owners(group):
+                        story.append(ActionFlowable(("ownerFloor", owners)))
                     _append_callout_group(
                         story, group, translated, links_by_block, portrait_frame,
                         records, part_counters, media_payloads=media_payloads,
@@ -1629,8 +1996,17 @@ def _build_rich_document(
                     continue
                 append_text(block, portrait_frame)
             append_pending_section_notes(None)
-            pdf = BaseDocTemplate(
+            story.extend([_PublicationIndex(update_note_plan), ActionFlowable(("noteTail",))])
+            pdf = PublicationDocTemplate(
                 destination,
+                reset_pass=reset_pass,
+                anchor_pages=anchor_pages,
+                last_note_page=lambda: max(note_plan, default=0),
+                owner_page_floors=owner_page_floors,
+                body_frame=lambda frame: (
+                    (frame[0], frame[1] + reserve_for(pdf.page), frame[2], frame[3] - reserve_for(pdf.page))
+                    if frame in {portrait_frame, landscape_frame} else frame
+                ),
                 pagesize=(
                     landscape_size if initial_landscape else portrait_size
                 ),
@@ -1648,7 +2024,7 @@ def _build_rich_document(
                 else [portrait_template, landscape_template]
             )
             pdf.addPageTemplates(templates)
-            pdf.build(story)
+            pdf.multiBuild(story, maxPasses=8)
     except PdfAssemblyError:
         raise
     except Exception as error:
@@ -1657,6 +2033,13 @@ def _build_rich_document(
         note_id for _page, note_id in drawn_page_notes
     }:
         raise PdfAssemblyError("not every page-local footnote was emitted")
+    if publication_evidence is not None:
+        publication_evidence.update(
+            anchor_pages=dict(anchor_pages),
+            toc_entries=[replace(item, output_page=anchor_pages[_anchor_name(item.target_block_id)] if item.target_block_id else None)
+                for item in (toc_resolutions or {}).values()],
+            footnote_continuations=continuations,
+        )
     return records
 
 
@@ -1982,7 +2365,7 @@ def _native_table(
     records: list[PdfFlowableLayout],
     part_counters: dict[str, int],
     header_rows: set[int],
-    on_draw_by_block: Mapping[str, Callable[[Any, int], None]],
+    on_draw_by_block: Mapping[str, Callable[[Any, int, Flowable], None]],
     links_by_block: Mapping[str, Sequence[PdfLinkEvidence]],
 ) -> Table:
     row_count = max((block.row or 0) + block.row_span for block in blocks)
