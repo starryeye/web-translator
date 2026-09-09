@@ -104,6 +104,10 @@ _FIGURE_LABEL = re.compile(r"^\s*(?:figure|fig\.)\s+\d+\b", re.IGNORECASE)
 _VISIBLE_PROVENANCE = re.compile(
     r"Selectable Korean PDF translation;\s*Source:\s*.+?;\s*Generated:\s*\S+"
 )
+_TOC_SOURCE_REFERENCE = re.compile(
+    r"^.+?\s+(?P<reference>\d+|[ivxlcdm]+)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class PdfQAFailure(RuntimeError):
@@ -2074,22 +2078,15 @@ def _validate_toc_pages(
     warning_count = 0
     for block in toc_blocks:
         resolution = resolutions[block.id]
+        source_reference = _validated_toc_source_reference(block, resolution)
         parts = by_block.get(block.id, ())
         if not parts:
             raise PdfQAFailure(f"TOC entry is missing layout evidence: {block.id}")
-        if resolution.source_reference is not None and re.search(
-            rf"(?:^|\s){re.escape(resolution.source_reference)}\s*$",
-            block.source_text,
-            re.IGNORECASE,
-        ) is None:
-            raise PdfQAFailure(
-                f"TOC source-reference evidence disagrees with its source block: {block.id}"
-            )
         selected = _normalize_text("\n".join(selected_by_block.get(block.id, ())))
         if resolution.target_block_id is None:
             warning_count += 1
-            if resolution.source_reference is not None and re.search(
-                rf"(?:^|\s){re.escape(resolution.source_reference)}\s*$", selected,
+            if source_reference is not None and re.search(
+                rf"(?:^|\s){re.escape(source_reference)}\s*$", selected,
                 re.IGNORECASE,
             ) is None:
                 raise PdfQAFailure(
@@ -2097,7 +2094,7 @@ def _validate_toc_pages(
                 )
             continue
         assert resolution.output_page is not None
-        if resolution.source_reference is not None and re.search(
+        if source_reference is not None and re.search(
             rf"(?:^|\s){resolution.output_page}\s*$", selected
         ) is None:
             raise PdfQAFailure(
@@ -2125,6 +2122,23 @@ def _validate_toc_pages(
         f"Validated {resolved_count} resolved TOC entries and "
         f"{warning_count} outside-input warnings."
     )
+
+
+def _validated_toc_source_reference(block: Any, resolution: Any) -> str | None:
+    match = _TOC_SOURCE_REFERENCE.fullmatch(block.source_text)
+    derived = match.group("reference") if match is not None else None
+    supplied = resolution.source_reference
+    if supplied is None:
+        if block.semantic_role != "toc-part" or derived is not None:
+            raise PdfQAFailure(
+                f"numbered TOC entry has no source-reference evidence: {block.id}"
+            )
+        return None
+    if derived is None or supplied.casefold() != derived.casefold():
+        raise PdfQAFailure(
+            f"TOC source-reference evidence disagrees with its source block: {block.id}"
+        )
+    return derived
 
 
 def _toc_annotation_matches(
@@ -2273,10 +2287,18 @@ def _validate_text_image_separation(
                     if len(group) >= 4
                     and sum(len(str(word.get("text", ""))) for word in group) >= 24
                 ]
-                if len(prose_lines) >= 2:
+                clear_single_lines = [
+                    group for group in prose_lines if _looks_like_complete_prose_line(group)
+                ]
+                if len(prose_lines) >= 2 or clear_single_lines:
+                    description = (
+                        f"{len(prose_lines)} prose lines"
+                        if len(prose_lines) >= 2
+                        else "a complete prose sentence"
+                    )
                     raise PdfQAFailure(
                         "figure contains translatable selectable text: "
-                        f"page {figure.page_number} block {figure.id} has {len(prose_lines)} prose lines"
+                        f"page {figure.page_number} block {figure.id} has {description}"
                     )
     except PdfQAFailure:
         raise
@@ -2285,6 +2307,20 @@ def _validate_text_image_separation(
     return (
         f"Validated {len(figures)} source figure regions from held bytes; "
         f"{owned_total} sparse artwork-label characters remained image-owned."
+    )
+
+
+def _looks_like_complete_prose_line(words: Sequence[Mapping[str, object]]) -> bool:
+    text = " ".join(str(word.get("text", "")) for word in words).strip()
+    lexical_words = re.findall(
+        r"[A-Za-z\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]+",
+        text,
+    )
+    letters = len(_LATIN_CHARACTER.findall(text)) + len(_KOREAN_CHARACTER.findall(text))
+    return (
+        len(lexical_words) >= 5
+        and letters >= 28
+        and re.search(r"[.!?。！？]\s*$", text) is not None
     )
 
 
@@ -2794,7 +2830,7 @@ def _validate_pdf_structure(
     for block, segment, translated in normalized:
         expected = _normalize_text(
             _toc_reconciled_translation(
-                block.id, translated, toc_resolutions.get(block.id)
+                block, translated, toc_resolutions.get(block.id)
             )
         )
         selected = _normalize_text("\n".join(block_text.get(block.id, [])))
@@ -2813,23 +2849,22 @@ def _validate_pdf_structure(
 
 
 def _toc_reconciled_translation(
-    block_id: str, translated: str, resolution: Any | None
+    block: Any, translated: str, resolution: Any | None
 ) -> str:
     """Replace only a verified TOC terminal page token for selectability comparison."""
-    if (
-        resolution is None
-        or resolution.source_reference is None
-        or resolution.output_page is None
-    ):
+    if resolution is None:
+        return translated
+    source_reference = _validated_toc_source_reference(block, resolution)
+    if source_reference is None or resolution.output_page is None:
         return translated
     pattern = re.compile(
-        rf"(?P<prefix>.*?)(?P<reference>{re.escape(resolution.source_reference)})\s*$",
+        rf"(?P<prefix>.*?)(?P<reference>{re.escape(source_reference)})\s*$",
         re.IGNORECASE | re.DOTALL,
     )
     match = pattern.fullmatch(translated)
     if match is None:
         raise PdfQAFailure(
-            f"translated TOC source reference is missing before reconciliation: {block_id}"
+            f"translated TOC source reference is missing before reconciliation: {block.id}"
         )
     return match.group("prefix") + str(resolution.output_page)
 

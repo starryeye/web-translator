@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 import pytest
@@ -23,6 +25,7 @@ from reportlab.pdfgen.canvas import Canvas
 
 from web_translator.models import ProtectedToken, Segment, Translation, write_segments
 from web_translator.pdf_assemble import assemble_pdf
+from web_translator.pdf_flowables import PdfTocResolution
 from web_translator.pdf_models import (
     PdfBlock,
     PdfBlockStyle,
@@ -640,6 +643,34 @@ def test_prepare_pdf_qa_allows_sparse_source_figure_labels(
     assert result.passed is True
 
 
+def test_text_image_separation_rejects_single_clear_prose_sentence() -> None:
+    stream = io.BytesIO()
+    canvas = Canvas(stream, pagesize=(612, 792))
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(
+        72,
+        580,
+        "This sentence is selectable source prose that must be translated.",
+    )
+    canvas.save()
+    figure = SimpleNamespace(
+        id="figure-1",
+        kind="figure",
+        segment_id=None,
+        page_number=1,
+        bbox=(60.0, 190.0, 550.0, 290.0),
+    )
+    document = SimpleNamespace(blocks=[figure], page_count=1)
+    layout = SimpleNamespace(flowables=[SimpleNamespace(block_id="figure-1")])
+
+    with pytest.raises(PdfQAFailure, match="figure contains translatable selectable text"):
+        pdf_qa_module._validate_text_image_separation(
+            document,
+            layout,
+            stream.getvalue(),
+        )
+
+
 def test_prepare_pdf_qa_rejects_visible_generated_provenance(
     assembled_pdf_run: PdfQARun,
     tmp_path: Path,
@@ -746,15 +777,102 @@ def test_latin_density_excludes_exact_first_canonical_gloss_only(
         )
 
 
+def _in_memory_toc_gate(
+    *, semantic_role: str, source_text: str, source_reference: str | None
+) -> tuple[object, object, PdfTocResolution, PdfReader]:
+    entry_id = "pdf:page-0001:block-0001"
+    target_id = "pdf:page-0002:block-0001"
+    stream = io.BytesIO()
+    canvas = Canvas(stream, pagesize=(612, 792))
+    canvas.drawString(72, 720, source_text)
+    canvas.linkRect("", "target", (72, 716, 300, 736), relative=0)
+    canvas.showPage()
+    canvas.bookmarkHorizontalAbsolute("target", 736, left=72)
+    canvas.drawString(72, 720, "Chapter title")
+    canvas.save()
+    entry = SimpleNamespace(
+        id=entry_id,
+        semantic_role=semantic_role,
+        source_text=source_text,
+        destination=target_id,
+    )
+    target = SimpleNamespace(
+        id=target_id,
+        semantic_role="chapter-title",
+        source_text="Chapter title",
+    )
+    resolution = PdfTocResolution.from_dict({
+        "block_id": entry_id,
+        "source_reference": source_reference,
+        "target_block_id": target_id,
+        "output_page": 2,
+        "evidence": "source-internal-destination",
+        "warning": None,
+    })
+    layout = SimpleNamespace(
+        flowables=[
+            SimpleNamespace(
+                block_id=entry_id,
+                page_number=1,
+                bounds=(72.0, 716.0, 228.0, 20.0),
+            ),
+            SimpleNamespace(
+                block_id=target_id,
+                page_number=2,
+                bounds=(72.0, 716.0, 160.0, 20.0),
+            ),
+        ],
+        toc_entries=[resolution],
+        anchor_pages=[("wt-" + target_id.replace(":", "-"), 2)],
+    )
+    document = SimpleNamespace(blocks=[entry, target])
+    reader = pdf_qa_module._open_staged_reader(stream.getvalue())
+    return document, layout, resolution, reader
+
+
+def test_toc_gate_rejects_null_reference_for_numbered_entry() -> None:
+    document, layout, _resolution, reader = _in_memory_toc_gate(
+        semantic_role="toc-entry",
+        source_text="Chapter title ... 47",
+        source_reference=None,
+    )
+
+    with pytest.raises(PdfQAFailure, match="numbered TOC entry has no source-reference"):
+        pdf_qa_module._validate_toc_pages(document, layout, reader)
+
+
+def test_toc_gate_allows_genuinely_unnumbered_part() -> None:
+    document, layout, resolution, reader = _in_memory_toc_gate(
+        semantic_role="toc-part",
+        source_text="Part I. Foundations",
+        source_reference=None,
+    )
+
+    assert "Validated 1 resolved TOC entries" in pdf_qa_module._validate_toc_pages(
+        document,
+        layout,
+        reader,
+    )
+    entry = document.blocks[0]
+    assert pdf_qa_module._toc_reconciled_translation(
+        entry,
+        "Part I. 기초",
+        resolution,
+    ) == "Part I. 기초"
+
+
 def test_toc_text_reconciliation_changes_only_verified_terminal_page_column() -> None:
-    class Resolution:
-        source_reference = "47"
-        output_page = 3
+    block = SimpleNamespace(
+        id="pdf:page-0001:block-0001",
+        semantic_role="toc-entry",
+        source_text="47개 사례를 검토한 장 제목 ... 47",
+    )
+    resolution = SimpleNamespace(source_reference="47", output_page=3)
 
     assert pdf_qa_module._toc_reconciled_translation(
-        "pdf:page-0001:block-0001",
+        block,
         "47개 사례를 검토한 장 제목 ... 47",
-        Resolution(),
+        resolution,
     ) == "47개 사례를 검토한 장 제목 ... 3"
 
 
