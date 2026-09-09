@@ -450,6 +450,11 @@ _VISUAL_DIMENSIONS = (
     "page_transitions",
     "clipping_overlap",
     "glyph_rendering",
+    "semantic_structure",
+    "toc_navigation",
+    "reference_formatting",
+    "text_image_separation",
+    "terminology_readability",
 )
 
 

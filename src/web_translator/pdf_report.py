@@ -44,6 +44,21 @@ _SEMANTIC_DIMENSIONS = {
     "boundary_consistency",
     "protected_content",
 }
+_VISUAL_DIMENSIONS = {
+    "heading_hierarchy",
+    "text_legibility",
+    "table_legibility",
+    "figure_caption_pairing",
+    "footnote_placement",
+    "page_transitions",
+    "clipping_overlap",
+    "glyph_rendering",
+    "semantic_structure",
+    "toc_navigation",
+    "reference_formatting",
+    "text_image_separation",
+    "terminology_readability",
+}
 _ZONE_FILE = re.compile(r"zone-\d{3}\.json\Z")
 _TERMINOLOGY_POLICY_ID = "korean-first-technical-terms"
 _TERMINOLOGY_POLICY_VERSION = "2.0"
@@ -168,6 +183,8 @@ class PdfManifestSource:
 @dataclass(frozen=True, slots=True)
 class PdfManifestExtraction:
     layout_validation_counts: dict[str, int]
+    semantic_role_counts: dict[str, int]
+    toc_resolution_warnings: tuple[str, ...]
     warnings: tuple[str, ...]
     unreconstructed_links: tuple[PdfLinkEvidence, ...]
 
@@ -183,6 +200,8 @@ class PdfManifestExtraction:
     def to_dict(self) -> dict[str, object]:
         return {
             "layout_validation_counts": dict(self.layout_validation_counts),
+            "semantic_role_counts": dict(self.semantic_role_counts),
+            "toc_resolution_warnings": list(self.toc_resolution_warnings),
             "warnings": list(self.warnings),
             "unreconstructed_links": [
                 link.to_dict() for link in self.unreconstructed_links
@@ -194,7 +213,13 @@ class PdfManifestExtraction:
         data = _exact_report_mapping(
             value,
             "extraction",
-            {"layout_validation_counts", "warnings", "unreconstructed_links"},
+            {
+                "layout_validation_counts",
+                "semantic_role_counts",
+                "toc_resolution_warnings",
+                "warnings",
+                "unreconstructed_links",
+            },
         )
         counts_data = _exact_report_mapping(
             data.get("layout_validation_counts"),
@@ -207,6 +232,30 @@ class PdfManifestExtraction:
             )
             for field in sorted(cls._COUNT_FIELDS)
         }
+        role_data = _report_mapping(
+            data.get("semantic_role_counts"), "extraction.semantic_role_counts"
+        )
+        role_counts = {
+            key: _report_nonnegative_int_value(
+                item, f"extraction.semantic_role_counts[{key!r}]"
+            )
+            for key, item in role_data.items()
+            if isinstance(key, str) and key
+        }
+        if len(role_counts) != len(role_data) or list(role_counts) != sorted(role_counts):
+            raise PdfQAFailure(
+                "extraction.semantic_role_counts keys must be sorted nonempty strings"
+            )
+        toc_warnings = tuple(
+            _report_string_list(
+                data.get("toc_resolution_warnings"),
+                "extraction.toc_resolution_warnings",
+            )
+        )
+        if list(toc_warnings) != sorted(set(toc_warnings)):
+            raise PdfQAFailure(
+                "extraction.toc_resolution_warnings must be sorted and unique"
+            )
         warnings = tuple(_report_string_list(data.get("warnings"), "extraction.warnings"))
         if list(warnings) != sorted(set(warnings)):
             raise PdfQAFailure("extraction.warnings must be sorted and unique")
@@ -232,7 +281,7 @@ class PdfManifestExtraction:
             raise PdfQAFailure(
                 "extraction unreconstructed-link count disagrees with its evidence"
             )
-        return cls(counts, warnings, links)
+        return cls(counts, role_counts, toc_warnings, warnings, links)
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +526,10 @@ class PdfManifestQA:
             visual = visual_record.to_dict()
         except PdfContractError as error:
             raise PdfQAFailure(f"invalid qa.visual evidence: {error}") from error
+        if set(visual_record.findings) != _VISUAL_DIMENSIONS:
+            raise PdfQAFailure(
+                "qa.visual findings must contain exactly the thirteen canonical dimensions"
+            )
         if findings != visual["findings"]:
             raise PdfQAFailure("qa.layout_findings disagree with qa.visual")
         if contacts != visual["contact_sheets_reviewed"]:
@@ -601,6 +654,10 @@ def build_pdf_report_evidence(
     visual_review: PdfLayoutReview,
 ) -> PdfReportEvidence:
     """Parse and cross-validate one already captured report-evidence snapshot."""
+    if document_value.get("schema_version") != "1.1" or layout.schema_version != "1.1":
+        raise PdfQAFailure(
+            "legacy PDF document/layout evidence is diagnostic only and cannot be finalized"
+        )
     try:
         source = PdfSourceRecord.from_dict(source_value)
         document = PdfDocument.from_dict(document_value)
@@ -694,6 +751,7 @@ def build_pdf_manifest(
     semantic_review = evidence.semantic_review
     metrics = dict(qa.metrics)
     block_counts = Counter(block.kind for block in document.blocks)
+    semantic_role_counts = Counter(block.semantic_role for block in document.blocks)
     target_segments = [segment for segment in segments if segment.target]
     tables = {
         block.table_id for block in document.blocks if block.table_id is not None
@@ -755,6 +813,15 @@ def build_pdf_manifest(
                 ),
                 "unreconstructed_links": len(unreconstructed),
             },
+            semantic_role_counts=dict(sorted(semantic_role_counts.items())),
+            toc_resolution_warnings=tuple(sorted(
+                (
+                    f"{entry.block_id}: {entry.warning}; "
+                    f"source_reference={entry.source_reference!r}; evidence={entry.evidence}"
+                )
+                for entry in layout.toc_entries
+                if entry.warning is not None
+            )),
             warnings=tuple(sorted(extraction_warnings)),
             unreconstructed_links=unreconstructed,
         ),
@@ -846,6 +913,9 @@ def render_pdf_review_report(manifest: Mapping[str, object]) -> str:
         f"- Source bytes/pages: {source.get('byte_length', 0)} / {source.get('page_count', 0)}",
         f"- Output pages: {output.get('page_count', 0)}",
         f"- Output SHA-256: `{output.get('sha256', '')}`",
+        "- Terminology policy: "
+        f"{_markdown(_mapping(translation, 'terminology', 'manifest.translation').get('policy_id', ''))} / "
+        f"{_markdown(_mapping(translation, 'terminology', 'manifest.translation').get('policy_version', ''))}",
         "",
         "## Extraction and document counts",
         "",
@@ -854,8 +924,18 @@ def render_pdf_review_report(manifest: Mapping[str, object]) -> str:
     if isinstance(layout_counts, Mapping):
         for name in sorted(layout_counts, key=str):
             lines.append(f"- {_markdown(name)}: {layout_counts[name]}")
+    role_counts = extraction.get("semantic_role_counts", {})
+    if isinstance(role_counts, Mapping):
+        for name in sorted(role_counts, key=str):
+            lines.append(f"- role.{_markdown(name)}: {role_counts[name]}")
     for name in sorted(counts, key=str):
         lines.append(f"- count.{_markdown(name)}: {counts[name]}")
+    lines.extend(["", "### TOC resolution warnings", ""])
+    toc_warnings = extraction.get("toc_resolution_warnings", [])
+    if isinstance(toc_warnings, list) and toc_warnings:
+        lines.extend(f"- {_markdown(item)}" for item in toc_warnings)
+    else:
+        lines.append("None.")
     lines.extend([
         "",
         "## Automated PDF QA",

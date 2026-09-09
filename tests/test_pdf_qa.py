@@ -62,6 +62,11 @@ VISUAL_DIMENSIONS = (
     "page_transitions",
     "clipping_overlap",
     "glyph_rendering",
+    "semantic_structure",
+    "toc_navigation",
+    "reference_formatting",
+    "text_image_separation",
+    "terminology_readability",
 )
 
 
@@ -220,7 +225,7 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
         ),
     ]
     document = PdfDocument(
-        schema_version="1.0",
+        schema_version="1.1",
         source_sha256=source_sha256,
         page_count=1,
         selectable_characters=120,
@@ -449,6 +454,380 @@ def test_prepare_pdf_qa_renders_every_page_and_covers_contact_sheets(
         finding["code"] for finding in record["findings"]
     )
     assert not assembled_pdf_run.output_dir.exists()
+
+
+def test_prepare_pdf_qa_rejects_opener_not_starting_a_page(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    block_id = "pdf:page-0001:block-0002"
+
+    def mark_document_opener(document: dict[str, object]) -> None:
+        block = next(item for item in document["blocks"] if item["id"] == block_id)  # type: ignore[index,union-attr]
+        block["semantic_role"] = "chapter-title"
+
+    def mark_layout_opener(layout: dict[str, object]) -> None:
+        flowable = next(item for item in layout["flowables"] if item["block_id"] == block_id)  # type: ignore[index,union-attr]
+        flowable["semantic_role"] = "chapter-title"
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_document_opener,
+        layout_mutation=mark_layout_opener,
+    )
+
+    with pytest.raises(PdfQAFailure, match="chapter opener must start a fresh page"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_specialized_role_in_body_template(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    block_id = "pdf:page-0001:block-0002"
+
+    def mark_dedication(document: dict[str, object]) -> None:
+        block = next(item for item in document["blocks"] if item["id"] == block_id)  # type: ignore[index,union-attr]
+        block["semantic_role"] = "dedication"
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_dedication,
+    )
+
+    with pytest.raises(PdfQAFailure, match="specialized role uses an invalid layout template"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_toc_page_mismatch(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    entry_id = "pdf:page-0001:block-0005"
+    target_id = "pdf:page-0001:block-0001"
+
+    def mark_document_toc(document: dict[str, object]) -> None:
+        block = next(item for item in document["blocks"] if item["id"] == entry_id)  # type: ignore[index,union-attr]
+        block["semantic_role"] = "toc-entry"
+        block["source_text"] = "Jump to heading ... 47"
+
+    def add_resolution(layout: dict[str, object]) -> None:
+        flowable = next(item for item in layout["flowables"] if item["block_id"] == entry_id)  # type: ignore[index,union-attr]
+        flowable["semantic_role"] = "toc-entry"
+        layout["toc_entries"] = [{
+            "block_id": entry_id,
+            "source_reference": "47",
+            "target_block_id": target_id,
+            "output_page": 1,
+            "evidence": "source-internal-destination",
+            "warning": None,
+        }]
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_document_toc,
+        layout_mutation=add_resolution,
+    )
+
+    with pytest.raises(PdfQAFailure, match="TOC displayed page does not match"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_merged_reference_entries(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    first_id = "pdf:page-0001:block-0001"
+    second_id = "pdf:page-0001:block-0002"
+
+    def mark_references(document: dict[str, object]) -> None:
+        for block in document["blocks"]:  # type: ignore[union-attr]
+            if block["id"] in {first_id, second_id}:
+                block["semantic_role"] = "reference-entry"
+
+    def merge_layout(layout: dict[str, object]) -> None:
+        layout["flowables"] = [
+            item for item in layout["flowables"]  # type: ignore[union-attr]
+            if item["block_id"] != second_id
+        ]
+        for item in layout["flowables"]:  # type: ignore[union-attr]
+            if item["block_id"] == first_id:
+                item["semantic_role"] = "reference-entry"
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_references,
+        layout_mutation=merge_layout,
+    )
+
+    with pytest.raises(PdfQAFailure, match="reference entry is not separately traceable"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_running_furniture_in_body_flow(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    block_id = "pdf:page-0001:block-0002"
+
+    def mark_header(document: dict[str, object]) -> None:
+        block = next(item for item in document["blocks"] if item["id"] == block_id)  # type: ignore[index,union-attr]
+        block["kind"] = "header"
+        block["segment_id"] = None
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_header,
+    )
+
+    with pytest.raises(PdfQAFailure, match="running furniture entered body flow"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_figure_crop_absorbing_selectable_prose(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = assembled_pdf_run.run_dir / "source.pdf"
+    canvas = Canvas(str(source_path), pagesize=(612, 792))
+    canvas.drawString(72, 720, "Selectable document text. " * 8)
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(80, 548, "Prose text needs translation")
+    canvas.drawString(80, 532, "Another sentence needs review")
+    canvas.save()
+    digest = _sha256(source_path)
+    source_record = json.loads(
+        (assembled_pdf_run.run_dir / "source.json").read_text(encoding="utf-8")
+    )
+    source_record["sha256"] = digest
+    source_record["byte_length"] = source_path.stat().st_size
+    _write_json(assembled_pdf_run.run_dir / "source.json", source_record)
+    document = json.loads(
+        (assembled_pdf_run.run_dir / "document.json").read_text(encoding="utf-8")
+    )
+    document["source_sha256"] = digest
+    _write_json(assembled_pdf_run.run_dir / "document.json", document)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
+    monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
+
+    with pytest.raises(PdfQAFailure, match="figure contains translatable selectable text"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_allows_sparse_source_figure_labels(
+    assembled_pdf_run: PdfQARun,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = assembled_pdf_run.run_dir / "source.pdf"
+    canvas = Canvas(str(source_path), pagesize=(612, 792))
+    canvas.drawString(72, 720, "Selectable document text. " * 8)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawString(90, 532, "0")
+    canvas.drawString(160, 532, "Seconds")
+    canvas.save()
+    digest = _sha256(source_path)
+    source_record = json.loads(
+        (assembled_pdf_run.run_dir / "source.json").read_text(encoding="utf-8")
+    )
+    source_record["sha256"] = digest
+    source_record["byte_length"] = source_path.stat().st_size
+    _write_json(assembled_pdf_run.run_dir / "source.json", source_record)
+    document = json.loads(
+        (assembled_pdf_run.run_dir / "document.json").read_text(encoding="utf-8")
+    )
+    document["source_sha256"] = digest
+    _write_json(assembled_pdf_run.run_dir / "document.json", document)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
+    monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
+
+    result = prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+    assert result.passed is True
+
+
+def test_prepare_pdf_qa_rejects_visible_generated_provenance(
+    assembled_pdf_run: PdfQARun,
+    tmp_path: Path,
+) -> None:
+    overlay_path = tmp_path / "provenance-overlay.pdf"
+    canvas = Canvas(str(overlay_path), pagesize=(612, 792))
+    canvas.drawString(
+        72,
+        24,
+        "Selectable Korean PDF translation; Source: source.pdf; Generated: 2026-09-09",
+    )
+    canvas.save()
+    overlay = PdfReader(overlay_path).pages[0]
+
+    def add_provenance(writer: PdfWriter) -> None:
+        writer.pages[0].merge_page(overlay)
+
+    _rewrite_pdf(assembled_pdf_run, add_provenance)
+
+    with pytest.raises(PdfQAFailure, match="visible generated provenance"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_detached_callout_content(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    title_id = "pdf:page-0001:block-0001"
+    body_id = "pdf:page-0001:block-0002"
+
+    def mark_callout(document: dict[str, object]) -> None:
+        for block in document["blocks"]:  # type: ignore[union-attr]
+            if block["id"] == title_id:
+                block["semantic_role"] = "callout-title"
+            elif block["id"] == body_id:
+                block["semantic_role"] = "callout-body"
+
+    def detach_body(layout: dict[str, object]) -> None:
+        layout["flowables"] = [
+            item for item in layout["flowables"]  # type: ignore[union-attr]
+            if item["block_id"] != body_id
+        ]
+        for item in layout["flowables"]:  # type: ignore[union-attr]
+            if item["block_id"] == title_id:
+                item["semantic_role"] = "callout-title"
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_callout,
+        layout_mutation=detach_body,
+    )
+
+    with pytest.raises(PdfQAFailure, match="detached callout content"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_excessive_latin_density(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    translations_path = assembled_pdf_run.run_dir / "translations" / "zone-001.jsonl"
+    records = [
+        json.loads(line)
+        for line in translations_path.read_text(encoding="utf-8").splitlines()
+    ]
+    records[0]["text"] = "This paragraph remains overwhelmingly English 본문"
+    translations_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    _refresh_review_digest(assembled_pdf_run.run_dir)
+
+    with pytest.raises(
+        PdfQAFailure,
+        match=r"Latin density.*page 1.*block-0001.*exclusions",
+    ):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_latin_density_excludes_exact_first_canonical_gloss_only(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    document = PdfDocument.from_dict(json.loads(
+        (assembled_pdf_run.run_dir / "document.json").read_text(encoding="utf-8")
+    ))
+    first, second = document.blocks[:2]
+
+    evidence = pdf_qa_module._validate_latin_density(
+        document,
+        {first.id: "복제(replication)를 사용한다."},
+        segments={},
+        glossary={"replication": "복제"},
+    )
+
+    assert "maximum ratio 0.000" in evidence
+    assert "first-gloss:replication=1" in evidence
+    with pytest.raises(PdfQAFailure, match="Latin density"):
+        pdf_qa_module._validate_latin_density(
+            document,
+            {
+                first.id: "복제(replication)를 사용한다.",
+                second.id: "복제(replication)를 다시 사용한다.",
+            },
+            segments={},
+            glossary={"replication": "복제"},
+        )
+
+
+def test_toc_text_reconciliation_changes_only_verified_terminal_page_column() -> None:
+    class Resolution:
+        source_reference = "47"
+        output_page = 3
+
+    assert pdf_qa_module._toc_reconciled_translation(
+        "pdf:page-0001:block-0001",
+        "47개 사례를 검토한 장 제목 ... 47",
+        Resolution(),
+    ) == "47개 사례를 검토한 장 제목 ... 3"
+
+
+def test_prepare_pdf_qa_rejects_legacy_document_as_publication_evidence(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    document_path = assembled_pdf_run.run_dir / "document.json"
+    document = json.loads(document_path.read_text(encoding="utf-8"))
+    document["schema_version"] = "1.0"
+    for block in document["blocks"]:
+        block.pop("semantic_role")
+        block.pop("continuation_of")
+    _write_json(document_path, document)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
+
+    with pytest.raises(PdfQAFailure, match="legacy PDF document is diagnostic only"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_layout_without_publication_evidence_fields(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    layout_path = assembled_pdf_run.run_dir / "layout.json"
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    for field in ("toc_entries", "footnote_continuations", "anchor_pages"):
+        layout.pop(field)
+    _write_json(layout_path, layout)
+
+    with pytest.raises(PdfQAFailure, match="layout publication evidence fields"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_prepare_pdf_qa_rejects_diagnostic_only_footnote_ownership(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    note_id = "pdf:page-0001:block-0002"
+    owner_id = "pdf:page-0001:block-0001"
+
+    def mark_footnote(document: dict[str, object]) -> None:
+        block = next(item for item in document["blocks"] if item["id"] == note_id)  # type: ignore[index,union-attr]
+        block["kind"] = "footnote"
+
+    def mark_legacy_ownership(layout: dict[str, object]) -> None:
+        flowable = next(item for item in layout["flowables"] if item["block_id"] == note_id)  # type: ignore[index,union-attr]
+        flowable["kind"] = "footnote"
+        flowable["footnote_owner_id"] = owner_id
+        flowable["footnote_ownership"] = "block-only-legacy"
+
+    _rewrite_publication_evidence(
+        assembled_pdf_run,
+        document_mutation=mark_footnote,
+        layout_mutation=mark_legacy_ownership,
+    )
+
+    with pytest.raises(PdfQAFailure, match="legacy footnote ownership is diagnostic only"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+
+
+def test_read_pdf_layout_review_rejects_stale_eight_dimension_record(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
+    _write_passing_layout_review(assembled_pdf_run.run_dir)
+    review_path = assembled_pdf_run.run_dir / "pdf-layout-review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["findings"] = {
+        key: review["findings"][key]
+        for key in VISUAL_DIMENSIONS[:8]
+    }
+    _write_json(review_path, review)
+
+    with pytest.raises(PdfQAFailure, match="thirteen canonical dimensions"):
+        read_pdf_layout_review(review_path, assembled_pdf_run.run_dir / "pdf-qa.json")
 
 
 @pytest.mark.parametrize(
@@ -1142,6 +1521,25 @@ def _rewrite_layout_hash(run: PdfQARun) -> None:
     layout = json.loads(layout_path.read_text(encoding="utf-8"))
     layout["staged_pdf_sha256"] = _sha256(pdf)
     _write_json(layout_path, layout)
+
+
+def _rewrite_publication_evidence(
+    run: PdfQARun,
+    *,
+    document_mutation: object | None = None,
+    layout_mutation: object | None = None,
+) -> None:
+    if document_mutation is not None:
+        document_path = run.run_dir / "document.json"
+        document = json.loads(document_path.read_text(encoding="utf-8"))
+        document_mutation(document)  # type: ignore[operator]
+        _write_json(document_path, document)
+        _refresh_review_digest(run.run_dir)
+    if layout_mutation is not None:
+        layout_path = run.run_dir / "layout.json"
+        layout = json.loads(layout_path.read_text(encoding="utf-8"))
+        layout_mutation(layout)  # type: ignore[operator]
+        _write_json(layout_path, layout)
 
 
 def _rewrite_pdf(run: PdfQARun, mutate: object) -> None:

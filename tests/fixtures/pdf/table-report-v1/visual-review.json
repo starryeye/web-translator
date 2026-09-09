@@ -29,12 +29,32 @@
       "evidence": "Fixture visual review passed page_transitions.",
       "verdict": "pass"
     },
+    "reference_formatting": {
+      "evidence": "Fixture visual review passed reference_formatting.",
+      "verdict": "pass"
+    },
+    "semantic_structure": {
+      "evidence": "Fixture visual review passed semantic_structure.",
+      "verdict": "pass"
+    },
     "table_legibility": {
       "evidence": "Fixture visual review passed table_legibility.",
       "verdict": "pass"
     },
+    "terminology_readability": {
+      "evidence": "Fixture visual review passed terminology_readability.",
+      "verdict": "pass"
+    },
+    "text_image_separation": {
+      "evidence": "Fixture visual review passed text_image_separation.",
+      "verdict": "pass"
+    },
     "text_legibility": {
       "evidence": "Fixture visual review passed text_legibility.",
+      "verdict": "pass"
+    },
+    "toc_navigation": {
+      "evidence": "Fixture visual review passed toc_navigation.",
       "verdict": "pass"
     }
   },

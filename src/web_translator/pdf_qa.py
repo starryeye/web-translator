@@ -33,6 +33,7 @@ from web_translator.pdf_flowables import PdfAssemblyError, PdfAssemblyLayout
 from web_translator.pdf_media import (
     PdfMediaError,
     build_contact_sheets,
+    figure_owns_character,
     render_pdf_pages,
 )
 from web_translator.pdf_models import (
@@ -75,7 +76,34 @@ _VISUAL_DIMENSIONS = {
     "page_transitions",
     "clipping_overlap",
     "glyph_rendering",
+    "semantic_structure",
+    "toc_navigation",
+    "reference_formatting",
+    "text_image_separation",
+    "terminology_readability",
 }
+_RUNNING_FURNITURE_KINDS = {"header", "footer", "page-number"}
+_TOC_ROLES = {"toc-part", "toc-chapter", "toc-entry"}
+_CALLOUT_ROLES = {"callout-title", "callout-body"}
+_SPECIALIZED_ROLES = {
+    "toc-title", "toc-part", "toc-chapter", "toc-entry",
+    "dedication", "epigraph", "epigraph-attribution", "part-label",
+    "part-title", "chapter-label", "chapter-title", "callout-title",
+    "callout-body", "reference-heading", "reference-entry",
+}
+_LATIN_DENSITY_LIMIT = 0.35
+_LATIN_CHARACTER = re.compile(r"[A-Za-z]")
+_KOREAN_CHARACTER = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_ACRONYM = re.compile(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])")
+_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]+_[A-Za-z0-9_]+|[a-z]+[A-Z][A-Za-z0-9]*)(?![A-Za-z0-9_])"
+)
+_URL = re.compile(r"(?:https?://|mailto:)[^\s<>()]+", re.IGNORECASE)
+_INLINE_CODE = re.compile(r"`[^`]+`")
+_FIGURE_LABEL = re.compile(r"^\s*(?:figure|fig\.)\s+\d+\b", re.IGNORECASE)
+_VISIBLE_PROVENANCE = re.compile(
+    r"Selectable Korean PDF translation;\s*Source:\s*.+?;\s*Generated:\s*\S+"
+)
 
 
 class PdfQAFailure(RuntimeError):
@@ -332,7 +360,10 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             ),
             qa,
         )
-        layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        layout_value = _json(
+            opened["layout.json"], run_dir / "layout.json", "PDF layout"
+        )
+        layout = _layout_from_value(layout_value)
         source_value = _strict_json_mapping(
             snapshot_bytes["source.json"], "PDF source record"
         )
@@ -518,7 +549,7 @@ def _pdf_layout_review_from_values(
         )
     if set(review.findings) != _VISUAL_DIMENSIONS:
         raise PdfQAFailure(
-            "PDF layout review visual dimensions must contain exactly the eight canonical dimensions"
+            "PDF layout review visual dimensions must contain exactly the thirteen canonical dimensions"
         )
     expected_unresolved = sorted(
         dimension
@@ -1243,11 +1274,17 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             staged_output_anchor, "translated.pdf", "staged translated PDF"
         )
         assembly._verify_anchored_evidence(run_anchor, opened)
-        document = _document(opened["document.json"], run_dir / "document.json")
+        document_value = _json(
+            opened["document.json"], run_dir / "document.json", "PDF document"
+        )
+        document = PdfDocument.from_dict(document_value)
         source = _source(opened["source.json"], run_dir / "source.json")
         segments = _snapshot_segments(semantic_snapshot)
         glossary = _snapshot_glossary(semantic_snapshot)
-        layout = _layout(opened["layout.json"], run_dir / "layout.json")
+        layout_value = _json(
+            opened["layout.json"], run_dir / "layout.json", "PDF layout"
+        )
+        layout = _layout_from_value(layout_value)
         translations, translation_zone_ids = _snapshot_translations(semantic_snapshot)
         review = _review(
             opened["review.json"],
@@ -1255,14 +1292,32 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             translation_zone_ids,
             semantic_snapshot=semantic_snapshot,
         )
-        _validate_source(document, source, opened["source.pdf"])
-        normalized = _validate_contracts(
-            document, segments, translations, glossary, review, layout, output_dir
-        )
+        source_pdf_bytes = _validate_source(document, source, opened["source.pdf"])
+        _validate_publication_evidence(document_value, layout_value, layout)
         pdf_bytes = assembly._read_opened_bytes(
             staged_pdf,
             run_dir / "staged-output" / "translated.pdf",
             "staged translated PDF",
+        )
+        staged_reader = _open_staged_reader(pdf_bytes)
+        opener_evidence = _validate_opener_pages(document, layout)
+        toc_evidence = _validate_toc_pages(document, layout, staged_reader)
+        reference_evidence = _validate_reference_layout(document, layout)
+        image_evidence = _validate_text_image_separation(
+            document, layout, source_pdf_bytes
+        )
+        furniture_evidence = _validate_running_furniture(document, layout)
+        callout_evidence = _validate_callout_layout(document, layout)
+        template_evidence = _validate_specialized_role_templates(document, layout)
+        provenance_evidence = _validate_generated_provenance(staged_reader, layout)
+        normalized = _validate_contracts(
+            document, segments, translations, glossary, review, layout, output_dir
+        )
+        latin_evidence = _validate_latin_density(
+            document,
+            {block.id: translated for block, _segment, translated in normalized},
+            segments={segment.id: segment for segment in segments},
+            glossary=glossary,
         )
         staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
         if layout.staged_pdf_sha256 != staged_hash:
@@ -1375,6 +1430,16 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                     "contract.coverage": f"Validated {len(normalized)} translated blocks.",
                     "contract.review": "Semantic review has no unresolved required finding.",
                     "layout.evidence": f"Validated {len(layout.flowables)} tracked flowables.",
+                    "publication.callouts": callout_evidence,
+                    "publication.evidence": "Validated schema 1.1 document and layout provenance.",
+                    "publication.latin_density": latin_evidence,
+                    "publication.openers": opener_evidence,
+                    "publication.provenance": provenance_evidence,
+                    "publication.references": reference_evidence,
+                    "publication.running_furniture": furniture_evidence,
+                    "publication.semantic_templates": template_evidence,
+                    "publication.text_image_separation": image_evidence,
+                    "publication.toc": toc_evidence,
                     "render.contact_sheets": f"Covered {structure['page_count']} rendered pages exactly once.",
                     "structure.fonts": "Embedded Regular and Bold Korean fonts have Unicode maps.",
                     "structure.links": f"Validated {structure['link_count']} PDF link annotations.",
@@ -1802,8 +1867,12 @@ def _review(
 
 
 def _layout(opened: assembly._OpenedFile, path: Path) -> PdfAssemblyLayout:
+    return _layout_from_value(_json(opened, path, "PDF layout"))
+
+
+def _layout_from_value(value: Mapping[str, Any]) -> PdfAssemblyLayout:
     try:
-        return PdfAssemblyLayout.from_dict(_json(opened, path, "PDF layout"))
+        return PdfAssemblyLayout.from_dict(value)
     except PdfAssemblyError as error:
         raise PdfQAFailure(f"invalid PDF layout: {error}") from error
 
@@ -1844,16 +1913,584 @@ def _read_translations(
         directory.close()
 
 
+def _validate_publication_evidence(
+    document_value: Mapping[str, Any],
+    layout_value: Mapping[str, Any],
+    layout: PdfAssemblyLayout,
+) -> None:
+    """Require native semantic evidence for publication, not compatibility upgrades."""
+    if document_value.get("schema_version") != "1.1":
+        raise PdfQAFailure(
+            "legacy PDF document is diagnostic only and cannot prove publication quality"
+        )
+    if layout.schema_version != "1.1":
+        raise PdfQAFailure(
+            "legacy PDF layout is diagnostic only and cannot prove publication quality"
+        )
+    required_layout_fields = {"toc_entries", "footnote_continuations", "anchor_pages"}
+    if not required_layout_fields.issubset(layout_value):
+        raise PdfQAFailure(
+            "layout publication evidence fields are absent; legacy-compatible evidence is diagnostic only"
+        )
+
+
+def _validate_specialized_role_templates(
+    document: PdfDocument, layout: PdfAssemblyLayout
+) -> str:
+    """Require every specialized source role to remain on its named layout template."""
+    by_block = _flowables_by_block(layout)
+    checked = 0
+    for block in document.blocks:
+        if block.semantic_role not in _SPECIALIZED_ROLES:
+            continue
+        parts = by_block.get(block.id, ())
+        if not parts or any(item.semantic_role != block.semantic_role for item in parts):
+            raise PdfQAFailure(
+                "specialized role uses an invalid layout template: "
+                f"{block.id} expected {block.semantic_role}"
+            )
+        checked += len(parts)
+    return f"Validated {checked} specialized-role flowables on matching templates."
+
+
+def _open_staged_reader(pdf_bytes: bytes) -> PdfReader:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=True)
+    except Exception as error:
+        raise PdfQAFailure(f"cannot reopen staged translated PDF: {error}") from error
+    if reader.is_encrypted:
+        raise PdfQAFailure("staged translated PDF must not be encrypted")
+    if not reader.pages:
+        raise PdfQAFailure("staged translated PDF has no pages")
+    return reader
+
+
+def _flowables_by_block(layout: PdfAssemblyLayout) -> dict[str, list[Any]]:
+    result: dict[str, list[Any]] = {}
+    for item in layout.flowables:
+        result.setdefault(item.block_id, []).append(item)
+    return result
+
+
+def _validate_opener_pages(
+    document: PdfDocument, layout: PdfAssemblyLayout
+) -> str:
+    """Require each part/chapter opener group to own the start of its output page."""
+    families = (
+        {"part-label", "part-title"},
+        {"chapter-label", "chapter-title"},
+    )
+    by_block = _flowables_by_block(layout)
+    checked = 0
+    for index, block in enumerate(document.blocks):
+        family = next((roles for roles in families if block.semantic_role in roles), None)
+        if family is None:
+            continue
+        if index and document.blocks[index - 1].semantic_role in family:
+            continue
+        group: list[Any] = []
+        for candidate in document.blocks[index:]:
+            if candidate.semantic_role not in family:
+                break
+            group.extend(by_block.get(candidate.id, ()))
+        if not group:
+            label = "chapter" if block.semantic_role.startswith("chapter-") else "part"
+            raise PdfQAFailure(f"{label} opener is missing layout evidence: {block.id}")
+        page_number = min(item.page_number for item in group)
+        if any(
+            item.split_part == 0 and item.page_number != page_number for item in group
+        ):
+            label = "chapter" if block.semantic_role.startswith("chapter-") else "part"
+            raise PdfQAFailure(
+                f"{label} opener group is detached across pages: {block.id}"
+            )
+        preceding = [
+            item
+            for item in layout.flowables
+            if item.page_number == page_number
+            and item.source_order < block.order
+            and item.kind not in _RUNNING_FURNITURE_KINDS
+            and item.footnote_owner_id is None
+        ]
+        if preceding:
+            label = "chapter" if block.semantic_role.startswith("chapter-") else "part"
+            raise PdfQAFailure(
+                f"{label} opener must start a fresh page: {block.id} on page {page_number}"
+            )
+        checked += 1
+    return f"Validated {checked} part/chapter opener groups on fresh pages."
+
+
+def _layout_block_text(
+    reader: PdfReader, layout: PdfAssemblyLayout
+) -> dict[str, list[str]]:
+    stream = getattr(reader, "stream", None)
+    if stream is None or not hasattr(stream, "getvalue"):
+        raise PdfQAFailure("staged PDF reader does not retain held byte evidence")
+    try:
+        payload = stream.getvalue()
+        with pdfplumber.open(io.BytesIO(payload)) as pdf:
+            result: dict[str, list[str]] = {}
+            for item in layout.flowables:
+                if item.page_number > len(pdf.pages):
+                    raise PdfQAFailure("layout refers to a nonexistent output page")
+                page = pdf.pages[item.page_number - 1]
+                x, y, width, height = item.bounds
+                crop = (
+                    max(0.0, x - 1.0),
+                    max(0.0, page.height - (y + height) - 1.0),
+                    min(page.width, x + width + 1.0),
+                    min(page.height, page.height - y + 1.0),
+                )
+                selected = page.crop(crop, strict=False).extract_text(
+                    x_tolerance=3, y_tolerance=3
+                )
+                result.setdefault(item.block_id, []).append(selected or "")
+            return result
+    except PdfQAFailure:
+        raise
+    except Exception as error:
+        raise PdfQAFailure(
+            f"cannot extract staged layout text evidence: {error}"
+        ) from error
+
+
+def _validate_toc_pages(
+    document: PdfDocument,
+    layout: PdfAssemblyLayout,
+    staged_reader: PdfReader,
+) -> str:
+    """Validate only the independently evidenced TOC page-column transformation."""
+    toc_blocks = [block for block in document.blocks if block.semantic_role in _TOC_ROLES]
+    resolutions = {item.block_id: item for item in layout.toc_entries}
+    if len(resolutions) != len(layout.toc_entries):
+        raise PdfQAFailure("TOC resolution block IDs must be unique")
+    if set(resolutions) != {block.id for block in toc_blocks}:
+        raise PdfQAFailure("TOC resolution evidence must exactly cover semantic TOC entries")
+    selected_by_block = _layout_block_text(staged_reader, layout) if toc_blocks else {}
+    by_block = _flowables_by_block(layout)
+    anchors = dict(layout.anchor_pages)
+    resolved_count = 0
+    warning_count = 0
+    for block in toc_blocks:
+        resolution = resolutions[block.id]
+        parts = by_block.get(block.id, ())
+        if not parts:
+            raise PdfQAFailure(f"TOC entry is missing layout evidence: {block.id}")
+        if resolution.source_reference is not None and re.search(
+            rf"(?:^|\s){re.escape(resolution.source_reference)}\s*$",
+            block.source_text,
+            re.IGNORECASE,
+        ) is None:
+            raise PdfQAFailure(
+                f"TOC source-reference evidence disagrees with its source block: {block.id}"
+            )
+        selected = _normalize_text("\n".join(selected_by_block.get(block.id, ())))
+        if resolution.target_block_id is None:
+            warning_count += 1
+            if resolution.source_reference is not None and re.search(
+                rf"(?:^|\s){re.escape(resolution.source_reference)}\s*$", selected,
+                re.IGNORECASE,
+            ) is None:
+                raise PdfQAFailure(
+                    f"unresolved TOC source page is not displayed: {block.id}"
+                )
+            continue
+        assert resolution.output_page is not None
+        if resolution.source_reference is not None and re.search(
+            rf"(?:^|\s){resolution.output_page}\s*$", selected
+        ) is None:
+            raise PdfQAFailure(
+                "TOC displayed page does not match anchored output page: "
+                f"{block.id} expected {resolution.output_page}"
+            )
+        target_parts = by_block.get(resolution.target_block_id, ())
+        if not target_parts or target_parts[0].page_number != resolution.output_page:
+            raise PdfQAFailure(
+                f"TOC target layout page disagrees with resolution: {block.id}"
+            )
+        anchor_name = "wt-" + re.sub(
+            r"[^A-Za-z0-9_.-]", "-", resolution.target_block_id
+        )
+        if anchors.get(anchor_name) != resolution.output_page:
+            raise PdfQAFailure(f"TOC anchor evidence is missing or stale: {block.id}")
+        if not _toc_annotation_matches(
+            staged_reader, parts, target_parts[0]
+        ):
+            raise PdfQAFailure(
+                f"TOC internal link does not resolve to its anchored target: {block.id}"
+            )
+        resolved_count += 1
+    return (
+        f"Validated {resolved_count} resolved TOC entries and "
+        f"{warning_count} outside-input warnings."
+    )
+
+
+def _toc_annotation_matches(
+    reader: PdfReader, source_parts: Sequence[Any], target: Any
+) -> bool:
+    for item in source_parts:
+        page = reader.pages[item.page_number - 1]
+        for reference in page.get("/Annots", []):
+            try:
+                annotation = reference.get_object()
+                if annotation.get("/Subtype") != "/Link":
+                    continue
+                rectangle = _annotation_rectangle(annotation.get("/Rect"))
+                destination = annotation.get("/Dest")
+                if (
+                    destination is not None
+                    and _rectangle_intersects_bounds(rectangle, item.bounds)
+                    and _destination_matches_layout(reader, destination, target)
+                ):
+                    return True
+            except PdfQAFailure:
+                raise
+            except Exception as error:
+                raise PdfQAFailure(
+                    f"cannot inspect TOC link annotation: {error}"
+                ) from error
+    return False
+
+
+def _validate_reference_layout(
+    document: PdfDocument, layout: PdfAssemblyLayout
+) -> str:
+    by_block = _flowables_by_block(layout)
+    entries = [
+        block for block in document.blocks if block.semantic_role == "reference-entry"
+    ]
+    for block in entries:
+        parts = by_block.get(block.id, ())
+        if (
+            not parts
+            or any(item.semantic_role != "reference-entry" for item in parts)
+            or [item.split_part for item in parts] != list(range(len(parts)))
+        ):
+            raise PdfQAFailure(
+                f"reference entry is not separately traceable in layout: {block.id}"
+            )
+    return f"Validated separate layout traceability for {len(entries)} reference entries."
+
+
+def _source_character_box(character: Mapping[str, object]) -> tuple[float, float, float, float] | None:
+    try:
+        box = tuple(float(character[key]) for key in ("x0", "top", "x1", "bottom"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in box) or box[2] <= box[0] or box[3] <= box[1]:
+        return None
+    return box  # type: ignore[return-value]
+
+
+def _top_boxes_intersect(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    return (
+        min(left[2], right[2]) - max(left[0], right[0]) > 1e-6
+        and min(left[3], right[3]) - max(left[1], right[1]) > 1e-6
+    )
+
+
+def _validate_text_image_separation(
+    document: PdfDocument,
+    layout: PdfAssemblyLayout,
+    source_pdf_bytes: bytes,
+) -> str:
+    """Recompute figure character ownership from the already verified held source."""
+    figures = [block for block in document.blocks if block.kind == "figure"]
+    by_block = _flowables_by_block(layout)
+    if any(not by_block.get(figure.id) for figure in figures):
+        raise PdfQAFailure("figure is missing output layout evidence")
+    translatable = [
+        block
+        for block in document.blocks
+        if block.segment_id is not None and block.kind not in _RUNNING_FURNITURE_KINDS
+    ]
+    owned_total = 0
+    try:
+        with pdfplumber.open(io.BytesIO(source_pdf_bytes)) as pdf:
+            if len(pdf.pages) != document.page_count:
+                raise PdfQAFailure("held source page count disagrees with document evidence")
+            for figure in figures:
+                page = pdf.pages[figure.page_number - 1]
+                owned: list[Mapping[str, object]] = []
+                for raw_character in page.chars:
+                    if not isinstance(raw_character, Mapping):
+                        raise PdfQAFailure("held source contains malformed character evidence")
+                    if not str(raw_character.get("text", "")).strip():
+                        continue
+                    try:
+                        is_owned = figure_owns_character(
+                            raw_character, figure.bbox, page_number=figure.page_number
+                        )
+                    except PdfMediaError as error:
+                        raise PdfQAFailure(
+                            f"figure selectable-text ownership is ambiguous: {error}"
+                        ) from error
+                    if is_owned:
+                        owned.append(raw_character)
+                owned_total += len(owned)
+                for character in owned:
+                    char_box = _source_character_box(character)
+                    assert char_box is not None
+                    if any(
+                        block.page_number == figure.page_number
+                        and block.id != figure.id
+                        and _top_boxes_intersect(char_box, block.bbox)
+                        for block in translatable
+                    ):
+                        raise PdfQAFailure(
+                            "figure contains translatable selectable text: "
+                            f"page {figure.page_number} block {figure.id} bounds {figure.bbox}"
+                        )
+                words = page.extract_words(return_chars=True)
+                owned_words = []
+                for word in words if isinstance(words, list) else []:
+                    chars = word.get("chars", [])
+                    if not isinstance(chars, list) or not chars:
+                        continue
+                    nonspace = [char for char in chars if str(char.get("text", "")).strip()]
+                    if nonspace and all(
+                        figure_owns_character(
+                            char, figure.bbox, page_number=figure.page_number
+                        )
+                        for char in nonspace
+                    ):
+                        owned_words.append(word)
+                line_groups: dict[int, list[Mapping[str, object]]] = {}
+                for word in owned_words:
+                    try:
+                        key = round(float(word["top"]) / 3)
+                    except (KeyError, TypeError, ValueError):
+                        raise PdfQAFailure("held source contains malformed word evidence")
+                    line_groups.setdefault(key, []).append(word)
+                prose_lines = [
+                    group
+                    for group in line_groups.values()
+                    if len(group) >= 4
+                    and sum(len(str(word.get("text", ""))) for word in group) >= 24
+                ]
+                if len(prose_lines) >= 2:
+                    raise PdfQAFailure(
+                        "figure contains translatable selectable text: "
+                        f"page {figure.page_number} block {figure.id} has {len(prose_lines)} prose lines"
+                    )
+    except PdfQAFailure:
+        raise
+    except Exception as error:
+        raise PdfQAFailure(f"cannot validate held source figure ownership: {error}") from error
+    return (
+        f"Validated {len(figures)} source figure regions from held bytes; "
+        f"{owned_total} sparse artwork-label characters remained image-owned."
+    )
+
+
+def _validate_running_furniture(
+    document: PdfDocument, layout: PdfAssemblyLayout
+) -> str:
+    blocks = {block.id: block for block in document.blocks}
+    for item in layout.flowables:
+        if item.footnote_ownership == "block-only-legacy":
+            raise PdfQAFailure(
+                "legacy footnote ownership is diagnostic only: "
+                f"{item.block_id} on page {item.page_number}"
+            )
+        if item.footnote_owner_id is not None and item.footnote_owner_id not in blocks:
+            raise PdfQAFailure(
+                f"page-local footnote owner is missing: {item.block_id}"
+            )
+    body_frames: dict[int, set[tuple[float, float, float, float]]] = {}
+    for item in layout.flowables:
+        block = blocks.get(item.block_id)
+        if block is None:
+            continue
+        if block.kind not in _RUNNING_FURNITURE_KINDS and item.footnote_owner_id is None:
+            body_frames.setdefault(item.page_number, set()).add(item.frame)
+    checked = 0
+    for item in layout.flowables:
+        block = blocks.get(item.block_id)
+        if block is None or block.kind not in _RUNNING_FURNITURE_KINDS:
+            continue
+        if item.kind != block.kind or item.frame in body_frames.get(item.page_number, set()):
+            raise PdfQAFailure(
+                f"running furniture entered body flow: {block.id} on page {item.page_number}"
+            )
+        checked += 1
+    return f"Validated {checked} running-furniture flowables outside body frames."
+
+
+def _validate_callout_layout(
+    document: PdfDocument, layout: PdfAssemblyLayout
+) -> str:
+    by_block = _flowables_by_block(layout)
+    checked = 0
+    for index, block in enumerate(document.blocks):
+        if block.semantic_role not in _CALLOUT_ROLES:
+            continue
+        parts = by_block.get(block.id, ())
+        if not parts or any(item.semantic_role != block.semantic_role for item in parts):
+            raise PdfQAFailure(f"detached callout content: {block.id}")
+        if block.semantic_role == "callout-title":
+            following = document.blocks[index + 1] if index + 1 < len(document.blocks) else None
+            body = (
+                following
+                if following is not None
+                and following.page_number == block.page_number
+                and following.semantic_role == "callout-body"
+                else None
+            )
+            if body is None or not by_block.get(body.id):
+                raise PdfQAFailure(f"detached callout content: {block.id}")
+            if (
+                parts[0].page_number != by_block[body.id][0].page_number
+                or parts[0].frame != by_block[body.id][0].frame
+            ):
+                raise PdfQAFailure(f"detached callout content: {block.id}")
+            previous = document.blocks[index - 1] if index else None
+            if (
+                previous is not None
+                and previous.kind == "figure"
+                and previous.caption_id is None
+                and previous.page_number == block.page_number
+                and previous.bbox[2] <= block.bbox[0]
+                and previous.bbox[1] < block.bbox[3]
+                and previous.bbox[3] > block.bbox[1]
+            ):
+                icon_parts = by_block.get(previous.id, ())
+                if (
+                    not icon_parts
+                    or icon_parts[0].page_number != parts[0].page_number
+                    or icon_parts[0].frame != parts[0].frame
+                ):
+                    raise PdfQAFailure(
+                        f"detached callout content: icon {previous.id} from {block.id}"
+                    )
+        checked += 1
+    return f"Validated {checked} callout title/body layout records."
+
+
+def _validate_generated_provenance(
+    staged_reader: PdfReader, layout: PdfAssemblyLayout
+) -> str:
+    global_text = _normalize_text(
+        "\n".join(page.extract_text() or "" for page in staged_reader.pages)
+    )
+    matches = list(_VISIBLE_PROVENANCE.finditer(global_text))
+    if not matches:
+        return "Validated metadata-only generated provenance with no visible block."
+    block_text = {
+        block_id: _normalize_text("\n".join(parts))
+        for block_id, parts in _layout_block_text(staged_reader, layout).items()
+    }
+    for match in matches:
+        if not any(match.group() in selected for selected in block_text.values()):
+            raise PdfQAFailure("visible generated provenance was added outside source flowables")
+    return "Validated provenance-like source prose only inside tracked source flowables."
+
+
+def _mask_span(characters: list[str], start: int, end: int) -> None:
+    characters[start:end] = [" " for _ in range(end - start)]
+
+
+def _mask_matches(
+    characters: list[str], pattern: re.Pattern[str], label: str, exclusions: list[str]
+) -> None:
+    text = "".join(characters)
+    for match in pattern.finditer(text):
+        _mask_span(characters, match.start(), match.end())
+        exclusions.append(label)
+
+
+def _validate_latin_density(
+    document: PdfDocument,
+    translations_by_block: Mapping[str, str],
+    *,
+    segments: Mapping[str, Segment],
+    glossary: Mapping[str, str],
+) -> str:
+    """Enforce Korean prose density after explicit, evidenced exclusions."""
+    seen_terms: set[str] = set()
+    applied_exclusions: Counter[str] = Counter()
+    maximum = 0.0
+    measured = 0
+    for block in document.blocks:
+        text = translations_by_block.get(block.id)
+        if text is None or block.semantic_role == "reference-entry":
+            continue
+        if block.kind == "caption" and _FIGURE_LABEL.search(block.source_text):
+            continue
+        if block.kind in {"figure", "header", "footer", "page-number"}:
+            continue
+        characters = list(text)
+        exclusions: list[str] = []
+        segment = segments.get(block.segment_id or "")
+        if segment is not None:
+            for token in segment.protected:
+                if token.kind == "tag" or not token.value:
+                    continue
+                start = 0
+                while (found := "".join(characters).find(token.value, start)) >= 0:
+                    _mask_span(characters, found, found + len(token.value))
+                    exclusions.append(f"protected-{token.kind}")
+                    start = found + len(token.value)
+        visible_before_gloss = "".join(characters)
+        for term, gloss in sorted(glossary.items(), key=lambda item: (-len(item[0]), item[0])):
+            pair = f"{gloss}({term})"
+            found = visible_before_gloss.find(pair)
+            if term not in seen_terms and found >= 0:
+                english_start = found + len(gloss) + 1
+                _mask_span(characters, english_start, english_start + len(term))
+                exclusions.append(f"first-gloss:{term}")
+            if (
+                term in visible_before_gloss
+                or gloss in visible_before_gloss
+                or pair in visible_before_gloss
+            ):
+                seen_terms.add(term)
+        _mask_matches(characters, _URL, "url", exclusions)
+        _mask_matches(characters, _INLINE_CODE, "code", exclusions)
+        _mask_matches(characters, _IDENTIFIER, "identifier", exclusions)
+        _mask_matches(characters, _ACRONYM, "acronym", exclusions)
+        measured_text = "".join(characters)
+        applied_exclusions.update(exclusions)
+        latin = len(_LATIN_CHARACTER.findall(measured_text))
+        korean = len(_KOREAN_CHARACTER.findall(measured_text))
+        denominator = latin + korean
+        if denominator == 0:
+            continue
+        ratio = latin / denominator
+        maximum = max(maximum, ratio)
+        measured += 1
+        if ratio > _LATIN_DENSITY_LIMIT:
+            names = ",".join(sorted(set(exclusions))) or "none"
+            raise PdfQAFailure(
+                "Latin density exceeds 35 percent: "
+                f"page {block.page_number} block {block.id} ratio {ratio:.3f}; "
+                f"exclusions={names}"
+            )
+    exclusion_evidence = ", ".join(
+        f"{name}={count}" for name, count in sorted(applied_exclusions.items())
+    ) or "none"
+    return (
+        f"Validated {measured} Korean prose blocks at or below 35 percent Latin; "
+        f"maximum ratio {maximum:.3f}; exclusions {exclusion_evidence}."
+    )
+
+
 def _validate_source(
     document: PdfDocument,
     source: PdfSourceRecord,
     source_pdf: assembly._OpenedFile,
-) -> None:
+) -> bytes:
     payload = assembly._read_opened_bytes(source_pdf, Path("source.pdf"), "PDF source")
     if source.sha256 != hashlib.sha256(payload).hexdigest():
         raise PdfQAFailure("source PDF hash does not match source.json")
     if source.byte_length != len(payload) or source.sha256 != document.source_sha256:
         raise PdfQAFailure("source/document PDF evidence does not agree")
+    return payload
 
 
 def _validate_contracts(
@@ -2153,8 +2790,13 @@ def _validate_pdf_structure(
         raise PdfQAFailure(f"cannot extract selectable text from staged PDF: {error}") from error
     if any(character in text for character in ("\ufffd", "\x00", "\u25a1")):
         raise PdfQAFailure("rendered PDF contains glyph replacement boxes")
+    toc_resolutions = {item.block_id: item for item in layout.toc_entries}
     for block, segment, translated in normalized:
-        expected = _normalize_text(translated)
+        expected = _normalize_text(
+            _toc_reconciled_translation(
+                block.id, translated, toc_resolutions.get(block.id)
+            )
+        )
         selected = _normalize_text("\n".join(block_text.get(block.id, [])))
         if expected not in selected:
             raise PdfQAFailure(
@@ -2168,6 +2810,28 @@ def _validate_pdf_structure(
         "page_count": len(reader.pages),
         "page_sizes": tuple(page_sizes),
     }
+
+
+def _toc_reconciled_translation(
+    block_id: str, translated: str, resolution: Any | None
+) -> str:
+    """Replace only a verified TOC terminal page token for selectability comparison."""
+    if (
+        resolution is None
+        or resolution.source_reference is None
+        or resolution.output_page is None
+    ):
+        return translated
+    pattern = re.compile(
+        rf"(?P<prefix>.*?)(?P<reference>{re.escape(resolution.source_reference)})\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.fullmatch(translated)
+    if match is None:
+        raise PdfQAFailure(
+            f"translated TOC source reference is missing before reconciliation: {block_id}"
+        )
+    return match.group("prefix") + str(resolution.output_page)
 
 
 def _require_embedded_font(

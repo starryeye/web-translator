@@ -334,7 +334,12 @@ def test_pdf_skill_requires_complete_strict_visual_review() -> None:
         "page_transitions",
         "clipping_overlap",
         "glyph_rendering",
-        "exactly the eight canonical dimensions",
+        "semantic_structure",
+        "toc_navigation",
+        "reference_formatting",
+        "text_image_separation",
+        "terminology_readability",
+        "exactly the thirteen canonical dimensions",
         "`pages_reviewed` is a sorted, unique integer array",
         "`contact_sheets_reviewed` maps each filename string to a sorted, unique integer array",
         "`unresolved_required` is a sorted, unique string array",
@@ -364,6 +369,11 @@ def test_pdf_skill_requires_complete_strict_visual_review() -> None:
         "page_transitions",
         "clipping_overlap",
         "glyph_rendering",
+        "semantic_structure",
+        "toc_navigation",
+        "reference_formatting",
+        "text_image_separation",
+        "terminology_readability",
     }
     assert schema["pages_reviewed"] == [1]
     assert all(type(page) is int for page in schema["pages_reviewed"])

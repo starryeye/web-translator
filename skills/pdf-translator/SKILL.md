@@ -252,9 +252,14 @@ in `qa-pages/` with `view_image`; do not infer visual quality from automated met
 inspect only a sample. Confirm the sheets collectively cover every rendered page exactly
 once, then inspect pages at higher detail when a contact sheet exposes a possible defect.
 
-Judge exactly the eight canonical dimensions: `heading_hierarchy`, `text_legibility`,
+Judge exactly the thirteen canonical dimensions: `heading_hierarchy`, `text_legibility`,
 `table_legibility`, `figure_caption_pairing`, `footnote_placement`, `page_transitions`,
-`clipping_overlap`, and `glyph_rendering`. Write `pdf-layout-review.json` with exactly the
+`clipping_overlap`, `glyph_rendering`, `semantic_structure`, `toc_navigation`,
+`reference_formatting`, `text_image_separation`, and `terminology_readability`. The five
+publication dimensions require page-specific evidence: opener and callout grouping,
+printed TOC pages and link destinations, separate hanging-indent references, selectable
+translated prose outside source artwork, and natural Korean terminology with protected
+content retained. Write `pdf-layout-review.json` with exactly the
 six top-level fields shown below. Copy `staged_pdf_sha256`, page coverage, and contact-sheet
 coverage exactly from the current `pdf-qa.json`; do not reuse the sample values. Every
 finding has exactly `verdict` and nonempty `evidence`. A verdict is only `pass` or
@@ -278,7 +283,12 @@ integers without quotation marks; never emit string-valued page arrays.
     "footnote_placement": {"verdict": "pass", "evidence": "Footnotes remain legible and associated with their page content."},
     "page_transitions": {"verdict": "pass", "evidence": "Paragraphs, lists, and sections transition coherently across pages."},
     "clipping_overlap": {"verdict": "pass", "evidence": "No text, table, figure, or footer is clipped or overlaps peer content."},
-    "glyph_rendering": {"verdict": "pass", "evidence": "Korean glyphs render without replacement boxes or corruption."}
+    "glyph_rendering": {"verdict": "pass", "evidence": "Korean glyphs render without replacement boxes or corruption."},
+    "semantic_structure": {"verdict": "pass", "evidence": "Page 1 opener, callout, and body structures retain their intended grouping."},
+    "toc_navigation": {"verdict": "pass", "evidence": "Page 1 printed TOC references match their linked output destinations."},
+    "reference_formatting": {"verdict": "pass", "evidence": "Reference entries remain separate, readable hanging-indent paragraphs."},
+    "text_image_separation": {"verdict": "pass", "evidence": "Translated prose remains selectable while source graph labels stay inside artwork."},
+    "terminology_readability": {"verdict": "pass", "evidence": "Korean technical prose uses the canonical first bilingual gloss and later Korean-only forms naturally."}
   },
   "unresolved_required": []
 }

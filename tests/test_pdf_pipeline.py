@@ -1898,9 +1898,17 @@ def test_pdf_manifest_schema_is_exact_and_report_contains_equivalent_evidence(
     }
     assert set(manifest["extraction"]) == {
         "layout_validation_counts",
+        "semantic_role_counts",
+        "toc_resolution_warnings",
         "warnings",
         "unreconstructed_links",
     }
+    assert manifest["extraction"]["semantic_role_counts"] == {
+        "body": len(json.loads(
+            (prepared_pdf_run.run_dir / "document.json").read_text(encoding="utf-8")
+        )["blocks"])
+    }
+    assert manifest["extraction"]["toc_resolution_warnings"] == []
     assert set(manifest["counts"]) == {
         "headings",
         "paragraphs",
@@ -1940,6 +1948,9 @@ def test_pdf_manifest_schema_is_exact_and_report_contains_equivalent_evidence(
     assert PdfFinalManifest.from_dict(manifest).to_dict() == manifest
 
     report = render_pdf_review_report(manifest)
+    assert "Terminology policy: korean-first-technical-terms / 2.0" in report
+    assert "role.body" in report
+    assert "TOC resolution warnings" in report
     canonical = report.split("```json\n", 1)[1].split("\n```", 1)[0]
     assert json.loads(canonical) == manifest
 
@@ -1959,6 +1970,12 @@ def test_pdf_manifest_schema_is_exact_and_report_contains_equivalent_evidence(
     ].pop()
     with pytest.raises(PdfQAFailure, match="dimensions are incomplete"):
         PdfFinalManifest.from_dict(invalid_review)
+
+    stale_visual = json.loads(json.dumps(manifest))
+    stale_visual["qa"]["visual"]["findings"].pop("semantic_structure")
+    stale_visual["qa"]["layout_findings"].pop("semantic_structure")
+    with pytest.raises(PdfQAFailure, match="thirteen canonical dimensions"):
+        PdfFinalManifest.from_dict(stale_visual)
 
 
 def test_pdf_manifest_and_report_preserve_complete_unreconstructed_link_evidence(
