@@ -817,6 +817,76 @@ def test_footnote_repeated_translated_marker_fails_closed(tmp_path: Path) -> Non
     assert not (run_dir / "layout.json").exists()
 
 
+def _competing_footnotes_run(tmp_path: Path, *, section_end: bool) -> tuple[Path, list[PdfBlock]]:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "body", "Owner 1"), (1, "body", "Owner 2"),
+        (1, "body", "1 " + " ".join(f"주석{n:04d}" for n in range(1600))),
+        (2 if section_end else 1, "body", "2 " + (
+            " ".join(f"절주석{n:04d}" for n in range(1000)) if section_end else "Short second note"
+        )),
+    ])
+    path = run_dir / "document.json"
+    document = PdfDocument.from_dict(json.loads(path.read_text()))
+    blocks = list(document.blocks)
+    for index in (0, 1):
+        blocks[index] = replace(blocks[index], destination=blocks[index + 2].id)
+        blocks[index + 2] = replace(blocks[index + 2], kind="footnote")
+    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    path = run_dir / "segments.jsonl"
+    segments = [replace(segment, semantic_type=blocks[index].kind)
+                for index, segment in enumerate(read_segments(path))]
+    path.unlink()
+    write_segments(path, segments)
+    return run_dir, blocks
+
+
+def test_competing_local_footnotes_share_first_part_capacity_with_each_marker(tmp_path: Path) -> None:
+    run_dir, blocks = _competing_footnotes_run(tmp_path, section_end=False)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    for owner, note in zip(blocks[:2], blocks[2:]):
+        owner_part = next(r for r in layout.flowables if r.block_id == owner.id)
+        note_parts = [r for r in layout.flowables if r.block_id == note.id]
+        assert note_parts[0].page_number == owner_part.page_number == 1
+        assert note_parts[0].footnote_ownership == "unique-source-marker"
+        assert [r.split_part for r in note_parts] == list(range(len(note_parts)))
+    with pdfplumber.open(output) as pdf:
+        text = " ".join(page.extract_text() for page in pdf.pages)
+    assert text.count("Short second note") == 1
+    for n in range(1600):
+        assert text.count(f"주석{n:04d}") == 1
+    first_parts = [r for r in layout.flowables if r.kind == "footnote" and r.page_number == 1]
+    assert len(first_parts) == 2
+    assert first_parts[0].bounds[1] >= first_parts[1].bounds[1] + first_parts[1].bounds[3]
+
+
+def test_local_continuations_keep_section_end_note_pages_mixed_until_body_finishes(tmp_path: Path) -> None:
+    run_dir, blocks = _competing_footnotes_run(tmp_path, section_end=True)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    local = [r for r in layout.flowables if r.block_id == blocks[2].id]
+    section = [r for r in layout.flowables if r.block_id == blocks[3].id]
+    assert len(section) > 1
+    assert local[0].page_number == 1
+    mixed = [note for note in local if any(body.page_number == note.page_number for body in section)]
+    assert any(note.split_part > 0 for note in mixed)
+    for note in mixed:
+        assert note.frame[3] <= 565.5 / 2
+        for body in section:
+            if body.page_number == note.page_number:
+                assert body.bounds[1] >= note.bounds[1] + note.bounds[3]
+    tails = [r for r in local if r.page_number > max(part.page_number for part in section)]
+    assert tails
+    assert all(r.frame[3] == 565.5 and r.bounds[1] + r.bounds[3] > 580 for r in tails)
+    with pdfplumber.open(output) as pdf:
+        tokens = " ".join(page.extract_text() for page in pdf.pages).split()
+    for prefix, count in (("주석", 1600), ("절주석", 1000)):
+        for n in range(count):
+            assert tokens.count(f"{prefix}{n:04d}") == 1
+    for parts in (local, section):
+        assert [r.split_part for r in parts] == list(range(len(parts)))
+
+
 def test_publication_nonconverging_index_is_bounded_and_never_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", "One entry")])
     monkeypatch.setattr(pdf_assemble_module._PublicationIndex, "isSatisfied", lambda self: False)

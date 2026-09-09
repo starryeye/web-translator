@@ -1420,8 +1420,10 @@ def _build_rich_document(
     def update_note_plan() -> bool:
         new_plan: dict[int, list[tuple[str, int, Paragraph, float]]] = {}
         body_last_page = max((record.page_number for record in records
-            if record.kind not in _IGNORED_KINDS | {"footnote"}), default=0)
+            if record.kind not in _IGNORED_KINDS and record.footnote_owner_id is None), default=0)
         owners_stable = True
+        pending_notes: dict[str, tuple[int, Paragraph, float]] = {}
+        first_part_reserves: dict[int, float] = {}
         for note_id in sorted(page_local_notes, key=lambda identifier: block_by_id[identifier].order):
             if note_id not in scheduled_note_pages:
                 raise PdfAssemblyError(f"footnote owner was not emitted: {note_id}")
@@ -1436,6 +1438,16 @@ def _build_rich_document(
             if page < owner_page_floors.get(owner, 0):
                 owners_stable = False
                 page = owner_page_floors[owner]
+            size = page_sizes.get(page, portrait_size)
+            _, height = paragraph.wrap(size[0] - left_margin - right_margin, size[1])
+            # ReportLab's paragraph split keeps at least two first lines, unless the
+            # whole note is shorter. Protect every first-part obligation up front.
+            minimum = min(height, footnote_style.leading * 2) + 2
+            pending_notes[note_id] = (page, paragraph, minimum)
+            first_part_reserves[page] = first_part_reserves.get(page, 0) + minimum
+
+        for note_id, (page, paragraph, minimum) in pending_notes.items():
+            first_part_reserves[page] -= minimum
             part = 0
             while paragraph is not None:
                 size = page_sizes.get(page, portrait_size)
@@ -1443,7 +1455,7 @@ def _build_rich_document(
                 body_height = size[1] - top_margin - bottom_margin
                 capacity = (body_height if page > body_last_page else body_height / 2) - 12.0
                 occupied = sum(h + (13.0 if p else 0) + 2 for _n, p, _f, h in new_plan.get(page, []))
-                available = capacity - occupied - (13.0 if part else 0) - 2
+                available = capacity - occupied - first_part_reserves.get(page, 0) - (13.0 if part else 0) - 2
                 _, height = paragraph.wrap(width, available)
                 if height <= available:
                     first, remainder = paragraph, None
@@ -1554,7 +1566,9 @@ def _build_rich_document(
         page_number = int(canvas.getPageNumber())
         page_sizes[page_number] = (width, height)
         base_frame = portrait_frame if orientation == "portrait" else landscape_frame
-        reserve = reserve_for(page_number)
+        # Body reflow may reach a page previously predicted to be a note-only tail.
+        # Leave mixed-page capacity until this pass proves body flow has finished.
+        reserve = min(reserve_for(page_number), base_frame[3] / 2)
         frame = _doc.pageTemplate.frames[0]
         frame._y1 = base_frame[1] + reserve
         frame._height = base_frame[3] - reserve
@@ -1627,6 +1641,13 @@ def _build_rich_document(
         page_number = int(canvas.getPageNumber())
         planned_parts = note_plan.get(page_number, [])
         if not planned_parts:
+            return
+        if page_number in note_only_pages and any(
+            record.page_number == page_number and record.kind not in _IGNORED_KINDS
+            and record.footnote_owner_id is None for record in records
+        ):
+            # This transient tail prediction was overtaken by actual body content.
+            # update_note_plan will allocate mixed-page parts on the next pass.
             return
         width, height = portrait_size if orientation == "portrait" else landscape_size
         note_height = (height - top_margin - bottom_margin
@@ -2004,7 +2025,8 @@ def _build_rich_document(
                 last_note_page=lambda: max(note_plan, default=0),
                 owner_page_floors=owner_page_floors,
                 body_frame=lambda frame: (
-                    (frame[0], frame[1] + reserve_for(pdf.page), frame[2], frame[3] - reserve_for(pdf.page))
+                    (frame[0], frame[1] + min(reserve_for(pdf.page), frame[3] / 2),
+                     frame[2], frame[3] - min(reserve_for(pdf.page), frame[3] / 2))
                     if frame in {portrait_frame, landscape_frame} else frame
                 ),
                 pagesize=(
