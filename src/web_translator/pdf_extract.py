@@ -369,7 +369,7 @@ def _attach_reference_continuations(blocks: Sequence[PdfBlock]) -> list[PdfBlock
         elif block.semantic_role == "reference-entry":
             if _REFERENCE_ENTRY_MARKER_PATTERN.match(block.source_text) is not None:
                 owner = block
-            elif owner is not None and block.page_number > owner.page_number:
+            elif owner is not None:
                 block = replace(block, continuation_of=owner.id)
         elif block.kind not in {"header", "footer", "page-number"}:
             owner = None
@@ -730,7 +730,55 @@ def _intersection_area(
     return width * height
 
 
+def _reference_core_lengths(blocks: Sequence[PdfBlock]) -> dict[str, int]:
+    """Locate citation cores logically, then project them onto physical fragments."""
+    groups: dict[str, list[PdfBlock]] = {}
+    for block in blocks:
+        if block.semantic_role == "reference-entry":
+            groups.setdefault(block.continuation_of or block.id, []).append(block)
+    lengths: dict[str, int] = {}
+    for fragments in groups.values():
+        text = " ".join(block.source_text for block in fragments)
+        annotation = re.search(r"\s+(?:Note|Annotation):\s*", text, re.IGNORECASE)
+        core_end = annotation.start() if annotation else len(text)
+        core = text[:core_end]
+        # Recognize ordering evidence, not a universal year-as-end delimiter.
+        # An author-(year) entry has a title clause and a publication clause;
+        # unknown extra prose still needs an explicit annotation boundary.
+        years = list(re.finditer(r"\b(?:18|19|20)\d{2}\b", core))
+        if not years and re.search(r"(?:https?://\S+|\bDOI:?\s*10\.\d+/\S+)[.)]*\s*$", core, re.I) is None:
+            raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+        if years:
+            tail = core[years[-1].end():]
+            tail = re.sub(r"(?:https?://\S+|(?:DOI|ISBN):?\s*\S+)", "", tail, flags=re.I)
+            author_year = re.search(r"\((?:18|19|20)\d{2}\)\.\s*", core)
+            title_publication = (
+                author_year is not None
+                and re.fullmatch(r'(?:(?:"[^"]+"|“[^”]+”)|[^.!?]+)\.\s+[^.!?]+\.?\s*', core[author_year.end():]) is not None
+            )
+            if re.search(r"[A-Za-z]", tail) and not title_publication:
+                raise PdfExtractionError(f"ambiguous bibliography annotation: {fragments[0].id}")
+        offset = 0
+        for block in fragments:
+            lengths[block.id] = max(0, min(len(block.source_text), core_end - offset))
+            offset += len(block.source_text) + 1
+    return lengths
+
+
+def _protect_reference_fragment(text: str, core_length: int) -> tuple[str, list[ProtectedToken]]:
+    if not core_length:
+        return protect_fragment(text)
+    suffix, protected = protect_fragment(text[core_length:])
+    shifted = {token.token: f"⟦WT:{index + 1:06d}⟧" for index, token in enumerate(protected)}
+    suffix = re.sub(r"⟦WT:\d{6}⟧", lambda match: shifted[match.group()], suffix)
+    return "⟦WT:000000⟧" + suffix, [
+        ProtectedToken(token="⟦WT:000000⟧", kind="bibliography", value=text[:core_length]),
+        *(replace(token, token=shifted[token.token]) for token in protected),
+    ]
+
+
 def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segment]]:
+    reference_lengths = _reference_core_lengths(blocks)
     target_kinds = {
         "heading",
         "paragraph",
@@ -765,7 +813,9 @@ def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segmen
         and (marker := _pdf_leading_marker_value(block.source_text)) is not None
     }
     for identifier, block in zip(identifiers, target_blocks, strict=True):
-        source_text, protected = protect_fragment(block.source_text)
+        source_text, protected = _protect_reference_fragment(
+            block.source_text, reference_lengths.get(block.id, 0)
+        )
         source_text, protected = _protect_pdf_numbers_and_markers(
             source_text,
             list(protected),

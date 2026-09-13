@@ -876,6 +876,31 @@ def test_toc_text_reconciliation_changes_only_verified_terminal_page_column() ->
     ) == "47개 사례를 검토한 장 제목 ... 3"
 
 
+@pytest.mark.parametrize(("selected", "matches"), [
+    ("점...과 제목 ........ 3", True),
+    ("점...과 제목........ 3", True),
+    ("점...과 제목 3", True),
+    ("점...과 제목 ........ 4", False),
+    ("점...과 제목 ........", False),
+    ("다른 제목 ........ 3", False),
+    ("점과 제목 ........ 3", False),
+    ("........ 3", False),
+])
+def test_selectable_toc_allows_only_terminal_generated_leaders(selected: str, matches: bool) -> None:
+    block = SimpleNamespace(id="pdf:page-0001:block-0001", semantic_role="toc-entry", source_text="Dots...and title 47")
+    resolution = SimpleNamespace(source_reference="47", output_page=3)
+    matcher = getattr(pdf_qa_module, "_selectable_translation_matches", None)
+    assert callable(matcher), "TOC selectability needs evidenced terminal leader reconciliation"
+    assert matcher(block, "점...과 제목 47", selected, resolution) is matches
+
+
+def test_selectable_non_toc_prose_does_not_ignore_punctuation() -> None:
+    block = SimpleNamespace(id="pdf:page-0001:block-0001", semantic_role="body")
+    matcher = getattr(pdf_qa_module, "_selectable_translation_matches", None)
+    assert callable(matcher)
+    assert not matcher(block, "점과 제목 3", "점과 제목 ........ 3", None)
+
+
 def test_prepare_pdf_qa_rejects_legacy_document_as_publication_evidence(
     assembled_pdf_run: PdfQARun,
 ) -> None:

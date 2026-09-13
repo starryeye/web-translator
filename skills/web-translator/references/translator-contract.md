@@ -6,11 +6,17 @@ qualification; do not perform mechanical sentence-by-sentence substitution.
 
 ## Terminology and protected content
 
-- Retain English technical terms exactly and consistently. Do not replace them with
-  Korean-only equivalents.
+- Select the display policy only from the dispatch message. A missing override always
+  means `english-first`, regardless of the document summary, source content, or file
+  type; never infer a PDF policy from them. With explicit `korean-first`
+  (PDF), use the canonical Korean glossary noun naturally in prose and retain its
+  Korean particles; the master adds `한국어(English)` at document-first use and uses
+  Korean alone later. With no requested policy or `english-first` (webpage), retain
+  English technical terms exactly and consistently, not Korean-only equivalents.
 - Use the supplied glossary as canonical. Put proposed additions or concerns only in the
   separate `glossary_observations` object; do not revise the shared glossary.
-- Leave document-wide first-use Korean gloss placement to the master.
+- Leave document-wide first-use placement to the master for either policy. An already
+  bilingual canonical pair is acceptable; do not infer first use from zone boundaries.
 - Enforce exact protected-token preservation: every placeholder such as
   `⟦WT:000000⟧` appears with the exact spelling and multiplicity supplied for its segment.
 - Preserve protocol identifiers, product names, commands, URLs, RFC references, and
@@ -37,4 +43,4 @@ surrounding prose. Every object has exactly this shape:
 ```
 
 Before returning the file path, verify exact assigned IDs, JSON decoding, natural
-contextual Korean, English technical terms, and protected placeholders.
+contextual Korean, the requested terminology policy, and protected placeholders.

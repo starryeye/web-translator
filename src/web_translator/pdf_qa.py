@@ -2808,12 +2808,21 @@ def _validate_pdf_structure(
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
             block_text: dict[str, list[str]] = {}
+            continuation_parts = {
+                (part.block_id, part.split_part, part.page_number)
+                for part in layout.footnote_continuations
+            }
             for item in layout.flowables:
                 page = pdf.pages[item.page_number - 1]
                 x, y, width, height = item.bounds
+                # The generated continuation label sits above the tracked source
+                # box. Padding can clip its descenders into the first source line.
+                top_padding = 0.0 if (
+                    item.block_id, item.split_part, item.page_number
+                ) in continuation_parts else 1.0
                 crop = (
                     max(0.0, x - 1.0),
-                    max(0.0, page.height - (y + height) - 1.0),
+                    max(0.0, page.height - (y + height) - top_padding),
                     min(page.width, x + width + 1.0),
                     min(page.height, page.height - y + 1.0),
                 )
@@ -2828,13 +2837,10 @@ def _validate_pdf_structure(
         raise PdfQAFailure("rendered PDF contains glyph replacement boxes")
     toc_resolutions = {item.block_id: item for item in layout.toc_entries}
     for block, segment, translated in normalized:
-        expected = _normalize_text(
-            _toc_reconciled_translation(
-                block, translated, toc_resolutions.get(block.id)
-            )
-        )
         selected = _normalize_text("\n".join(block_text.get(block.id, [])))
-        if expected not in selected:
+        if not _selectable_translation_matches(
+            block, translated, selected, toc_resolutions.get(block.id)
+        ):
             raise PdfQAFailure(
                 f"translated block is not selectable in the staged PDF: {segment.id}"
             )
@@ -2846,6 +2852,25 @@ def _validate_pdf_structure(
         "page_count": len(reader.pages),
         "page_sizes": tuple(page_sizes),
     }
+
+
+def _selectable_translation_matches(
+    block: Any, translated: str, selected: str, resolution: Any | None
+) -> bool:
+    expected = _normalize_text(_toc_reconciled_translation(block, translated, resolution))
+    selected = _normalize_text(selected)
+    if resolution is None or block.semantic_role not in _TOC_ROLES:
+        return expected in selected
+    reference = _validated_toc_source_reference(block, resolution)
+    if reference is None:
+        return expected in selected
+    page = str(resolution.output_page) if resolution.output_page is not None else reference
+    # ResolvedTocEntry renders an exact title, generated dot leaders, and the
+    # evidenced terminal page column. Only that inter-column area may differ.
+    title = re.sub(rf"\s*{re.escape(page)}$", "", expected).rstrip(" .·…")
+    return re.fullmatch(
+        rf"{re.escape(title)}(?:\s+|(?:\s*\.\s*)+){re.escape(page)}", selected
+    ) is not None
 
 
 def _toc_reconciled_translation(

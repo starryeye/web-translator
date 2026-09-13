@@ -237,6 +237,117 @@ def make_publication_structure_pdf(path: Path) -> Path:
     return path
 
 
+def run_publication_fixture_pipeline(tmp_path: Path) -> tuple[Path, Path]:
+    """Real deterministic source→publication path; reviewed translations are local data."""
+    from web_translator.cli import main
+    from web_translator.models import read_segments
+    from web_translator.protection import restore_tokens
+    from tests.test_pdf_qa import _write_passing_layout_review, _write_review
+
+    run_dir = tmp_path / ".web-translator" / "runs" / "publication"
+    output_dir = tmp_path / "translated-pdfs" / "publication"
+    run_dir.mkdir(parents=True)
+    output_dir.parent.mkdir()
+    front = make_publication_structure_pdf(tmp_path / "front.pdf")
+    callout = make_decorated_callout_pdf(tmp_path / "callout.pdf")
+    appendix = tmp_path / "appendix.pdf"
+    canvas = _deterministic_canvas(appendix)
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(72, 714, "Foundations of Reliable Systems")
+    canvas.drawString(72, 570, "Observing the Pipeline")
+    canvas.drawString(72, 510, "Publishing with Confidence")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 670, "Replication preserves the observations.")
+    canvas.drawString(72, 640, "Replication supports independent review.")
+    canvas.drawString(72, 610, "The following note records the review conditions")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(305, 615, "1")
+    note_sentence = "This extended note preserves every observation and qualification for independent review."
+    canvas.setFont("Helvetica", 4.5)
+    for index in range(30):
+        canvas.drawString(72, 178 - index * 4.5, ("1 " if index == 0 else "") + note_sentence + " " + note_sentence)
+    canvas.showPage()
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 714, "REFERENCES")
+    canvas.setFont("Helvetica", 8)
+    canvas.drawString(72, 674, '[1] A. Writer: "Data replication", Press, 2024. [2] B. Reader: "Reliable review", Press, 2025.')
+    canvas.drawString(72, 650, '[3] C. Author: "Evidence across formats",')
+    canvas.drawString(84, 638, 'Archive Press, 2026. Note: Replication preserves evidence.')
+    canvas.save()
+    writer = PdfWriter()
+    writer.append(front, pages=(0, 5))
+    writer.append(callout)
+    writer.append(appendix)
+    source = tmp_path / "publication.pdf"
+    with source.open("wb") as destination:
+        writer.write(destination)
+
+    def command(*arguments: str) -> None:
+        assert main([*arguments, "--run-dir", str(run_dir)]) == 0
+
+    command("pdf-acquire", str(source))
+    command("pdf-extract")
+    command("plan-zones")
+    _write_json(run_dir / "glossary.json", {"replication": "복제"})
+    (run_dir / "document-summary.txt").write_text("출판 구조와 검토 증거에 관한 결정적 시험 문서", encoding="utf-8")
+    command("prepare-assignments")
+    translations = []
+    for segment in read_segments(run_dir / "segments.jsonl"):
+        if not segment.target:
+            continue
+        source_text = restore_tokens(segment.source_text, segment.protected)
+        if source_text.startswith("1 " + note_sentence):
+            assert source_text == "1 " + " ".join([note_sentence] * 60)
+            translated = "1 " + " ".join(["이 확장된 각주는 독립적인 검토를 위해 모든 관찰 내용과 한정 조건을 빠짐없이 보존합니다."] * 60)
+        elif segment.protected and segment.protected[0].kind == "bibliography":
+            translated = source_text.replace("Note: Replication preserves evidence.", "주석: 복제는 증거를 보존합니다.")
+        else:
+            translated = _PUBLICATION_TRANSLATIONS[source_text]
+        for token in segment.protected:
+            assert token.value in translated
+            translated = translated.replace(token.value, token.token, 1)
+        translations.append({"segment_id": segment.id, "text": translated, "notes": None, "glossary_observations": {}})
+    (run_dir / "translations").mkdir()
+    (run_dir / "translations" / "zone-001.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in translations), encoding="utf-8"
+    )
+    command("validate-translations")
+    _write_review(run_dir)
+    command("pdf-assemble", "--output-dir", str(output_dir))
+    command("pdf-qa", "prepare", "--output-dir", str(output_dir))
+    _write_passing_layout_review(run_dir)
+    command("pdf-qa", "finalize", "--output-dir", str(output_dir))
+    return run_dir, output_dir
+
+
+_PUBLICATION_TRANSLATIONS = {
+    "CONTENTS": "목차",
+    "Foundations of Reliable Systems 1": "신뢰할 수 있는 시스템의 기초 1",
+    "Observing the Pipeline 17": "파이프라인 관찰 17",
+    "Publishing with Confidence 43": "확신을 갖고 출판하기 43",
+    "Foundations of Reliable Systems": "신뢰할 수 있는 시스템의 기초",
+    "Observing the Pipeline": "파이프라인 관찰",
+    "Publishing with Confidence": "확신을 갖고 출판하기",
+    "For everyone who preserves meaning across formats": "형식이 달라져도 의미를 보존하는 모든 분께",
+    "Structure makes difficult reading feel inevitable.": "구조는 어려운 글도 자연스럽게 읽히게 한다.",
+    "—A patient typesetter": "—인내심 있는 조판자",
+    "PART I": "제 I 부",
+    "THE SOURCE": "원본",
+    "CHAPTER 2": "제 2 장",
+    "READING THE PAGE": "페이지 읽기",
+    "Operational guidance": "운영 지침",
+    "Keep every selectable sentence available for translation. A decorative border provides emphasis around this prose. The small symbol belongs beside these explanatory lines. Source words and their geometry must remain unchanged.": "선택 가능한 문장은 모두 번역할 수 있어야 합니다. 장식 테두리는 이 글을 강조합니다. 작은 기호는 설명 문장 옆에 놓입니다. 원본 단어와 그 기하 정보는 변경하지 않아야 합니다.",
+    "Ordinary body begins after the indented callout has ended.": "들여쓴 설명 상자가 끝난 뒤에 일반 본문이 시작됩니다.",
+    "Figure 1. Measurements under controlled conditions show the changing rate across the complete observation period.": "그림 1. 통제된 조건에서 측정한 값은 전체 관찰 기간에 걸친 비율 변화를 보여줍니다.",
+    "This independent body paragraph must stay outside the caption.": "이 독립된 본문 단락은 캡션 밖에 유지되어야 합니다.",
+    "Replication preserves the observations.": "복제는 관찰 내용을 보존합니다.",
+    "Replication supports independent review.": "복제는 독립적인 검토를 지원합니다.",
+    "The following note records the review conditions 1": "다음 각주는 검토 조건을 기록합니다 1",
+    "Replication supports independent review. The following note records the review conditions 1": "복제는 독립적인 검토를 지원합니다. 다음 각주는 검토 조건을 기록합니다 1",
+    "REFERENCES": "참고 문헌",
+}
+
+
 def make_image_only_pdf(path: Path, *, pages: int = 1) -> Path:
     """Create pages whose dominant content is one full-page raster image."""
     image_path = path.with_suffix(".png")

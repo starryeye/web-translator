@@ -108,6 +108,24 @@ Regular and Bold fonts, prepares automated/rendered QA, and requires master insp
 every numbered contact sheet. Font licensing and source provenance are stored beside the
 package fonts in `src/web_translator/font_assets/OFL.txt` and `PROVENANCE.json`.
 
+The Korean edition preserves the source trim size and distinct publication structures:
+TOC hierarchy and output-page links, dedication and epigraph, part/chapter openers,
+selectable callouts with independent icons, figures and captions, hanging-indent
+references, and owner-linked footnote continuations. Source artwork stays intact while
+translated prose remains selectable. Technical prose uses `한국어(English)` at first use
+and Korean thereafter; protected products, code, identifiers, URLs, numbers, and citation
+facts stay exact. Genuine reference annotations remain translatable. The webpage
+workflow keeps its existing English-first policy and command selection.
+Citation protection is conservative: explicit `Note:`/`Annotation:` suffixes can be
+translated, while unclear citation/prose boundaries stop extraction with block evidence.
+The deterministic publication fixture and independent synthetic layouts are regression
+coverage, not a claim of acceptance across all real-world book or bibliography styles.
+
+PDF input is limited to 500 pages and 50 MiB. Scanned/image-only PDFs are rejected;
+there is no OCR fallback. Every run uses fresh paths without overwriting the source or
+previous outputs. Partial-input TOC destinations outside the supplied PDF remain visible
+with an unresolved-excerpt warning instead of a fabricated link.
+
 Only `pdf-qa finalize` publishes a successful output:
 
 ```text

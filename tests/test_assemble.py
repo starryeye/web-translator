@@ -95,6 +95,29 @@ def test_english_first_policy_remains_backward_compatible() -> None:
     assert actual[0].text == "OAuth(권한 위임)"
 
 
+def test_korean_only_translator_results_receive_first_pairs_without_changing_particles() -> None:
+    records = [
+        translation("a", f"복제는 내결함성을 향상시키지만, 복제만으로는 저장소가 모든 장애에서 살아남는다는 보장은 없다. {TOKEN}를 사용한다."),
+        translation("b", "내결함성은 장애 모델에 달려 있다. 복제는 지연 시간을 늘릴 수 있으며, 저장소 비용도 증가할 수 있다."),
+    ]
+    glossary = {"replication": "복제", "fault tolerance": "내결함성", "storage": "저장소"}
+    metadata = {"a": [ProtectedToken(TOKEN, "product", "PostgreSQL")]}
+    once = normalize_terminology(records, glossary, policy="korean-first", protected_by_segment=metadata)
+    assert [r.text for r in once] == [
+        f"복제(replication)는 내결함성(fault tolerance)을 향상시키지만, 복제만으로는 저장소(storage)가 모든 장애에서 살아남는다는 보장은 없다. {TOKEN}를 사용한다.",
+        records[1].text,
+    ]
+    assert normalize_terminology(once, glossary, policy="korean-first", protected_by_segment=metadata) == once
+    assert normalize_terminology(records, glossary, policy="english-first", protected_by_segment=metadata) == records
+
+
+def test_korean_gloss_matching_prefers_longest_and_rejects_word_substrings() -> None:
+    records = [translation("a", "복제본과 비복제는 다르다. 데이터 복제를 설명한다. 복제도 필요하다.")]
+    actual = normalize_terminology(records, {"data replication": "데이터 복제", "replication": "복제"}, policy="korean-first")
+    assert actual[0].text == "복제본과 비복제는 다르다. 데이터 복제(data replication)를 설명한다. 복제(replication)도 필요하다."
+    assert normalize_terminology(actual, {"data replication": "데이터 복제", "replication": "복제"}, policy="korean-first") == actual
+
+
 def test_first_use_keeps_digit_bearing_technical_term_compatibility() -> None:
     actual = normalize_first_use(
         [translation("a", "HTML5 evolves.")],
@@ -102,6 +125,15 @@ def test_first_use_keeps_digit_bearing_technical_term_compatibility() -> None:
     )
 
     assert actual[0].text == "HTML5(HTML5 표준) evolves."
+
+
+def test_ambiguous_korean_aliases_require_choice_only_for_reverse_lookup() -> None:
+    glossary = {"replication": "복제", "copying": "복제"}
+    with pytest.raises(TerminologyError, match="ambiguous Korean glossary form"):
+        normalize_terminology([translation("a", "복제는 필요하다.")], glossary, policy="korean-first")
+    assert normalize_terminology([translation("a", "replication 기능")], glossary, policy="korean-first")[0].text == "복제(replication) 기능"
+    assert normalize_terminology([translation("a", "복제(replication)는 필요하다.")], glossary, policy="korean-first")[0].text == "복제(replication)는 필요하다."
+    assert normalize_first_use([translation("a", "복제는 필요하다.")], glossary)[0].text == "복제는 필요하다."
 
 
 def test_korean_first_is_idempotent_for_preexisting_korean_first_pair() -> None:

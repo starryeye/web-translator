@@ -98,6 +98,7 @@ preserving spaces and non-ASCII characters.
 
    - the absolute immutable assignment package path;
    - the absolute `translator-contract.md` path, which the agent must read completely;
+   - the explicit terminology display policy `english-first`;
    - one absolute destination: `translations/<zone-id>.jsonl`; and
    - the requirement to return only that path plus a short ambiguity note.
 

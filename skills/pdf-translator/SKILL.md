@@ -18,6 +18,16 @@ Before semantic review, read the shared
 same contracts used by HTML translation; do not invent a separate PDF translation
 contract or copy the reference files into this skill.
 
+The Korean edition preserves the source trim size with embedded Korean fonts and
+selectable body, callout, caption, and reference text. TOC hierarchy and resolved output
+links, dedication, epigraph, part/chapter openers, independent icons, figures/captions,
+separate hanging-indent references, and owned footnote continuations remain distinct
+structures. Partial-input TOC destinations outside the source stay visible as warnings.
+Use the shared `korean-first` policy: `한국어(English)` once at document-first use, then
+canonical Korean reuse. Bibliographic names, titles, identifiers, publication facts,
+products, code, protocol keywords, acronyms, URLs, and numbers remain protected exactly;
+translate genuine reference annotations, not the citation core.
+
 ## Platform execution contract
 
 Detect the active OS and shell yourself. Never ask the user to choose a platform.
@@ -179,7 +189,7 @@ Apply these requirements at each stage:
 1. After `pdf-extract`, read `document.json`, `segments.jsonl`, and every `zones/*.json`
    after zone planning. Treat each PDF locator as opaque. Build one concise document
    outline and the same document summary for every translator. Write that summary to
-   `document-summary.txt` and write `glossary.json` as the canonical mapping of retained
+   `document-summary.txt` and write `glossary.json` as the canonical mapping of
    English technical terms to Korean glosses. Preserve the exact target partition:
    every target `Segment` ID appears once, no context ID becomes a target, and no target
    is added or removed.
@@ -193,7 +203,7 @@ Apply these requirements at each stage:
    with `fork_turns="none"` and `reasoning_effort="medium"`; queue remaining zones. Each
    fresh agent receives only the absolute immutable assignment-package path, the absolute
    shared translator-contract path, one absolute destination
-   `translations/<zone-id>.jsonl`, and a request to return that path plus a short ambiguity
+   `translations/<zone-id>.jsonl`, the explicit display policy `korean-first`, and a request to return that path plus a short ambiguity
    note. Require one zone result file per fresh agent identity. Translators must not edit
    source evidence, shared context, another zone, or aggregate files.
 

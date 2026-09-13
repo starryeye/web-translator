@@ -710,6 +710,34 @@ def test_heading_classification_ignores_subpixel_font_size_jitter() -> None:
     assert [line.kind for line in classified] == ["paragraph", "paragraph"]
 
 
+@pytest.mark.parametrize(("body_size", "note_size", "page_height"), [(12, 7, 600), (9, 5, 400)])
+@pytest.mark.parametrize("owned", [True, False])
+def test_body_font_estimation_excludes_only_owned_smaller_edge_notes(
+    body_size: int, note_size: int, page_height: int, owned: bool,
+) -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    words = [
+        _word("A real heading", x0=20, x1=160, top=10, bottom=10 + body_size + 4, size=body_size + 4, fontname="Helvetica-Bold"),
+        _word("Ordinary prose with a note", x0=20, x1=160, top=50, bottom=50 + body_size, size=body_size),
+        _word("Further ordinary prose", x0=20, x1=160, top=80, bottom=80 + body_size, size=body_size),
+    ]
+    if owned:
+        words.append(_word("2", x0=162, x1=166, top=48, bottom=48 + note_size, size=note_size))
+    for index in range(8):
+        top = page_height * 0.8 + index * (note_size + 2)
+        words.append(_word(
+            ("2 " if index == 0 else "") + "Dense smaller text with independent observations. " * 4,
+            x0=20, x1=190, top=top, bottom=top + note_size, size=note_size,
+        ))
+    lines = [line.with_page_geometry(240, page_height) for line in group_words_into_lines(words)]
+    result = classify_document_lines([(lines, float(page_height))])[0]
+    assert result[0].kind == "heading"
+    ordinary = next(line for line in result if line.text.startswith("Further ordinary"))
+    assert ordinary.kind == ("paragraph" if owned else "heading")
+    assert all(line.kind == "paragraph" for line in result if line.text.startswith("Dense smaller"))
+
+
 @pytest.mark.parametrize("styled_position", ["first", "last"])
 def test_styled_ordered_list_edge_uses_tight_same_indent_peer_context(
     styled_position: str,
@@ -1609,6 +1637,130 @@ def test_extract_pdf_preserves_publication_semantic_roles(tmp_path: Path) -> Non
         "Layout Review Quarterly 18(2), 2025.",
         second_reference.id,
     )
+
+
+def test_reference_inline_and_adjacent_markers_keep_exact_text_geometry(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import extract_pdf
+    from reportlab.pdfgen.canvas import Canvas
+
+    path = tmp_path / "references.pdf"
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 720, "REFERENCES")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(72, 680, '[1] A. Writer: "Data replication", Example Press, 2024. [2] B. Reader: "Models [8] A. Title", Example Press, 2025.')
+    canvas.drawString(72, 666, '[3] C. Author: "Evidence", Example Press, 2026.')
+    canvas.drawString(80, 656, 'Note: See [7] for details.')
+    canvas.save()
+    document = extract_pdf(path, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    entries = [b for b in document.blocks if b.semantic_role == "reference-entry"]
+    assert [b.source_text for b in entries] == [
+        '[1] A. Writer: "Data replication", Example Press, 2024.',
+        '[2] B. Reader: "Models [8] A. Title", Example Press, 2025.',
+        '[3] C. Author: "Evidence", Example Press, 2026. Note: See [7] for details.',
+    ]
+    assert entries[0].bbox[2] < entries[1].bbox[2]
+    assert all(b.segment_id for b in entries)
+
+
+@pytest.mark.parametrize("citation", [
+    '[1] A. Writer: “Data replication”, Example Press, 2024.',
+    '[1] A. Writer: "Data replication". https://example.com/replication',
+    '[1] A. Writer: "Data replication". DOI: 10.1234/replication',
+    '[1] Ada North. Data replication. Archive Press, 2024. DOI: 10.1234/replication ISBN: 978-1-234-56789-0',
+    '[1] Writer, A. (2024). Data replication. Example Press.',
+    '[1] Research Council (2024). Data replication. Example Press.',
+    '[1] Aristotle (2024). Data replication. Example Press.',
+])
+def test_reference_core_is_opaque_before_translation_and_normalization(citation: str) -> None:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_block
+    from web_translator.pdf_extract import _build_segments
+    from web_translator.models import Translation
+    from web_translator.protection import restore_tokens
+    from web_translator.terminology import normalize_terminology
+
+    raw = citation + " Note: replication reduces risk."
+    _, segments = _build_segments([replace(make_pdf_block(semantic_role="reference-entry"), source_text=raw)])
+    segment = segments[0]
+    assert citation in [token.value for token in segment.protected]
+    assert "replication reduces risk." in segment.source_text
+    translated = segment.source_text.replace("Note: replication reduces risk.", "주석: 복제는 위험을 줄인다.")
+    normalized = normalize_terminology([Translation(segment.id, translated)], {"replication": "복제"}, policy="korean-first", protected_by_segment={segment.id: segment.protected})
+    assert restore_tokens(normalized[0].text, segment.protected) == citation + " 주석: 복제(replication)는 위험을 줄인다."
+
+
+def test_reference_inline_backward_wrap_uses_linked_nonoverlapping_fragments(tmp_path: Path) -> None:
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.models import read_segments
+    from web_translator.protection import restore_tokens
+
+    path = tmp_path / "inline-wrap.pdf"
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 720, "REFERENCES")
+    canvas.setFont("Helvetica", 8)
+    canvas.drawString(72, 680, '[1] A. Writer: "Data replication", Press, 2024. [2] B. Reader: "Distributed')
+    canvas.drawString(80, 669, 'replication", Archive Press, 2025. Note: Useful replication evidence.')
+    canvas.save()
+    document = extract_pdf(path, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    entries = [b for b in document.blocks if b.semantic_role == "reference-entry"]
+    assert [b.source_text for b in entries] == [
+        '[1] A. Writer: "Data replication", Press, 2024.',
+        '[2] B. Reader: "Distributed',
+        'replication", Archive Press, 2025. Note: Useful replication evidence.',
+    ]
+    assert entries[2].continuation_of == entries[1].id
+    assert entries[0].bbox[2] <= entries[1].bbox[0]
+    assert entries[0].bbox[3] <= entries[2].bbox[1]
+    segments = {s.id: s for s in read_segments(tmp_path / "segments.jsonl")}
+    for entry in entries:
+        segment = segments[entry.segment_id]
+        assert restore_tokens(segment.source_text, segment.protected) == entry.source_text
+    assert segments[entries[1].segment_id].protected[0].value == '[2] B. Reader: "Distributed'
+    assert segments[entries[2].segment_id].protected[0].value == 'replication", Archive Press, 2025.'
+    assert "Useful replication evidence." in segments[entries[2].segment_id].source_text
+
+
+@pytest.mark.parametrize("raw", [
+    '[1] A. Writer: "Data replication", Example Press, 2024. This explains replication.',
+    '[1] This explains replication without identifiable publication facts.',
+    '[1] Writer, A. (2024). Systems. Example Press. This explains replication.',
+    '[1] Writer. Systems. https://example.com/systems This explains replication.',
+])
+def test_reference_unmarked_annotation_fails_with_block_evidence(raw: str) -> None:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_block
+    from web_translator.pdf_extract import _build_segments
+
+    block = replace(make_pdf_block(semantic_role="reference-entry"), source_text=raw)
+    with pytest.raises(PdfExtractionError, match="ambiguous bibliography.*page-0001:block-0001"):
+        _build_segments([block])
+
+
+@pytest.mark.parametrize("second", [
+    '[2] Research Council. "Shared systems", Archive Press, 2025.',
+    '[2] Aristotle. "Shared systems", Archive Press, 2025.',
+    '[2] Writer, A. (2025). Shared systems. Archive Press.',
+    '[2] Council. Shared systems. Archive Press, 2025.',
+])
+def test_inline_reference_boundaries_do_not_depend_on_author_spelling(tmp_path: Path, second: str) -> None:
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_extract import extract_pdf
+
+    path = tmp_path / "author-forms.pdf"
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 720, "REFERENCES")
+    canvas.setFont("Helvetica", 6)
+    first = '[1] Council. "Methods [8] A. Example", Archive Press, 2024.'
+    canvas.drawString(72, 680, first + " " + second)
+    canvas.drawString(72, 660, '[3] Review Group. "Evidence", Archive Press, 2026. Note: See [7] for details.')
+    canvas.save()
+    document = extract_pdf(path, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    entries = [b.source_text for b in document.blocks if b.semantic_role == "reference-entry"]
+    assert entries == [first, second, '[3] Review Group. "Evidence", Archive Press, 2026. Note: See [7] for details.']
 
 
 def test_semantic_classification_preserves_mixed_toc_hierarchy_and_continuation() -> None:

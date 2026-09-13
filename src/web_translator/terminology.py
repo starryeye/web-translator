@@ -13,6 +13,8 @@ from web_translator.models import ProtectedToken, Translation
 _TOKEN_PATTERN = re.compile(r"⟦WT:\d{6}⟧")
 _KOREAN_PATTERN = re.compile(r"[가-힣]")
 _IDENTIFIER_CHARACTER = r"A-Za-z0-9_"
+# Exact noun glosses may be followed by particles, not arbitrary Korean word tails.
+_KOREAN_GLOSS_END = r"(?=(?:(?:만으로|으로|에서|에게|부터|까지|처럼|보다|와|과|을|를|이|가|은|는|의|에|로|도|만)(?:는|은|도|만)?){0,2}(?![\w]))"
 
 
 class TerminologyError(ValueError):
@@ -190,7 +192,7 @@ def _normalize_record(
             start = found + 1
 
     candidates: list[
-        tuple[int, int, str, list[tuple[int, int]], Literal["pair", "term"]]
+        tuple[int, int, str, list[tuple[int, int]], Literal["pair", "term", "gloss"]]
     ] = [
         (start, end, term, [], "pair") for start, end, term in pairs
     ]
@@ -219,6 +221,24 @@ def _normalize_record(
                 (*match_range, term, exact_gloss_ranges, "term")
             )
 
+    if suppress_numeric_values:
+        # Korean-only translator output still participates in document-wide first
+        # use. Prefer the longest canonical noun and never inspect opaque values.
+        for term, gloss in sorted(canonical.items(), key=lambda item: -len(item[1])):
+            if _is_numeric_value(term):
+                continue
+            pattern = re.compile(rf"(?<![\w]){re.escape(gloss)}{_KOREAN_GLOSS_END}")
+            for match in pattern.finditer(projected):
+                if any(match.start() < end and start < match.end()
+                       for start, end, *_ in candidates):
+                    continue
+                if any(match.start() < end and start < match.end()
+                       for start, end in ignored_ranges):
+                    continue
+                if sum(value == gloss for value in canonical.values()) != 1:
+                    raise TerminologyError(f"ambiguous Korean glossary form: {gloss!r}")
+                candidates.append((match.start(), match.end(), term, [], "gloss"))
+
     replacements: list[tuple[int, int, str]] = []
     for start, end, term, gloss_ranges, kind in sorted(candidates):
         gloss = canonical[term]
@@ -228,7 +248,7 @@ def _normalize_record(
             original_positions, start, end, len(text)
         )
         source_fragment = text[original_start:original_end]
-        if kind == "pair":
+        if kind in {"pair", "gloss"}:
             canonical_first = first_format(term, gloss)
             if first_occurrence and projected[start:end] == canonical_first:
                 replacement = source_fragment

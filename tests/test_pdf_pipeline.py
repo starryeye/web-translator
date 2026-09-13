@@ -55,6 +55,48 @@ def _pdf_cli_paths(tmp_path: Path, run_id: str = "run") -> tuple[Path, Path]:
     run_dir.mkdir(parents=True, exist_ok=True)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     return run_dir, output_dir
+
+
+def test_publication_fixture_publishes_exact_artifacts_with_semantics(tmp_path: Path) -> None:
+    runner = getattr(pdf_fixtures, "run_publication_fixture_pipeline", None)
+    assert callable(runner), "deterministic publication fixture pipeline is missing"
+    run_dir, output_dir = runner(tmp_path)
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        "manifest.json", "review-report.md", "translated.pdf",
+    ]
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    roles = manifest["extraction"]["semantic_role_counts"]
+    assert roles["toc-entry"] == 3
+    assert roles["reference-entry"] == 3
+    for role in ("dedication", "epigraph", "epigraph-attribution", "part-label",
+                 "part-title", "chapter-label", "chapter-title", "callout-title", "callout-body"):
+        assert roles[role] >= 1
+    assert manifest["translation"]["terminology"]["policy_id"] == "korean-first-technical-terms"
+    document = json.loads((run_dir / "document.json").read_text())
+    ordinary = [block for block in document["blocks"] if any(
+        phrase in block["source_text"] for phrase in (
+            "Replication preserves the observations.",
+            "Replication supports independent review.",
+            "Ordinary body begins after the indented callout has ended.",
+            "This independent body paragraph must stay outside the caption.",
+        )
+    )]
+    assert ordinary and all(block["kind"] == "paragraph" and not block["style"]["bold"] for block in ordinary)
+    layout = json.loads((run_dir / "layout.json").read_text())
+    assert len([b for b in document["blocks"] if b["kind"] == "figure"]) == 2
+    assert len([b for b in document["blocks"] if b["kind"] == "caption"]) == 1
+    assert layout["footnote_continuations"]
+    reader = PdfReader(output_dir / "translated.pdf")
+    assert all(tuple(float(v) for v in page.mediabox) == (0, 0, 612, 792) for page in reader.pages)
+    text = " ".join(page.extract_text() or "" for page in reader.pages)
+    assert text.count("복제(replication)") == 1
+    assert "복제는" in text
+    assert "운영 지침" in text and "선택 가능한 문장" in text
+    assert 'Data replication' in text
+    assert "각주 계속" in text
+    assert text.count("이 확장된 각주는 독립적인 검토를 위해") == 60
+
+
 _SEMANTIC_ORACLE = {
     "technical-document-v1": {
         "Deterministic Systems Review": "결정론적 시스템 검토",

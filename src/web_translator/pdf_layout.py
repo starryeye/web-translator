@@ -541,8 +541,9 @@ def classify_document_lines(
 
     sizes: Counter[int] = Counter()
     for lines in normalized:
-        for line in lines:
-            if line.kind is None:
+        note_lines = _owned_edge_note_lines(lines)
+        for index, line in enumerate(lines):
+            if line.kind is None and index not in note_lines:
                 sizes[font_size_bucket(line.size)] += line.character_count
     body_size = max(sizes, key=lambda size: (sizes[size], -size)) if sizes else 0
     heading_sizes = sorted(
@@ -585,6 +586,43 @@ def classify_document_lines(
                 classified.append(replace(line, kind="paragraph"))
         result.append(classified)
     return result
+
+
+def _owned_edge_note_lines(lines: Sequence[PdfLine]) -> set[int]:
+    """Exclude evidenced note runs only from the body-font vote, not extraction."""
+    ordinary = [line for line in lines if line.kind is None and not line.bold
+                and line.page_height is not None and line.top < line.page_height * 0.75]
+    sizes: Counter[int] = Counter()
+    for line in ordinary:
+        sizes[font_size_bucket(line.size)] += line.character_count
+    if not sizes:
+        return set()
+    ordinary_size = max(sizes, key=lambda size: (sizes[size], -size))
+    excluded: set[int] = set()
+    previous: PdfLine | None = None
+    for index, line in enumerate(lines):
+        if (line.kind is not None or line.page_height is None
+                or line.top < line.page_height * 0.75
+                or line.size > ordinary_size * 0.85):
+            previous = None
+            continue
+        marker = _leading_footnote_marker(line.text)
+        owned = marker is not None and any(
+            owner.top < line.top and owner.size > line.size
+            and len(owner.words) > 1
+            and any(_normalized_marker(word.text) == marker
+                    and word.size <= owner.size * 0.85 for word in owner.words)
+            for owner in ordinary
+        )
+        continues = (marker is None and previous is not None
+                     and abs(previous.size - line.size) <= 0.5
+                     and _paragraphs_are_contiguous(previous, line))
+        if owned or continues:
+            excluded.add(index)
+            previous = line
+        else:
+            previous = None
+    return excluded
 
 
 def classify_semantic_roles(
@@ -1337,6 +1375,14 @@ def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLin
         and (line.bold or line.size >= 14.0)
     ]
     for heading_page, heading_line in headings:
+        # Split only within a references section, at intact source-word boundaries.
+        # Quotes and cross-reference markers are not evidence of a new citation.
+        for page_index in range(heading_page, len(result)):
+            start = heading_line + 1 if page_index == heading_page else 0
+            expanded = result[page_index][:start]
+            for line in result[page_index][start:]:
+                expanded.extend(_split_inline_references(line))
+            result[page_index] = expanded
         candidates: list[tuple[int, int]] = []
         marker_count = 0
         stopped = False
@@ -1379,6 +1425,27 @@ def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLin
                     line, semantic_role="reference-entry"
                 )
     return result
+
+
+def _split_inline_references(line: PdfLine) -> list[PdfLine]:
+    starts = [0]
+    quoted = False
+    for index, word in enumerate(line.words):
+        if index and not quoted and re.fullmatch(r"\[\d+\]|\d+[.)]", word.text):
+            preceding = " ".join(item.text for item in line.words[starts[-1]:index])
+            tail = " ".join(item.text for item in line.words[index:])
+            # A completed citation followed by a new author/title start is
+            # evidence independent of how many words the author name contains.
+            citation_end = re.search(r"(?:\b(?:18|19|20)\d{2}[.)]*|https?://\S+|\bDOI:?\s*10\.\S+)\s*$", preceding, re.I)
+            citation_start = re.match(r'(?:\[\d+\]|\d+[.)])\s+[^\d\[\]]+?(?:[.:]\s+["“]|\(\d{4}\)\.)', tail)
+            complete_citation = re.match(r"(?:\[\d+\]|\d+[.)])\s+[^\d\[\]]+[.:]\s+.+(?:\b(?:18|19|20)\d{2}\b|https?://|\bDOI:)", tail)
+            if citation_end and (citation_start or complete_citation):
+                starts.append(index)
+        for character in word.text:
+            if character in {'"', '“', '”'}:
+                quoted = not quoted
+    ends = starts[1:] + [len(line.words)]
+    return [replace(line, words=line.words[start:end]) for start, end in zip(starts, ends)]
 
 
 def _edge_band(line: PdfLine) -> str | None:
@@ -1437,6 +1504,12 @@ def merge_contiguous_paragraph_lines(
                 or continues_reference
             )
             and merged[-1][1][-1].semantic_role == line.semantic_role
+            and not (line.semantic_role == "reference-entry"
+                     and _REFERENCE_MARKER_PATTERN.match(line.text) is not None)
+            # A backward wrap after an inline entry is L-shaped, not one box.
+            # Keep page-local fragments; extraction links their logical owner.
+            and not (continues_reference
+                     and line.x0 < merged[-1][1][-1].x0 - line.size)
             and not line.semantic_role.startswith("toc-")
             and _paragraphs_are_contiguous(merged[-1][1][-1], line)
             and not _source_paragraph_gap(classified, index)
