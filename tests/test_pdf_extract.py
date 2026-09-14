@@ -1663,6 +1663,47 @@ def test_reference_inline_and_adjacent_markers_keep_exact_text_geometry(tmp_path
     assert all(b.segment_id for b in entries)
 
 
+@pytest.mark.parametrize("check", ["headings", "section-boundary"])
+def test_reference_inline_expansion_keeps_multiple_headings_and_section_boundaries(tmp_path: Path, check: str) -> None:
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.protection import restore_tokens
+
+    path = tmp_path / "reference-sections.pdf"
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    citations = [
+        '[1] A. Writer: "Systems", Press, 2024.',
+        '[2] B. Reader: "Methods", Press, 2025.',
+        '[1] C. Author: "Review", Press, 2023.',
+        '[2] D. Author: "Evidence", Press, 2022.',
+    ]
+    outside = '[1] E. Author: "Example", Press, 2021. [2] F. Author: "Example", Press, 2020.'
+    for heading, y in [("REFERENCES", 720), ("BIBLIOGRAPHY", 600), ("APPENDIX", 480)]:
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.drawString(72, y, heading)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawString(72, 680, " ".join(citations[:2]))
+    canvas.drawString(72, 560, citations[2])
+    canvas.drawString(72, 540, citations[3])
+    canvas.drawString(72, 440, outside)
+    canvas.save()
+    document = extract_pdf(path, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    if check == "section-boundary":
+        assert [(b.source_text, b.semantic_role) for b in document.blocks[-2:]] == [("APPENDIX", "body"), (outside, "body")]
+    assert [b.source_text for b in document.blocks if b.semantic_role == "reference-heading"] == ["REFERENCES", "BIBLIOGRAPHY"]
+    entries = [b for b in document.blocks if b.semantic_role == "reference-entry"]
+    assert [b.source_text for b in entries] == citations
+    assert entries[0].bbox[2] <= entries[1].bbox[0]
+    assert all(b.continuation_of is None for b in entries)
+    assert [(b.source_text, b.semantic_role) for b in document.blocks[-2:]] == [("APPENDIX", "body"), (outside, "body")]
+    segments = {s.id: s for s in read_segments(tmp_path / "segments.jsonl")}
+    for entry in entries:
+        segment = segments[entry.segment_id]
+        assert segment.protected[0].value == entry.source_text
+        assert segment.protected[0].kind == "bibliography"
+        assert restore_tokens(segment.source_text, segment.protected) == entry.source_text
+
+
 @pytest.mark.parametrize("citation", [
     '[1] A. Writer: “Data replication”, Example Press, 2024.',
     '[1] A. Writer: "Data replication". https://example.com/replication',
@@ -1671,6 +1712,11 @@ def test_reference_inline_and_adjacent_markers_keep_exact_text_geometry(tmp_path
     '[1] Writer, A. (2024). Data replication. Example Press.',
     '[1] Research Council (2024). Data replication. Example Press.',
     '[1] Aristotle (2024). Data replication. Example Press.',
+    '[1] A. Writer: "2024 Note: Data replication", Example Press, 2025.',
+    '[1] Research Council: “2024 Annotation: Data replication”, Example Press, 2025.',
+    '[1] Council. 2024 Data replication. Archive Press, 2025.',
+    '[1] Council. Data replication in 2024. Archive Press, 2025.',
+    '[1] A. Writer. Data replication in 2024. Example Press, 2025.',
 ])
 def test_reference_core_is_opaque_before_translation_and_normalization(citation: str) -> None:
     from dataclasses import replace
@@ -1723,11 +1769,49 @@ def test_reference_inline_backward_wrap_uses_linked_nonoverlapping_fragments(tmp
     assert "Useful replication evidence." in segments[entries[2].segment_id].source_text
 
 
+@pytest.mark.parametrize("annotation", ["Note", "Annotation"])
+def test_reference_quoted_annotation_across_physical_fragments(tmp_path: Path, annotation: str) -> None:
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.protection import restore_tokens
+
+    path = tmp_path / "quoted-wrap.pdf"
+    canvas = Canvas(str(path), pagesize=(612, 792))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 720, "REFERENCES")
+    canvas.setFont("Helvetica", 8)
+    first = '[1] A. Writer: "Systems", Press, 2023.'
+    opening = '[2] B. Reader: "2024'
+    closing = f'{annotation}: Data replication", Archive Press, 2025.'
+    suffix = f" {annotation}: Useful replication evidence."
+    canvas.drawString(72, 680, first + " " + opening)
+    canvas.drawString(80, 669, closing + suffix)
+    canvas.save()
+    document = extract_pdf(path, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    entries = [b for b in document.blocks if b.semantic_role == "reference-entry"]
+    assert [b.source_text for b in entries] == [first, opening, closing + suffix]
+    assert entries[2].continuation_of == entries[1].id
+    assert entries[0].bbox[2] <= entries[1].bbox[0]
+    assert entries[0].bbox[3] <= entries[2].bbox[1]
+    segments = {s.id: s for s in read_segments(tmp_path / "segments.jsonl")}
+    for entry, core in zip(entries, [first, opening, closing], strict=True):
+        segment = segments[entry.segment_id]
+        assert restore_tokens(segment.source_text, segment.protected) == entry.source_text
+        assert segment.protected[0].kind == "bibliography"
+        assert segment.protected[0].value == core
+    assert suffix in segments[entries[2].segment_id].source_text
+
+
 @pytest.mark.parametrize("raw", [
     '[1] A. Writer: "Data replication", Example Press, 2024. This explains replication.',
     '[1] This explains replication without identifiable publication facts.',
     '[1] Writer, A. (2024). Systems. Example Press. This explains replication.',
     '[1] Writer. Systems. https://example.com/systems This explains replication.',
+    '[1] A. Writer: "Data replication", Example Press, 2024. This explains replication in 2025.',
+    '[1] Writer, A. (2024). Systems. Example Press. This explains replication in 2025.',
+    '[1] Writer. Systems. https://example.com/systems This explains replication in 2025.',
+    '[1] Council. 2024 Data replication. Archive Press, 2025. This explains replication in 2026.',
+    '[1] Council. Data replication in 2024. Archive Press, 2025. This explains replication in 2026.',
 ])
 def test_reference_unmarked_annotation_fails_with_block_evidence(raw: str) -> None:
     from dataclasses import replace

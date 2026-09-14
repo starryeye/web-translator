@@ -894,6 +894,28 @@ def test_selectable_toc_allows_only_terminal_generated_leaders(selected: str, ma
     assert matcher(block, "점...과 제목 47", selected, resolution) is matches
 
 
+@pytest.mark.parametrize("punctuation", ["…", "·", ".", "..."])
+@pytest.mark.parametrize("source_leaders", ["", " ..."])
+@pytest.mark.parametrize(("selected_template", "matches"), [
+    ("제목{punctuation} ........ 3", True),
+    ("제목{punctuation} 3", True),
+    ("제목 ........ 3", False),
+    ("제목{punctuation} ........ 4", False),
+])
+def test_selectable_toc_preserves_terminal_title_punctuation(
+    punctuation: str, source_leaders: str, selected_template: str, matches: bool,
+) -> None:
+    block = SimpleNamespace(
+        id="pdf:page-0001:block-0001", semantic_role="toc-entry",
+        source_text=f"A title{punctuation}{source_leaders} 47",
+    )
+    resolution = SimpleNamespace(source_reference="47", output_page=3)
+    assert pdf_qa_module._selectable_translation_matches(
+        block, f"제목{punctuation}{source_leaders} 47",
+        selected_template.format(punctuation=punctuation), resolution,
+    ) is matches
+
+
 def test_selectable_non_toc_prose_does_not_ignore_punctuation() -> None:
     block = SimpleNamespace(id="pdf:page-0001:block-0001", semantic_role="body")
     matcher = getattr(pdf_qa_module, "_selectable_translation_matches", None)

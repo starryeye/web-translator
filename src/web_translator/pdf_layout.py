@@ -1363,6 +1363,22 @@ def _line_is_italic(line: PdfLine) -> bool:
     )
 
 
+def _is_reference_heading(line: PdfLine) -> bool:
+    return (
+        line.kind not in {"header", "footer", "page-number"}
+        and _REFERENCE_HEADING_PATTERN.fullmatch(_normalized_text(line.text)) is not None
+        and (line.bold or line.size >= 14.0)
+    )
+
+
+def _ends_reference_section(line: PdfLine) -> bool:
+    return _is_reference_heading(line) or (
+        line.bold
+        and line.size >= 14.0
+        and _REFERENCE_MARKER_PATTERN.match(line.text) is None
+    )
+
+
 def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
     result = [list(lines) for lines in pages]
     headings = [
@@ -1370,19 +1386,29 @@ def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLin
         for page_index, lines in enumerate(result)
         for line_index, line in enumerate(lines)
         if line.semantic_role == "body"
-        and line.kind not in {"header", "footer", "page-number"}
-        and _REFERENCE_HEADING_PATTERN.fullmatch(_normalized_text(line.text)) is not None
-        and (line.bold or line.size >= 14.0)
+        and _is_reference_heading(line)
     ]
-    for heading_page, heading_line in headings:
+    # Expanding a later section cannot invalidate an earlier heading's index.
+    for heading_page, heading_line in reversed(headings):
         # Split only within a references section, at intact source-word boundaries.
         # Quotes and cross-reference markers are not evidence of a new citation.
+        stopped = False
         for page_index in range(heading_page, len(result)):
             start = heading_line + 1 if page_index == heading_page else 0
             expanded = result[page_index][:start]
-            for line in result[page_index][start:]:
+            for line_index in range(start, len(result[page_index])):
+                line = result[page_index][line_index]
+                if line.kind in {"header", "footer", "page-number"}:
+                    expanded.append(line)
+                    continue
+                if _ends_reference_section(line):
+                    expanded.extend(result[page_index][line_index:])
+                    stopped = True
+                    break
                 expanded.extend(_split_inline_references(line))
             result[page_index] = expanded
+            if stopped:
+                break
         candidates: list[tuple[int, int]] = []
         marker_count = 0
         stopped = False
@@ -1392,12 +1418,7 @@ def _classify_reference_sections(pages: list[list[PdfLine]]) -> list[list[PdfLin
                 line = result[page_index][line_index]
                 if line.kind in {"header", "footer", "page-number"}:
                     continue
-                if (
-                    candidates
-                    and line.bold
-                    and line.size >= 14.0
-                    and _REFERENCE_MARKER_PATTERN.match(line.text) is None
-                ):
+                if _ends_reference_section(line):
                     stopped = True
                     break
                 candidates.append((page_index, line_index))

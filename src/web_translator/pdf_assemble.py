@@ -1150,7 +1150,10 @@ def _toc_parts(text: str) -> tuple[str, str]:
     match = _TOC_REFERENCE.fullmatch(text)
     if match is None:
         raise PdfAssemblyError(f"TOC entry has no unambiguous page column: {text!r}")
-    return match[1].rstrip(" .·…"), match[2]
+    # Only a separate repeated leader run is layout material. Attached title
+    # punctuation (or a lone separated punctuation mark) remains exact text.
+    title = re.sub(r"\s+(?:\.{3,}|\.(?:\s+\.){2,})\s*$", "", match[1]).rstrip()
+    return title, match[2]
 
 
 def _toc_heading_key(text: str) -> str:

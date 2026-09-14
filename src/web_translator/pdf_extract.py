@@ -730,6 +730,11 @@ def _intersection_area(
     return width * height
 
 
+def _unquoted_reference_text(text: str) -> str:
+    """Mask quoted titles without changing logical-to-physical offsets."""
+    return re.sub(r'"[^\"]*"|“[^”]*”', lambda match: "_" * len(match.group()), text)
+
+
 def _reference_core_lengths(blocks: Sequence[PdfBlock]) -> dict[str, int]:
     """Locate citation cores logically, then project them onto physical fragments."""
     groups: dict[str, list[PdfBlock]] = {}
@@ -739,24 +744,45 @@ def _reference_core_lengths(blocks: Sequence[PdfBlock]) -> dict[str, int]:
     lengths: dict[str, int] = {}
     for fragments in groups.values():
         text = " ".join(block.source_text for block in fragments)
-        annotation = re.search(r"\s+(?:Note|Annotation):\s*", text, re.IGNORECASE)
+        annotation = re.search(
+            r"\s+(?:Note|Annotation):\s*", _unquoted_reference_text(text), re.IGNORECASE
+        )
         core_end = annotation.start() if annotation else len(text)
         core = text[:core_end]
         # Recognize ordering evidence, not a universal year-as-end delimiter.
         # An author-(year) entry has a title clause and a publication clause;
         # unknown extra prose still needs an explicit annotation boundary.
-        years = list(re.finditer(r"\b(?:18|19|20)\d{2}\b", core))
-        if not years and re.search(r"(?:https?://\S+|\bDOI:?\s*10\.\d+/\S+)[.)]*\s*$", core, re.I) is None:
-            raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
-        if years:
-            tail = core[years[-1].end():]
-            tail = re.sub(r"(?:https?://\S+|(?:DOI|ISBN):?\s*\S+)", "", tail, flags=re.I)
-            author_year = re.search(r"\((?:18|19|20)\d{2}\)\.\s*", core)
-            title_publication = (
-                author_year is not None
-                and re.fullmatch(r'(?:(?:"[^"]+"|“[^”]+”)|[^.!?]+)\.\s+[^.!?]+\.?\s*', core[author_year.end():]) is not None
+        unquoted = _unquoted_reference_text(core)
+        # Initials and entry markers are not clause separators. Mask them with
+        # equal-length text so all offsets still refer to the exact source.
+        clauses = re.sub(r"(?<!\w)([A-Z])\.(?=\s)", r"\1_", unquoted)
+        clauses = re.sub(
+            r"^\s*(?:\[[A-Za-z0-9]+\]|\d+[.)])\s+",
+            lambda match: "_" * len(match.group()), clauses,
+        )
+        author_year = re.match(r"[^.!?:]*\((?:18|19|20)\d{2}\)\.\s*", clauses)
+        if author_year is not None:
+            # A year-first entry needs exactly its title and publication clauses,
+            # even when extra prose happens to end in another year.
+            if re.fullmatch(r'(?:(?:"[^"]+"|“[^”]+”)|[^.!?]+)\.\s+[^.!?]+\.?\s*', core[author_year.end():]) is None:
+                raise PdfExtractionError(f"ambiguous bibliography annotation: {fragments[0].id}")
+        else:
+            # In year-last/identifier entries, completion belongs to publication
+            # facts after the author and title clauses, not to a year in the title.
+            author_title = re.match(r"[^.!?:]+[.:]\s+[^.!?,]+[.!?,]\s+", clauses)
+            if author_title is None:
+                raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+            publication_start = author_title.end()
+            completion = re.search(
+                r"\b(?:18|19|20)\d{2}\b|https?://\S+|\bDOI:?\s*10\.\d+/\S+",
+                unquoted[publication_start:], re.I,
             )
-            if re.search(r"[A-Za-z]", tail) and not title_publication:
+            if completion is None:
+                raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+            # Later prose cannot redefine completion just by ending in a year.
+            tail = core[publication_start + completion.end():]
+            tail = re.sub(r"(?:https?://\S+|(?:DOI|ISBN):?\s*\S+)", "", tail, flags=re.I)
+            if re.search(r"[A-Za-z]", tail):
                 raise PdfExtractionError(f"ambiguous bibliography annotation: {fragments[0].id}")
         offset = 0
         for block in fragments:

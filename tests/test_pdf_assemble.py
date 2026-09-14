@@ -591,6 +591,46 @@ def test_toc_prints_output_anchor_page_after_korean_reflow(tmp_path: Path) -> No
     assert len([r for r in layout.flowables if r.block_id == entry.block_id]) == 1
 
 
+@pytest.mark.parametrize("punctuation", ["…", "·", ".", "...", " ."])
+@pytest.mark.parametrize("source_leaders", ["", " ..."])
+def test_toc_render_preserves_terminal_title_punctuation(
+    tmp_path: Path, punctuation: str, source_leaders: str,
+) -> None:
+    from web_translator.pdf_qa import _selectable_translation_matches
+
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-title", "Contents"),
+        (1, "toc-entry", f"A title{punctuation}{source_leaders} 47"),
+        (2, "chapter-title", f"A title{punctuation}"),
+    ])
+    translated = f"제목{punctuation}{source_leaders} 47"
+    translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    translations["seg-000002"] = Translation("seg-000002", translated)
+    output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
+    labels = []
+
+    def capture_label(text, _cm, _tm, _font, _size):
+        if "제목" in text:
+            labels.append(text.strip())
+
+    reader = PdfReader(output)
+    reader.pages[0].extract_text(visitor_text=capture_label)
+    # The actual PDF drawing operation for the label excludes generated leaders;
+    # those dots must not impersonate missing title punctuation.
+    assert labels == [f"제목{punctuation}"]
+    layout = read_pdf_layout(run_dir / "layout.json")
+    resolution = layout.toc_entries[0]
+    chapter = next(r for r in layout.flowables if r.semantic_role == "chapter-title")
+    assert resolution.source_reference == "47"
+    assert resolution.output_page == chapter.page_number
+    assert resolution.target_block_id == chapter.block_id
+    assert reader.pages[0].get("/Annots")
+    with pdfplumber.open(output) as pdf:
+        selected = next(line for line in pdf.pages[0].extract_text().splitlines() if "제목" in line)
+    block = PdfDocument.from_dict(json.loads((run_dir / "document.json").read_text())).blocks[1]
+    assert _selectable_translation_matches(block, translated, selected, resolution)
+
+
 @pytest.mark.parametrize("footer_page", [2, 3])
 def test_toc_does_not_link_later_summary_to_same_title_in_current_chapter(tmp_path: Path, footer_page: int) -> None:
     run_dir = _publication_assembly_run(tmp_path, [

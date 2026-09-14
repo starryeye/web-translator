@@ -2867,7 +2867,7 @@ def _selectable_translation_matches(
     page = str(resolution.output_page) if resolution.output_page is not None else reference
     # ResolvedTocEntry renders an exact title, generated dot leaders, and the
     # evidenced terminal page column. Only that inter-column area may differ.
-    title = re.sub(rf"\s*{re.escape(page)}$", "", expected).rstrip(" .·…")
+    title, _reference = assembly._toc_parts(expected)
     return re.fullmatch(
         rf"{re.escape(title)}(?:\s+|(?:\s*\.\s*)+){re.escape(page)}", selected
     ) is not None
