@@ -755,12 +755,17 @@ def _reference_core_lengths(blocks: Sequence[PdfBlock]) -> dict[str, int]:
         unquoted = _unquoted_reference_text(core)
         # Initials and entry markers are not clause separators. Mask them with
         # equal-length text so all offsets still refer to the exact source.
-        clauses = re.sub(r"(?<!\w)([A-Z])\.(?=\s)", r"\1_", unquoted)
+        clauses = re.sub(r"(?<!\w)([A-Z])\.(?=\s|,)", r"\1_", unquoted)
         clauses = re.sub(
             r"^\s*(?:\[[A-Za-z0-9]+\]|\d+[.)])\s+",
             lambda match: "_" * len(match.group()), clauses,
         )
-        author_year = re.match(r"[^.!?:]*\((?:18|19|20)\d{2}\)\.\s*", clauses)
+        # A terminal generational suffix is author evidence, not a sentence.
+        # Keep the prefix anchored so unrelated prose cannot introduce a year.
+        author_year = re.match(
+            r"[^.!?:]*(?:\b(?:Jr|Sr)\.\s*)?\((?:18|19|20)\d{2}\)\.\s*",
+            clauses, re.IGNORECASE,
+        )
         if author_year is not None:
             # A year-first entry needs exactly its title and publication clauses,
             # even when extra prose happens to end in another year.

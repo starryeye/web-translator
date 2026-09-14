@@ -1736,6 +1736,29 @@ def test_reference_core_is_opaque_before_translation_and_normalization(citation:
     assert restore_tokens(normalized[0].text, segment.protected) == citation + " 주석: 복제(replication)는 위험을 줄인다."
 
 
+@pytest.mark.parametrize("citation", [
+    '[1] Smith, Jr. (2024). Systems. Example Press.',
+    '[1] Writer, A., Sr. (2023). “2024 Note: Data replication”. Archive Press.',
+    '[1] Reader, jr. (2025). Data replication. Research Press.',
+])
+@pytest.mark.parametrize("annotation", ["", " Note: Useful replication evidence.", " Annotation: Useful replication evidence."])
+def test_reference_author_suffix_preserves_core_and_annotation(citation: str, annotation: str) -> None:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_block
+    from web_translator.pdf_extract import _build_segments
+    from web_translator.protection import restore_tokens
+
+    block = replace(make_pdf_block(semantic_role="reference-entry"), source_text=citation + annotation)
+    blocks, segments = _build_segments([block])
+    segment = segments[0]
+    assert segment.protected[0].kind == "bibliography"
+    assert segment.protected[0].value == citation
+    assert segment.source_text == "⟦WT:000000⟧" + annotation
+    assert restore_tokens(segment.source_text, segment.protected) == block.source_text
+    assert blocks[0].source_text == block.source_text
+    assert blocks[0].bbox == block.bbox
+
+
 def test_reference_inline_backward_wrap_uses_linked_nonoverlapping_fragments(tmp_path: Path) -> None:
     from reportlab.pdfgen.canvas import Canvas
     from web_translator.pdf_extract import extract_pdf
@@ -1812,6 +1835,9 @@ def test_reference_quoted_annotation_across_physical_fragments(tmp_path: Path, a
     '[1] Writer. Systems. https://example.com/systems This explains replication in 2025.',
     '[1] Council. 2024 Data replication. Archive Press, 2025. This explains replication in 2026.',
     '[1] Council. Data replication in 2024. Archive Press, 2025. This explains replication in 2026.',
+    '[1] Smith, Jr. (2024). Systems. Example Press. This explains replication in 2025.',
+    '[1] Writer, A., Sr. (2023). Systems. Archive Press. This explains replication.',
+    '[1] Smith. This explains (2024). Systems. Example Press.',
 ])
 def test_reference_unmarked_annotation_fails_with_block_evidence(raw: str) -> None:
     from dataclasses import replace
