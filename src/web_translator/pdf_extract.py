@@ -774,21 +774,49 @@ def _reference_core_lengths(blocks: Sequence[PdfBlock]) -> dict[str, int]:
         else:
             # In year-last/identifier entries, completion belongs to publication
             # facts after the author and title clauses, not to a year in the title.
-            author_title = re.match(r"[^.!?:]+[.:]\s+[^.!?,]+[.!?,]\s+", clauses)
-            if author_title is None:
+            author_clause = re.match(
+                r"(?:(?:\bet\s+al\.(?=\s*:))|[^.!?:])+[.:]\s+",
+                clauses,
+                re.IGNORECASE,
+            )
+            if author_clause is None:
                 raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
-            publication_start = author_title.end()
+            # Quote closure is title evidence even when its terminal citation
+            # punctuation is inside the quote and was masked from clauses.
+            quoted_title = re.match(
+                r'(?:(?:"[^"]+"|“[^”]+”))[.!?,]?\s+',
+                core[author_clause.end():],
+            )
+            title_clause = quoted_title or re.match(
+                r"[^.!?,]+[.!?,]\s+", clauses[author_clause.end():],
+            )
+            if title_clause is None:
+                raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+            publication_start = author_clause.end() + title_clause.end()
+            publication = unquoted[publication_start:]
             completion = re.search(
                 r"\b(?:18|19|20)\d{2}\b|https?://\S+|\bDOI:?\s*10\.\d+/\S+",
-                unquoted[publication_start:], re.I,
+                publication, re.I,
             )
             if completion is None:
-                raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
-            # Later prose cannot redefine completion just by ending in a year.
-            tail = core[publication_start + completion.end():]
-            tail = re.sub(r"(?:https?://\S+|(?:DOI|ISBN):?\s*\S+)", "", tail, flags=re.I)
-            if re.search(r"[A-Za-z]", tail):
-                raise PdfExtractionError(f"ambiguous bibliography annotation: {fragments[0].id}")
+                # A bare domain is publication evidence only when it is the
+                # complete terminal clause after a source-confirmed quoted title,
+                # never a completion marker in prose.
+                if quoted_title is None:
+                    raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+                bare_domain = re.fullmatch(
+                    r"\s*(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+                    r"[A-Za-z]{2,63}\.?\s*",
+                    publication,
+                )
+                if bare_domain is None:
+                    raise PdfExtractionError(f"ambiguous bibliography citation core: {fragments[0].id}")
+            else:
+                # Later prose cannot redefine completion just by ending in a year.
+                tail = core[publication_start + completion.end():]
+                tail = re.sub(r"(?:https?://\S+|(?:DOI|ISBN):?\s*\S+)", "", tail, flags=re.I)
+                if re.search(r"[A-Za-z]", tail):
+                    raise PdfExtractionError(f"ambiguous bibliography annotation: {fragments[0].id}")
         offset = 0
         for block in fragments:
             lengths[block.id] = max(0, min(len(block.source_text), core_end - offset))

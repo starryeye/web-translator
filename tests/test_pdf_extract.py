@@ -1759,6 +1759,57 @@ def test_reference_author_suffix_preserves_core_and_annotation(citation: str, an
     assert blocks[0].bbox == block.bbox
 
 
+@pytest.mark.parametrize("citation", [
+    '[1] Writer et al.: "A study of systems," at Example Conference, October 2024.',
+    '[1] Writer et al.: "A study of systems", at Example Conference, October 2024.',
+    '[1] Writer et al.: “A study of systems,” at Example Conference, October 2024.',
+    '[1] Writer et al.: “A study of systems”, at Example Conference, October 2024.',
+])
+def test_reference_author_abbreviation_and_quoted_title_punctuation_preserve_core(
+    citation: str,
+) -> None:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_block
+    from web_translator.pdf_extract import _build_segments
+    from web_translator.protection import restore_tokens
+
+    annotation = " Note: Useful replication evidence."
+    block = replace(
+        make_pdf_block(semantic_role="reference-entry"),
+        source_text=citation + annotation,
+    )
+
+    _, segments = _build_segments([block])
+
+    segment = segments[0]
+    assert segment.protected[0].kind == "bibliography"
+    assert segment.protected[0].value == citation
+    assert segment.source_text == "⟦WT:000000⟧" + annotation
+    assert restore_tokens(segment.source_text, segment.protected) == block.source_text
+
+
+def test_reference_terminal_bare_domain_is_publication_evidence() -> None:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_block
+    from web_translator.pdf_extract import _build_segments
+    from web_translator.protection import restore_tokens
+
+    citation = '[1] Research Group: “A measurement system,” example.org.'
+    annotation = " Annotation: Useful replication evidence."
+    block = replace(
+        make_pdf_block(semantic_role="reference-entry"),
+        source_text=citation + annotation,
+    )
+
+    _, segments = _build_segments([block])
+
+    segment = segments[0]
+    assert segment.protected[0].kind == "bibliography"
+    assert segment.protected[0].value == citation
+    assert segment.source_text == "⟦WT:000000⟧" + annotation
+    assert restore_tokens(segment.source_text, segment.protected) == block.source_text
+
+
 def test_reference_inline_backward_wrap_uses_linked_nonoverlapping_fragments(tmp_path: Path) -> None:
     from reportlab.pdfgen.canvas import Canvas
     from web_translator.pdf_extract import extract_pdf
@@ -1838,6 +1889,11 @@ def test_reference_quoted_annotation_across_physical_fragments(tmp_path: Path, a
     '[1] Smith, Jr. (2024). Systems. Example Press. This explains replication in 2025.',
     '[1] Writer, A., Sr. (2023). Systems. Archive Press. This explains replication.',
     '[1] Smith. This explains (2024). Systems. Example Press.',
+    '[1] Writer et al.: “A study of systems,” at Example Conference, October 2024. This explains replication.',
+    '[1] Writer: "Systems," example.org. This explains replication.',
+    '[1] Writer: “Systems,” This prose merely ends at example.org.',
+    '[1] Writer: "Systems," example. This is unknown prose.',
+    '[1] Writer. Systems. example.org.',
 ])
 def test_reference_unmarked_annotation_fails_with_block_evidence(raw: str) -> None:
     from dataclasses import replace
