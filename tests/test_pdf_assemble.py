@@ -566,6 +566,62 @@ def _assemble_publication(run_dir: Path, output: Path) -> Path:
     return assemble_pdf(run_dir=run_dir, translations=translations, glossary={}, output_dir=output)
 
 
+def test_extracted_roman_toc_resolves_to_supplied_heading_and_output_anchor(tmp_path: Path) -> None:
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_extract import extract_pdf
+
+    source = tmp_path / "roman-contents.pdf"
+    canvas = Canvas(str(source), pagesize=(504, 661.5))
+    canvas.setFont("Helvetica-Bold", 20)
+    canvas.drawString(72, 570, "Contents")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(72, 510, "Introduction . . . xiii")
+    canvas.drawString(72, 480, "Foundations . . . 1")
+    canvas.showPage()
+    for title in ["Introduction", "Foundations"]:
+        canvas.setFont("Helvetica-Bold", 18)
+        canvas.drawString(72, 570, title)
+        canvas.setFont("Helvetica", 11)
+        canvas.drawString(72, 520, "Ordinary source prose supplies the destination context.")
+        canvas.showPage()
+    canvas.save()
+    run_dir, _, _ = _assembly_run(tmp_path)
+    (run_dir / "segments.jsonl").unlink()
+    document = extract_pdf(source, run_dir / "document.json", run_dir / "segments.jsonl", run_dir / "media")
+    source_record = json.loads((run_dir / "source.json").read_text())
+    source_record.update(sha256=document.source_sha256, byte_length=source.stat().st_size)
+    (run_dir / "source.json").write_text(json.dumps(source_record))
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert [entry.source_reference for entry in layout.toc_entries] == ["xiii", "1"]
+    roman = layout.toc_entries[0]
+    heading = next(block for block in document.blocks if block.kind == "heading" and block.source_text == "Introduction")
+    anchor = next(item for item in layout.flowables if item.block_id == heading.id)
+    assert roman.target_block_id == heading.id
+    assert roman.output_page == anchor.page_number
+    assert roman.warning is None
+    assert PdfReader(output).pages[0].get("/Annots")
+
+
+def test_roman_toc_does_not_use_decimal_furniture_to_choose_duplicate_title(tmp_path: Path) -> None:
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "toc-entry", "Introduction ... xiii"),
+        (2, "reference-heading", "Introduction"), (2, "body", "xiii"),
+        (3, "reference-heading", "Introduction"), (3, "body", "13"),
+    ])
+    document = PdfDocument.from_dict(json.loads((run_dir / "document.json").read_text()))
+    document = replace(document, blocks=[
+        replace(block, kind="page-number", segment_id=None)
+        if block.source_text in {"xiii", "13"} else block for block in document.blocks
+    ])
+    (run_dir / "document.json").write_text(json.dumps(document.to_dict()))
+    segments = [segment for segment in read_segments(run_dir / "segments.jsonl") if segment.source_text not in {"xiii", "13"}]
+    (run_dir / "segments.jsonl").unlink()
+    write_segments(run_dir / "segments.jsonl", segments)
+    with pytest.raises(PdfAssemblyError, match="ambiguous TOC heading target"):
+        _assemble_publication(run_dir, tmp_path / "out")
+
+
 def test_toc_prints_output_anchor_page_after_korean_reflow(tmp_path: Path) -> None:
     run_dir = _publication_assembly_run(tmp_path, [
         (1, "toc-title", "Contents"), (1, "toc-chapter", "2. Models ... 47"),

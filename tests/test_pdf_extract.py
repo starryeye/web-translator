@@ -972,6 +972,97 @@ def test_repeated_band_classification_accepts_exactly_sixty_percent() -> None:
     ]
 
 
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+def test_roman_page_tokens_require_same_family_edge_sequence(scale: float) -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    pages = []
+    for token in ["v", "vi", "7", "iiv"]:
+        words = [
+            _word("Ordinary prose", x0=20*scale, x1=160*scale, top=80*scale,
+                  bottom=90*scale, size=10*scale),
+            _word("iv", x0=20*scale, x1=35*scale, top=110*scale,
+                  bottom=120*scale, size=10*scale),
+            _word(token, x0=180*scale, x1=190*scale, top=185*scale,
+                  bottom=195*scale, size=9*scale),
+        ]
+        pages.append(([line.with_page_geometry(200*scale, 200*scale)
+                       for line in group_words_into_lines(words)], 200*scale))
+    classified = classify_document_lines(pages)
+    assert [page[-1].kind for page in classified] == [
+        "page-number", "page-number", "paragraph", "paragraph",
+    ]
+    assert all(page[1].kind == "paragraph" for page in classified)
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("footer_font", ["Running-Semibold", "Running-Oblique"])
+@pytest.mark.parametrize("missing_evidence", [
+    None, "left", "right", "sequence", "page-family", "baseline", "outward",
+    "font", "size", "body-font", "no-body",
+])
+def test_singleton_footer_requires_bracketed_geometry_and_distinct_typography(
+    scale: float, footer_font: str, missing_evidence: str | None,
+) -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    pages = []
+    for index, text in enumerate(["12 | Shared chapter", "Local section | 13", "14 | Shared chapter"]):
+        font = footer_font
+        size = 9
+        x0, x1, top = (20, 100, 278) if index != 1 else (100, 180, 278)
+        if index == 1:
+            if missing_evidence == "sequence":
+                text = "Local section | 31"
+            if missing_evidence == "page-family":
+                text = "Local section | xiii"
+            if missing_evidence == "baseline":
+                top = 287
+            if missing_evidence == "outward":
+                x1 = 198
+            if missing_evidence == "font":
+                font = "Unrelated-Regular"
+            if missing_evidence == "size":
+                size = 6
+        words = [_word("Ordinary explanatory prose occupies the main column.",
+            x0=20*scale, x1=180*scale, top=100*scale, bottom=110*scale,
+            size=(9 if missing_evidence == "body-font" else 10)*scale,
+            fontname=footer_font if missing_evidence == "body-font" else "Text-Regular")]
+        if missing_evidence == "no-body" and index == 1:
+            words = []
+        if not ((missing_evidence == "left" and index == 0)
+                or (missing_evidence == "right" and index == 2)):
+            words.append(_word(text, x0=x0*scale, x1=x1*scale, top=top*scale,
+                bottom=(top+size)*scale, size=size*scale, fontname=font))
+        pages.append(([line.with_page_geometry(200*scale, 300*scale)
+                       for line in group_words_into_lines(words)], 300*scale))
+    classified = classify_document_lines(pages)
+    if missing_evidence is None:
+        assert classified[1][-1].kind == "footer"
+    else:
+        assert classified[1][-1].kind in {"heading", "paragraph"}
+
+
+def test_singleton_footer_candidates_cannot_confirm_each_other() -> None:
+    from web_translator.pdf_layout import classify_document_lines, group_words_into_lines
+
+    pages = []
+    for text in ["Shared chapter | 12", "First local section | 13",
+                 "Second local section | 14", "Shared chapter | 15"]:
+        words = [
+            _word("Ordinary prose", x0=20, x1=180, top=100, bottom=110,
+                  fontname="Text-Regular"),
+            _word(text, x0=100, x1=180, top=278, bottom=287, size=9,
+                  fontname="Running-Regular"),
+        ]
+        pages.append(([line.with_page_geometry(200, 300)
+                       for line in group_words_into_lines(words)], 300))
+    classified = classify_document_lines(pages)
+    assert [page[-1].kind for page in classified] == [
+        "footer", "paragraph", "paragraph", "footer",
+    ]
+
+
 def test_running_band_classification_handles_alternating_page_number_sides() -> None:
     from web_translator.pdf_layout import (
         classify_document_lines,
@@ -2046,6 +2137,129 @@ def test_semantic_classification_does_not_treat_numeric_table_as_toc() -> None:
     classified = classify_semantic_roles([page])[0]
 
     assert {line.semantic_role for line in classified} == {"body"}
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("paired", [False, True])
+def test_roman_toc_rows_preserve_right_column_and_source_words(scale: float, paired: bool) -> None:
+    from web_translator.pdf_layout import classify_document_lines, classify_semantic_roles, group_words_into_lines
+
+    rows = [("Contents", 30, 20), ("Introduction", 80, 12), ("1. Foundations", 110, 12)]
+    words = []
+    for index, (label, top, size) in enumerate(rows):
+        token = [None, "xiii", "1"][index]
+        text = label if paired or token is None else f"{label} . . . {token}"
+        words.append(_word(text, x0=20*scale, x1=(120 if paired else 190)*scale,
+                           top=top*scale, bottom=(top+size)*scale, size=size*scale))
+        if paired and token:
+            words.append(_word(token, x0=178*scale, x1=190*scale, top=top*scale,
+                               bottom=(top+size)*scale, size=size*scale))
+    page = [line.with_page_geometry(200*scale, 300*scale) for line in group_words_into_lines(words)]
+    classified = classify_semantic_roles(classify_document_lines([(page, 300*scale)]))[0]
+    assert [line.semantic_role for line in classified] == ["toc-title", "toc-entry", "toc-chapter"]
+    assert classified[1].text.endswith("xiii")
+    assert sorted(id(word) for line in classified for word in line.words) == sorted(
+        id(word) for line in page for word in line.words
+    )
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("italic_font", ["Book-It", "Times-Oblique"])
+def test_epigraph_rejects_caption_heading_and_inline_emphasis_before_body_dash(
+    scale: float, italic_font: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    specs = [
+        ("Figure 2. A chart caption", 180, 10, italic_font, "caption"),
+        ("An explanatory heading", 204, 15, "Book-Bold", "heading"),
+        ("Ordinary prose continues across this line", 229, 10, "Book-Regular", "paragraph"),
+        ("and introduces a load increase", 241, 10, "Book-Regular", "paragraph"),
+        ("— perhaps more often than expected.", 253, 10, "Book-Regular", "paragraph"),
+        ("The next ordinary paragraph follows.", 275, 10, "Book-Regular", "paragraph"),
+    ]
+    page = []
+    for text, top, size, font, kind in specs:
+        line = group_words_into_lines([_word(text, x0=20*scale, x1=180*scale,
+            top=top*scale, bottom=(top+size)*scale, size=size*scale, fontname=font)])[0]
+        page.append(replace(line.with_page_geometry(200*scale, 400*scale), kind=kind))
+    classified = classify_semantic_roles([page])[0]
+    assert [line.semantic_role for line in classified] == ["body"] * len(page)
+    assert [line.kind for line in classified] == [line.kind for line in page]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("quote_kind", ["paragraph", "heading"])
+def test_epigraph_accepts_sparse_italic_quote_with_inferred_heading_kind(
+    scale: float, quote_kind: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    page = [group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+size)*scale, size=size*scale,
+        fontname=font)])[0].with_page_geometry(600*scale, 800*scale)
+        for text, x0, x1, top, size, font in [
+            ("A thought set apart from the surrounding text.", 175, 425, 340, 12, "Book-It"),
+            ("— Its author", 350, 450, 371, 11, "Book-Regular"),
+        ]]
+    page[0] = replace(page[0], kind=quote_kind)
+    page[1] = replace(page[1], kind="paragraph")
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == [
+        "epigraph", "epigraph-attribution",
+    ]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+def test_epigraph_bounds_multiline_attribution_before_resumed_body(scale: float) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    specs = [
+        ("A thought gives shape to the page", 40, 170, 100, "Book-It"),
+        ("and room for a reader.", 60, 150, 112, "Book-It"),
+        ("— A thoughtful author", 105, 185, 140, "Book-Regular"),
+        ("Collected essays", 105, 185, 152, "Book-Regular"),
+        ("Ordinary prose resumes in a full column.", 20, 185, 182, "Book-Regular"),
+    ]
+    page = [group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+10)*scale, size=10*scale, fontname=font)])[0]
+        .with_page_geometry(200*scale, 400*scale) for text,x0,x1,top,font in specs]
+    classified = classify_semantic_roles([page])[0]
+    assert [line.semantic_role for line in classified] == [
+        "epigraph", "epigraph", "epigraph-attribution", "epigraph-attribution", "body",
+    ]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+def test_epigraph_does_not_turn_inline_emphasis_into_quote_evidence(scale: float) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    words = [
+        _word("This prose has an emphasized", x0=20*scale, x1=135*scale,
+              top=100*scale, bottom=110*scale, size=10*scale),
+        _word("term", x0=138*scale, x1=160*scale, top=100*scale,
+              bottom=110*scale, size=10*scale, fontname="Book-It"),
+        _word("— A separate aside", x0=105*scale, x1=190*scale,
+              top=126*scale, bottom=136*scale, size=10*scale),
+    ]
+    page = [line.with_page_geometry(200*scale, 400*scale) for line in group_words_into_lines(words)]
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == ["body", "body"]
+
+
+@pytest.mark.parametrize("following_kind", ["heading", "caption"])
+def test_epigraph_attribution_does_not_absorb_indented_following_structure(following_kind: str) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    page = [group_words_into_lines([_word(text, x0=x0, x1=190, top=top,
+        bottom=top+10, size=10, fontname=font)])[0].with_page_geometry(200, 400)
+        for text,x0,top,font in [
+            ("A thought set apart.", 40, 100, "Book-It"),
+            ("— Its author", 110, 125, "Book-Regular"),
+            ("A new structure", 110, 137, "Book-Regular"),
+        ]]
+    page[-1] = replace(page[-1], kind=following_kind)
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == [
+        "epigraph", "epigraph-attribution", "body",
+    ]
 
 
 def test_semantic_classification_recognizes_right_aligned_multiline_opener_and_epigraph() -> None:

@@ -41,7 +41,8 @@ _HEADING_NUMBER_PATTERN = re.compile(r"^(?P<number>\d+(?:\.\d+)*)[.)]?\s+")
 _PAGE_NUMBER_PATTERN = re.compile(r"\d+\Z")
 _RUNNING_PAGE_TOKEN_PATTERN = re.compile(r"(?:\d+|[ivxlcdm]+)\Z", re.IGNORECASE)
 _TOC_DOT_LEADER_PATTERN = re.compile(
-    r"^\s*(?P<label>\S.*?)\s*(?:\.\s*){3,}(?P<page>\d+)\s*\Z"
+    r"^\s*(?P<label>\S.*?)\s*(?:\.\s*){3,}(?P<page>\d+|[ivxlcdm]+)\s*\Z",
+    re.IGNORECASE,
 )
 _TOC_NUMBERED_CHAPTER_PATTERN = re.compile(r"^\d+(?:\.\d+)*[.)]\s+\S")
 _TOC_PART_ROW_PATTERN = re.compile(
@@ -795,17 +796,19 @@ def _numbered_list_family(line: PdfLine) -> tuple[int, str] | None:
 
 
 def _classify_page_numbers(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
-    groups: dict[tuple[str, int], list[tuple[int, int, int]]] = defaultdict(list)
+    groups: dict[tuple[str, int, bool], list[tuple[int, int, int]]] = defaultdict(list)
     for page_index, lines in enumerate(pages):
         for line_index, line in enumerate(lines):
             if line.page_height is None or line.page_width is None:
                 continue
             band = _edge_band(line)
-            if band is None or _PAGE_NUMBER_PATTERN.fullmatch(line.text.strip()) is None:
+            token = line.text.strip()
+            value = _page_token_value(token)
+            if band is None or value is None:
                 continue
             horizontal_bucket = round((line.center_x / line.page_width) * 20)
-            groups[(band, horizontal_bucket)].append(
-                (page_index, line_index, int(line.text.strip()))
+            groups[(band, horizontal_bucket, token.isdecimal())].append(
+                (page_index, line_index, value)
             )
     page_number_locations: set[tuple[int, int]] = set()
     for entries in groups.values():
@@ -883,6 +886,31 @@ def _classify_running_bands(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         if _is_sequential_running_band(locations)
         for page_index, line_index, _value, _side in locations
     }
+    # New section labels can occur only once. Inherit layout evidence from
+    # already-confirmed furniture on BOTH adjacent pages, never from candidates.
+    confirmed_by_page: dict[int, list[PdfLine]] = defaultdict(list)
+    for page_index, line_index in running_band_locations:
+        confirmed_by_page[page_index].append(pages[page_index][line_index])
+    for locations in occurrences.values():
+        for page_index, line_index, value, side in locations:
+            if (page_index, line_index) in running_band_locations:
+                continue
+            line = pages[page_index][line_index]
+            neighbors = [
+                [peer for peer in confirmed_by_page.get(adjacent, [])
+                 if _edge_band(peer) == _edge_band(line)]
+                for adjacent in (page_index - 1, page_index + 1)
+            ]
+            if any(len(peers) != 1 for peers in neighbors):
+                continue
+            body = [peer for peer in pages[page_index] if _edge_band(peer) is None]
+            if not body or any(_same_running_type(line, peer) for peer in body):
+                continue
+            if all(
+                _matches_neighboring_furniture(line, side, value, peers[0], delta)
+                for peers, delta in zip(neighbors, (-1, 1), strict=True)
+            ):
+                running_band_locations.add((page_index, line_index))
     for (band, label), locations in occurrences.items():
         if not _is_sequential_running_band(locations):
             continue
@@ -911,6 +939,36 @@ def _classify_running_bands(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         ]
         for page_index, lines in enumerate(pages)
     ]
+
+
+def _same_running_type(left: PdfLine, right: PdfLine) -> bool:
+    left_fonts = {word.fontname.split("+")[-1] for word in left.words}
+    right_fonts = {word.fontname.split("+")[-1] for word in right.words}
+    left_size = left.size / (left.page_height or 1)
+    right_size = right.size / (right.page_height or 1)
+    return left_fonts == right_fonts and math.isclose(left_size, right_size, rel_tol=0.10)
+
+
+def _matches_neighboring_furniture(
+    line: PdfLine, side: str, value: int, peer: PdfLine, page_delta: int,
+) -> bool:
+    evidence = _running_band_evidence(peer)
+    if evidence is None or not line.page_width or not peer.page_width:
+        return False
+    _label, peer_value, peer_side = evidence
+    token = line.text.split("|")[0 if side == "left" else 1].strip()
+    peer_token = peer.text.split("|")[0 if peer_side == "left" else 1].strip()
+    if peer_value - value != page_delta or token.isdecimal() != peer_token.isdecimal():
+        return False
+    height, peer_height = line.page_height or 1, peer.page_height or 1
+    outward = line.x0 if side == "left" else line.page_width - line.x1
+    peer_outward = peer.x0 if peer_side == "left" else peer.page_width - peer.x1
+    return (
+        _same_running_type(line, peer)
+        and abs(line.bottom / height - peer.bottom / peer_height) <= line.size / height * 0.5
+        and abs(outward / line.page_width - peer_outward / peer.page_width)
+        <= line.size / line.page_width * 0.5
+    )
 
 
 def _running_band_label(line: PdfLine) -> str | None:
@@ -993,7 +1051,7 @@ def _classify_toc_entries(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         matches = [
             (line_index, line)
             for line_index, line in enumerate(lines)
-            if line.kind is None and _TOC_DOT_LEADER_PATTERN.fullmatch(line.text)
+            if line.kind is None and _toc_dot_leader_match(line.text)
         ]
         if len(matches) >= 2:
             evidence.update((page_index, index) for index, _line in matches)
@@ -1010,6 +1068,11 @@ def _classify_toc_entries(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
     ]
 
 
+def _toc_dot_leader_match(text: str) -> re.Match[str] | None:
+    match = _TOC_DOT_LEADER_PATTERN.fullmatch(text)
+    return match if match and _page_token_value(match["page"]) is not None else None
+
+
 def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
     evidence: list[_TocPageEvidence] = []
     for page_index, lines in enumerate(pages):
@@ -1020,7 +1083,7 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             and line.kind not in {"header", "footer", "page-number"}
             and line.page_width is not None
             and line.x0 >= line.page_width * 0.70
-            and _PAGE_NUMBER_PATTERN.fullmatch(line.text.strip()) is not None
+            and _page_token_value(line.text.strip()) is not None
         ]
         pairs: list[tuple[int, int]] = []
         claimed_left: set[int] = set()
@@ -1031,7 +1094,7 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
                 if index not in claimed_left
                 and line.semantic_role == "body"
                 and line.kind not in {"header", "footer", "page-number"}
-                and _PAGE_NUMBER_PATTERN.fullmatch(line.text.strip()) is None
+                and _page_token_value(line.text.strip()) is None
                 and line.x0 < number.x0
                 and number.x0 - line.x1 >= _MINIMUM_GUTTER
                 and line.vertical_overlap_ratio(number) >= _VERTICAL_OVERLAP
@@ -1052,7 +1115,7 @@ def _classify_toc_structure(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             for index, line in enumerate(lines)
             if line.semantic_role == "body"
             and line.kind not in {"header", "footer", "page-number"}
-            and _TOC_DOT_LEADER_PATTERN.fullmatch(line.text) is not None
+            and _toc_dot_leader_match(line.text) is not None
         ]
         title_index = next(
             (
@@ -1280,40 +1343,61 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
         for position, (attribution_index, attribution) in enumerate(content):
             if (
                 attribution.semantic_role != "body"
-                or attribution.kind == "list-item"
+                or attribution.kind not in {None, "paragraph"}
                 or not attribution.text.lstrip().startswith(("-", "\u2013", "\u2014"))
             ):
                 continue
             quote_lines: list[tuple[int, PdfLine]] = []
             for index, line in reversed(content[:position]):
-                if line.semantic_role != "body":
+                # A larger italic quote can inherit the document-wide heading
+                # kind. Keep that candidate, but never captions or bold titles.
+                quote_kind = line.kind in {None, "paragraph"} or (
+                    line.kind == "heading" and _line_is_italic(line) and not line.bold
+                )
+                if line.semantic_role != "body" or not quote_kind:
                     break
                 following = quote_lines[0][1] if quote_lines else attribution
                 gap = following.top - line.bottom
-                if gap > max(line.size, following.size) * 2.0:
+                if not 0 <= gap <= max(line.size, following.size) * (0.75 if quote_lines else 2.0):
+                    break
+                if quote_lines and (
+                    abs(line.size - following.size) > max(line.size, following.size) * 0.15
+                    or _line_is_italic(line) != _line_is_italic(following)
+                ):
                     break
                 quote_lines.insert(0, (index, line))
+            if not quote_lines:
+                continue
+            quote_left = min(line.x0 for _index, line in quote_lines)
+            inset_attribution = attribution.x0 - quote_left >= attribution.size
+            opener_separation = bool(opener_title_bottoms) and (
+                quote_lines[0][1].top - max(opener_title_bottoms) >= height * 0.05
+            )
+            sparse = (
+                max(line.bottom for _index, line in content)
+                - min(line.top for _index, line in content) <= height * 0.35
+                and all(abs(line.center_x - width / 2) <= width * 0.25
+                        for _index, line in quote_lines)
+            )
             quote_evidence = quote_lines and (
-                any(_line_is_italic(line) for _index, line in quote_lines)
+                all(_line_is_italic(line) for _index, line in quote_lines)
                 or quote_lines[0][1].text.lstrip().startswith(
                     ("\"", "\u201c", "'", "\u2018")
                 )
-                or (
-                    opener_title_bottoms
-                    and quote_lines[0][1].top - max(opener_title_bottoms)
-                    >= height * 0.05
-                )
+                or opener_separation
             )
-            if not quote_evidence:
+            if not (quote_evidence and inset_attribution and (sparse or opener_separation)):
                 continue
             attribution_lines = [(attribution_index, attribution)]
             for index, line in content[position + 1:]:
                 previous = attribution_lines[-1][1]
                 if (
                     line.semantic_role == "body"
-                    and line.x0 >= attribution.x0 - max(6.0, attribution.size)
+                    and line.kind in {None, "paragraph"}
+                    and abs(line.x0 - attribution.x0) <= attribution.size * 0.5
+                    and abs(line.size - attribution.size) <= attribution.size * 0.15
                     and 0.0 <= line.top - previous.bottom
-                    <= max(line.size, previous.size) * 2.0
+                    <= max(line.size, previous.size) * 0.75
                 ):
                     attribution_lines.append((index, line))
                     continue
@@ -1356,11 +1440,11 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
 
 
 def _line_is_italic(line: PdfLine) -> bool:
-    return any(
-        marker in word.fontname.casefold()
-        for word in line.words
-        for marker in ("italic", "oblique", "-it")
+    italic_characters = sum(
+        word.character_count for word in line.words
+        if any(marker in word.fontname.casefold() for marker in ("italic", "oblique", "-it"))
     )
+    return italic_characters >= line.character_count * 0.5
 
 
 def _is_reference_heading(line: PdfLine) -> bool:
