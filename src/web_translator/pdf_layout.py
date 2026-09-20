@@ -1379,29 +1379,53 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
                 and all(abs(line.center_x - width / 2) <= width * 0.25
                         for _index, line in quote_lines)
             )
-            quote_evidence = quote_lines and (
-                all(_line_is_italic(line) for _index, line in quote_lines)
-                or quote_lines[0][1].text.lstrip().startswith(
-                    ("\"", "\u201c", "'", "\u2018")
-                )
-                or opener_separation
-            )
-            if not (quote_evidence and inset_attribution and (sparse or opener_separation)):
-                continue
             attribution_lines = [(attribution_index, attribution)]
+            attribution_alignment = {"left", "right"}
+            attribution_families = {_epigraph_font_family(word.fontname) for word in attribution.words}
             for index, line in content[position + 1:]:
                 previous = attribution_lines[-1][1]
+                aligned_edges = {
+                    edge for edge, offset in (
+                        ("left", abs(line.x0 - attribution.x0)),
+                        ("right", abs(line.x1 - attribution.x1)),
+                    )
+                    if offset <= attribution.size * 0.5
+                }
+                common_alignment = attribution_alignment & aligned_edges
                 if (
                     line.semantic_role == "body"
                     and line.kind in {None, "paragraph"}
-                    and abs(line.x0 - attribution.x0) <= attribution.size * 0.5
+                    and common_alignment
+                    and line.x0 - quote_left >= attribution.size
+                    and line.bold == attribution.bold
+                    and all(_epigraph_font_family(word.fontname) in attribution_families for word in line.words)
                     and abs(line.size - attribution.size) <= attribution.size * 0.15
                     and 0.0 <= line.top - previous.bottom
                     <= max(line.size, previous.size) * 0.75
                 ):
                     attribution_lines.append((index, line))
+                    attribution_alignment = common_alignment
                     continue
                 break
+            following_position = position + len(attribution_lines)
+            following = content[following_position][1] if following_position < len(content) else None
+            quote_size = max(line.size for _index, line in quote_lines)
+            opener_quote_layout = opener_separation and (
+                (following is None and sparse)
+                or (following is not None
+                    and quote_left - following.x0 >= quote_size
+                    and following.top - attribution_lines[-1][1].bottom
+                    >= max(quote_size, attribution.size) * 1.5)
+            )
+            quote_evidence = (
+                all(_line_is_italic(line) for _index, line in quote_lines)
+                or quote_lines[0][1].text.lstrip().startswith(
+                    ("\"", "\u201c", "'", "\u2018")
+                )
+                or opener_quote_layout
+            )
+            if not (quote_evidence and inset_attribution and (sparse or opener_quote_layout)):
+                continue
             for index, line in quote_lines:
                 result[page_index][index] = replace(line, semantic_role="epigraph")
             for index, line in attribution_lines:
@@ -1437,6 +1461,14 @@ def _classify_epigraphs(pages: list[list[PdfLine]]) -> list[list[PdfLine]]:
             for index, line in body:
                 result[page_index][index] = replace(line, semantic_role="dedication")
     return result
+
+
+def _epigraph_font_family(fontname: str) -> str:
+    # Ignore PDF subset tags and conventional face styles, not family identity.
+    return re.sub(
+        r"[-_ ](?:regular|roman|italic|oblique|it)$", "",
+        fontname.split("+")[-1].casefold(),
+    )
 
 
 def _line_is_italic(line: PdfLine) -> bool:

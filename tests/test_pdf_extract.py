@@ -2210,6 +2210,120 @@ def test_epigraph_accepts_sparse_italic_quote_with_inferred_heading_kind(
 
 
 @pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("layout", ["full-column", "body-continuation", "isolated-quote"])
+def test_opener_epigraph_requires_inset_and_separation_from_following_body(
+    scale: float, layout: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    quote_left = 20 if layout == "full-column" else 45
+    body_top = 185 if layout == "body-continuation" else 225
+    specs = [
+        ("CHAPTER 2", 145, 190, 20, 16, "Book-Bold"),
+        ("AN OPENING TITLE", 85, 190, 45, 25, "Book-Bold"),
+        ("Two lines of ordinary looking prose", quote_left, 180, 145, 10, "Book-Regular"),
+        ("continue the thought here", quote_left, 180, 157, 10, "Book-Regular"),
+        ("— A separate continuation", 110, 190, 173, 10, "Book-Regular"),
+        *[(f"Subsequent body line {index}.", 20, 180, body_top + index * 12, 10, "Book-Regular")
+          for index in range(8)],
+    ]
+    page = [group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+size)*scale, size=size*scale,
+        fontname=font)])[0].with_page_geometry(200*scale, 400*scale)
+        for text, x0, x1, top, size, font in specs]
+    # Fixed semantic opener evidence isolates the epigraph decision at every scale.
+    page[0] = replace(page[0], semantic_role="chapter-label")
+    page[1] = replace(page[1], semantic_role="chapter-title")
+    classified = classify_semantic_roles([page])[0]
+    expected_quote = ["epigraph", "epigraph", "epigraph-attribution"] if layout == "isolated-quote" else ["body"] * 3
+    assert [line.semantic_role for line in classified[2:5]] == expected_quote
+    assert {line.semantic_role for line in classified[5:]} == {"body"}
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("following_kind", [
+    "paragraph", "heading", "caption", "unrelated-italic-body", "large-body", "alignment-change",
+])
+def test_epigraph_preserves_right_aligned_attribution_and_bounds_following_body(
+    scale: float, following_kind: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    follow_left = 20 if following_kind == "paragraph" else (105 if following_kind == "alignment-change" else 135)
+    follow_right = 175 if following_kind == "alignment-change" else 185
+    specs = [
+        ("A thought set apart.", 40, 170, 100, 10, "Book-It"),
+        ("— A thoughtful author", 105, 185, 125, 10, "Book-Regular"),
+        ("Collected essays", 130, 185, 137, 10, "Book-Regular"),
+        ("A separate following structure", follow_left, follow_right, 149,
+         14 if following_kind == "large-body" else 10,
+         "OtherFamily-It" if following_kind == "unrelated-italic-body" else "Book-Regular"),
+    ]
+    page = [group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+size)*scale, size=size*scale,
+        fontname=font)])[0].with_page_geometry(200*scale, 400*scale)
+        for text, x0, x1, top, size, font in specs]
+    page[-1] = replace(page[-1], kind=following_kind if following_kind in {"heading", "caption"} else "paragraph")
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == [
+        "epigraph", "epigraph-attribution", "epigraph-attribution", "body",
+    ]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("alignment", ["left", "right"])
+@pytest.mark.parametrize("author_font,title_font", [
+    ("Book-Regular", "Book-It"),
+    ("Times-Roman", "Times-Italic"),
+    ("Helvetica", "Helvetica-Oblique"),
+])
+def test_epigraph_regular_author_allows_same_family_italic_publication(
+    scale: float, alignment: str, author_font: str, title_font: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    title_left, title_right = (105, 160) if alignment == "left" else (130, 185)
+    specs = [
+        ("A thought set apart.", 40, 170, 100, "Quote-It"),
+        ("— A thoughtful author", 105, 185, 125, author_font),
+        ("Collected essays", title_left, title_right, 137, title_font),
+        ("Ordinary body resumes here.", 20, 185, 149, author_font),
+    ]
+    page = [group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+10)*scale, size=10*scale,
+        fontname=font)])[0].with_page_geometry(200*scale, 400*scale)
+        for text, x0, x1, top, font in specs]
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == [
+        "epigraph", "epigraph-attribution", "epigraph-attribution", "body",
+    ]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("alignment", ["left", "right"])
+def test_epigraph_wrapped_source_title_retains_observed_mixed_attribution_fonts(
+    scale: float, alignment: str,
+) -> None:
+    from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
+
+    continuation_left, continuation_right = (105, 160) if alignment == "left" else (130, 185)
+    words = [
+        _word("A thought set apart.", x0=40*scale, x1=170*scale,
+              top=100*scale, bottom=110*scale, size=10*scale, fontname="Book-It"),
+        _word("— A thoughtful author,", x0=105*scale, x1=155*scale,
+              top=125*scale, bottom=135*scale, size=10*scale, fontname="AAAAAA+Book-Regular"),
+        _word("Selected", x0=158*scale, x1=185*scale,
+              top=125*scale, bottom=135*scale, size=10*scale, fontname="AAAAAA+Book-It"),
+        _word("Essays (2000)", x0=continuation_left*scale, x1=continuation_right*scale,
+              top=137*scale, bottom=147*scale, size=10*scale, fontname="BBBBBB+Book-It"),
+        _word("Ordinary body resumes here.", x0=20*scale, x1=185*scale,
+              top=149*scale, bottom=159*scale, size=10*scale, fontname="Book-Regular"),
+    ]
+    page = [line.with_page_geometry(200*scale, 400*scale) for line in group_words_into_lines(words)]
+    assert [line.semantic_role for line in classify_semantic_roles([page])[0]] == [
+        "epigraph", "epigraph-attribution", "epigraph-attribution", "body",
+    ]
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
 def test_epigraph_bounds_multiline_attribution_before_resumed_body(scale: float) -> None:
     from web_translator.pdf_layout import classify_semantic_roles, group_words_into_lines
 
