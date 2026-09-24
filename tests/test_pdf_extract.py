@@ -578,6 +578,48 @@ def test_hanging_list_owns_wrapped_lines_and_stops_at_boundary(
     assert all(block.continuation_of is None for block in blocks)
 
 
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("marker", ["•", "2."])
+@pytest.mark.parametrize("right_edge", [180, 290])
+@pytest.mark.parametrize("neighbor", [False, True])
+def test_hanging_list_longer_continuation_respects_evidenced_column_boundary(
+    scale: float, marker: str, right_edge: float, neighbor: bool,
+) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    specs = [
+        (marker, 40, 44, 100),
+        ("Short first line", 50, 130, 100),
+        ("Longer genuine continuation [PLACEHOLDER].", 50, right_edge, 112),
+        ("Ordinary body returns.", 20, 180, 150),
+    ]
+    if neighbor:
+        specs.append(("Neighboring column.", 210, 310, 100))
+    lines = group_words_into_lines([
+        _word(text, x0=x0*scale, x1=x1*scale, top=top*scale,
+              bottom=(top+10)*scale, size=10*scale)
+        for text, x0, x1, top in specs
+    ])
+    # The block builder receives column-major reading order from its caller.
+    lines.sort(key=lambda line: (line.x0 >= 210*scale, line.top))
+    blocks = build_text_blocks(lines, page_number=1)
+    crosses_neighbor = neighbor and right_edge == 290
+    expected_item = f"{marker} Short first line"
+    if not crosses_neighbor:
+        expected_item += " Longer genuine continuation [PLACEHOLDER]."
+    assert blocks[0].kind == "list-item"
+    assert blocks[0].source_text == expected_item
+    assert any(block.kind == "paragraph" and block.source_text == "Ordinary body returns."
+               for block in blocks)
+    if crosses_neighbor:
+        assert blocks[1].source_text == "Longer genuine continuation [PLACEHOLDER]."
+    if neighbor:
+        assert blocks[-1].source_text == "Neighboring column."
+    assert sum(len("".join(block.source_text.split())) for block in blocks) == sum(
+        line.character_count for line in lines
+    )
+
+
 @pytest.mark.parametrize("case", [
     "no-marker", "unknown-text-edge", "body-return", "column-jump", "wider-column",
     "heading", "caption", "other-role", "other-font", "other-size", "large-gap",
@@ -604,11 +646,16 @@ def test_hanging_list_does_not_own_unproven_following_text(case: str) -> None:
         lines[-1] = replace(lines[-1], kind=case)
     if case == "other-role":
         lines[-1] = replace(lines[-1], semantic_role="epigraph")
+    if case == "wider-column":
+        # Width alone is not a column boundary: supply an independent peer.
+        lines.extend(group_words_into_lines([
+            _word("Neighboring column.", x0=210, x1=290, top=100, bottom=110),
+        ]))
     blocks = build_text_blocks(lines, page_number=1)
     if case == "no-marker":
         assert all(block.kind == "paragraph" for block in blocks)
     else:
-        assert len(blocks) == 2
+        assert len(blocks) == (3 if case == "wider-column" else 2)
         assert blocks[0].kind == "list-item"
         expected_first = "• An item." if case == "unknown-text-edge" else "• An established item."
         if case == "leading-drift":
@@ -629,8 +676,8 @@ def test_hanging_list_real_pdf_extracts_and_assembles_one_complete_item(tmp_path
     canvas.drawString(20, 350, "Example")
     canvas.setFont("Helvetica", 10)
     canvas.drawString(40, 300, "1.")
-    canvas.drawString(56, 300, "An item that needs")
-    canvas.drawString(56, 288, "its continuation")
+    canvas.drawString(56, 300, "An item")
+    canvas.drawString(56, 288, "that needs its continuation")
     canvas.drawString(56, 276, "and ending.")
     body_text = "A separate ordinary body paragraph remains outside this complete list."
     canvas.drawString(20, 254, body_text)

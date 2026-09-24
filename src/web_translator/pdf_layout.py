@@ -1625,7 +1625,7 @@ def merge_contiguous_paragraph_lines(
     merged: list[tuple[PdfBlockKind, tuple[PdfLine, ...]]] = []
     for index, (kind, line) in enumerate(classified):
         if (merged and merged[-1][0] == "list-item"
-                and _continues_hanging_list(merged[-1][1], kind, line)):
+                and _continues_hanging_list(merged[-1][1], kind, line, classified)):
             merged[-1] = ("list-item", (*merged[-1][1], line))
             continue
         continues_reference = (
@@ -1665,6 +1665,7 @@ def merge_contiguous_paragraph_lines(
 
 def _continues_hanging_list(
     owned: Sequence[PdfLine], kind: PdfBlockKind, current: PdfLine,
+    classified: Sequence[tuple[PdfBlockKind, PdfLine]],
 ) -> bool:
     first, previous = owned[0], owned[-1]
     marker = split_list_marker(first.text)
@@ -1684,9 +1685,23 @@ def _continues_hanging_list(
     gap = current.top - previous.bottom
     if (
         abs(current.x0 - body.x0) > size * 0.25
-        or current.x1 > first.x1 + size * 0.5
         or abs(current.size - body.size) > size * 0.15
         or not -1e-9 <= gap <= size * 0.75
+    ):
+        return False
+    # A short first line does not establish a column's right edge. Only an
+    # independently observed, side-by-side body peer can bound that extent.
+    # Inspect page-local geometry, since column-major peers may occur later.
+    if any(
+        peer_kind in {"paragraph", "list-item"}
+        and peer.semantic_role == "body" and not peer.is_spanning
+        and current.x1 > peer.x0
+        and any(
+            peer.x0 - line.x1 >= _MINIMUM_GUTTER
+            and line.vertical_overlap_ratio(peer) >= _VERTICAL_OVERLAP
+            for line in owned
+        )
+        for peer_kind, peer in classified
     ):
         return False
 
