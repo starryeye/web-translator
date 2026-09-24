@@ -545,6 +545,114 @@ def test_build_text_blocks_merges_only_contiguous_paragraph_lines() -> None:
     ]
 
 
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("marker,size,text_left", [("•", 10, 50), ("2.", 12, 65)])
+@pytest.mark.parametrize("ending", ["body", "next-item", "nested-item"])
+def test_hanging_list_owns_wrapped_lines_and_stops_at_boundary(
+    scale: float, marker: str, size: float, text_left: float, ending: str,
+) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    specs = [
+        (marker, text_left-10, text_left-6, 100),
+        ("First part ends with and", text_left, 180, 100),
+        ("its original continuation", text_left+0.001, 180, 100+size*1.2),
+        ("preserves [PLACEHOLDER].", text_left, 155, 100+size*2.4),
+    ]
+    last_top = 100+size*4.6
+    if ending == "body":
+        specs.append(("Independent ordinary body.", 20, 180, last_top))
+    else:
+        new_left = text_left + (20 if ending == "nested-item" else 0)
+        specs.extend([("3.", new_left-10, new_left-6, last_top),
+                      ("A distinct item.", new_left, 180, last_top)])
+    lines = group_words_into_lines([_word(text, x0=x0*scale, x1=x1*scale,
+        top=top*scale, bottom=(top+size)*scale, size=size*scale)
+        for text,x0,x1,top in specs])
+    blocks = build_text_blocks(lines, page_number=1)
+    assert [(block.kind, block.source_text) for block in blocks] == [
+        ("list-item", f"{marker} First part ends with and its original continuation preserves [PLACEHOLDER]."),
+        ("paragraph", "Independent ordinary body.") if ending == "body" else ("list-item", "3. A distinct item."),
+    ]
+    assert sum(len(''.join(block.source_text.split())) for block in blocks) == sum(line.character_count for line in lines)
+    assert all(block.continuation_of is None for block in blocks)
+
+
+@pytest.mark.parametrize("case", [
+    "no-marker", "unknown-text-edge", "body-return", "column-jump", "wider-column",
+    "heading", "caption", "other-role", "other-font", "other-size", "large-gap",
+    "leading-drift",
+])
+def test_hanging_list_does_not_own_unproven_following_text(case: str) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    first = ([_word("•", x0=40, x1=44, top=100, bottom=110),
+              _word("An established item.", x0=50, x1=180, top=100, bottom=110)]
+             if case not in {"no-marker", "unknown-text-edge"} else
+             [_word("Ordinary text." if case == "no-marker" else "• An item.",
+                    x0=40, x1=180, top=100, bottom=110)])
+    x0 = 20 if case == "body-return" else (210 if case == "column-jump" else 50)
+    x1 = 290 if case in {"column-jump", "wider-column"} else 180
+    top = 135 if case == "large-gap" else (128 if case == "leading-drift" else 112)
+    size = 14 if case == "other-size" else 10
+    if case == "leading-drift":
+        first.append(_word("A genuine continuation.", x0=50, x1=180, top=112, bottom=122))
+    lines = group_words_into_lines(first + [_word("Independent following content.",
+        x0=x0, x1=x1, top=top, bottom=top+size, size=size,
+        fontname="OtherText-Regular" if case == "other-font" else "Helvetica")])
+    if case in {"heading", "caption"}:
+        lines[-1] = replace(lines[-1], kind=case)
+    if case == "other-role":
+        lines[-1] = replace(lines[-1], semantic_role="epigraph")
+    blocks = build_text_blocks(lines, page_number=1)
+    if case == "no-marker":
+        assert all(block.kind == "paragraph" for block in blocks)
+    else:
+        assert len(blocks) == 2
+        assert blocks[0].kind == "list-item"
+        expected_first = "• An item." if case == "unknown-text-edge" else "• An established item."
+        if case == "leading-drift":
+            expected_first += " A genuine continuation."
+        assert blocks[0].source_text == expected_first
+        assert blocks[1].source_text == "Independent following content."
+
+
+def test_hanging_list_real_pdf_extracts_and_assembles_one_complete_item(tmp_path: Path) -> None:
+    from pypdf import PdfReader
+    from tests.test_pdf_assemble import _assembly_run, _assemble_publication
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_flowables import read_pdf_layout
+
+    source = tmp_path / "hanging-list.pdf"
+    canvas = Canvas(str(source), pagesize=(400, 400))
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(20, 350, "Example")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(40, 300, "1.")
+    canvas.drawString(56, 300, "An item that needs")
+    canvas.drawString(56, 288, "its continuation")
+    canvas.drawString(56, 276, "and ending.")
+    body_text = "A separate ordinary body paragraph remains outside this complete list."
+    canvas.drawString(20, 254, body_text)
+    canvas.save()
+    run_dir, _, _ = _assembly_run(tmp_path)
+    (run_dir / "segments.jsonl").unlink()
+    document = extract_pdf(source, run_dir / "document.json", run_dir / "segments.jsonl", run_dir / "media")
+    items = [block for block in document.blocks if block.kind == "list-item"]
+    assert [block.source_text for block in items] == ["1. An item that needs its continuation and ending."]
+    assert any(block.kind == "paragraph" and block.source_text == body_text
+               for block in document.blocks)
+    record = json.loads((run_dir / "source.json").read_text())
+    record.update(sha256=document.source_sha256, byte_length=source.stat().st_size)
+    (run_dir / "source.json").write_text(json.dumps(record))
+    output = _assemble_publication(run_dir, tmp_path / "output")
+    rendered = " ".join(" ".join(page.extract_text() or "" for page in PdfReader(output).pages).split())
+    assert rendered.count("1. An item that needs its continuation and ending.") == 1
+    assert rendered.count(body_text) == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert sum(flow.block_id == items[0].id for flow in layout.flowables) == 1
+
+
 def test_paragraph_spacing_evidence_does_not_cross_font_families() -> None:
     from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
 

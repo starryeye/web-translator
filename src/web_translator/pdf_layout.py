@@ -1624,6 +1624,10 @@ def merge_contiguous_paragraph_lines(
     """Merge contiguous prose while respecting semantic entry boundaries."""
     merged: list[tuple[PdfBlockKind, tuple[PdfLine, ...]]] = []
     for index, (kind, line) in enumerate(classified):
+        if (merged and merged[-1][0] == "list-item"
+                and _continues_hanging_list(merged[-1][1], kind, line)):
+            merged[-1] = ("list-item", (*merged[-1][1], line))
+            continue
         continues_reference = (
             merged
             and merged[-1][1][-1].semantic_role == "reference-entry"
@@ -1657,6 +1661,48 @@ def merge_contiguous_paragraph_lines(
         else:
             merged.append((kind, (line,)))
     return merged
+
+
+def _continues_hanging_list(
+    owned: Sequence[PdfLine], kind: PdfBlockKind, current: PdfLine,
+) -> bool:
+    first, previous = owned[0], owned[-1]
+    marker = split_list_marker(first.text)
+    if (
+        kind != "paragraph" or current.semantic_role != "body"
+        or first.semantic_role != "body" or marker is None
+        or split_list_marker(current.text) is not None
+        or len(first.words) < 2 or first.words[0].text != marker[0]
+    ):
+        return False
+    # A separately observed body word supplies the hanging edge; marker text
+    # alone cannot authorize ownership of an arbitrary following paragraph.
+    body = replace(first, words=first.words[1:])
+    if body.x0 <= first.words[0].x1:
+        return False
+    size = max(body.size, current.size)
+    gap = current.top - previous.bottom
+    if (
+        abs(current.x0 - body.x0) > size * 0.25
+        or current.x1 > first.x1 + size * 0.5
+        or abs(current.size - body.size) > size * 0.15
+        or not -1e-9 <= gap <= size * 0.75
+    ):
+        return False
+
+    def dominant_font(line: PdfLine) -> str:
+        weights: Counter[str] = Counter()
+        for word in line.words:
+            weights[word.fontname.split("+")[-1].casefold()] += word.character_count
+        return weights.most_common(1)[0][0]
+
+    if dominant_font(body) != dominant_font(current):
+        return False
+    if len(owned) > 1:
+        established_gap = owned[1].top - first.bottom
+        if abs(gap - established_gap) > size * 0.25:
+            return False
+    return True
 
 
 def _source_paragraph_gap(
