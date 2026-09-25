@@ -1989,11 +1989,19 @@ def detect_footnotes(
             for block in blocks
             if block.id != body.id
             and block.bbox[1] < body.bbox[1]
-            and any(
-                _normalized_marker(str(character.get("text", ""))) == marker
-                and _character_inside_bbox(character, block.bbox)
-                and _character_size(character) <= block.style.font_size * 0.85 + 1e-9
-                for character in characters
+            and (
+                any(
+                    _normalized_marker(str(character.get("text", ""))) == marker
+                    and _character_inside_bbox(character, block.bbox)
+                    and _character_size(character) <= block.style.font_size * 0.85 + 1e-9
+                    and _isolated_marker_character(character, block, characters)
+                    for character in characters
+                )
+                or (
+                    len(marker) > 1
+                    and block.kind in {"paragraph", "list-item"}
+                    and _inline_marker_characters(block, marker, characters)
+                )
             )
         ]
         trailing_owners = [
@@ -2095,7 +2103,23 @@ def detect_footnotes(
                 f"ambiguous footnote destination for block {owner.id}"
             )
         claimed_owners[owner.id] = body.id
-        replacements[body.id] = replace(body, kind="footnote")
+        note = body
+        for candidate in sorted(blocks, key=lambda block: block.order):
+            if candidate.order <= note.order or candidate.id in removed:
+                continue
+            if _continues_owned_footnote(note, candidate, marker, median_size, page_height):
+                note = replace(
+                    note,
+                    bbox=(min(note.bbox[0], candidate.bbox[0]), note.bbox[1],
+                          max(note.bbox[2], candidate.bbox[2]), candidate.bbox[3]),
+                    style=replace(note.style, space_after=candidate.style.space_after),
+                    source_text=f"{note.source_text} {candidate.source_text}",
+                    order=candidate.order,
+                )
+                removed.add(candidate.id)
+            else:
+                break
+        replacements[body.id] = replace(note, kind="footnote", order=body.order)
         replacements[owner.id] = replace(current_owner, destination=body.id)
     return [
         replacements.get(block.id, block)
@@ -2672,6 +2696,135 @@ def _trailing_marker_characters(
             if not marker.startswith(rendered):
                 break
     return None
+
+
+def _inline_marker_characters(
+    owner: PdfBlock,
+    marker: str,
+    characters: Sequence[Mapping[str, object]],
+) -> bool:
+    """Require one complete raised glyph run attached to ordinary body text."""
+    owned = [
+        character for character in characters
+        if str(character.get("text", "")).strip()
+        and _character_fully_inside_bbox(character, owner.bbox)
+        and _character_bbox(character) is not None
+    ]
+    small = sorted(
+        (character for character in owned
+         if _character_size(character) <= owner.style.font_size * 0.85 + 1e-9),
+        key=lambda character: (float(character["x0"]), float(character["top"])),
+    )
+    ordinary = [
+        character for character in owned
+        if _character_size(character) > owner.style.font_size * 0.85 + 1e-9
+    ]
+    for start in range(len(small)):
+        run: list[Mapping[str, object]] = []
+        rendered = ""
+        for character in small[start:]:
+            glyph = _normalized_marker(str(character.get("text", "")))
+            bbox = _character_bbox(character)
+            if len(glyph) != 1 or bbox is None:
+                break
+            if run:
+                previous = _character_bbox(run[-1])
+                if (previous is None
+                    or _vertical_overlap_ratio(previous, bbox) < 0.50
+                    or not -owner.style.font_size * 0.10 <= bbox[0] - previous[2]
+                    <= owner.style.font_size * 0.25
+                    or abs(_character_size(character) - _character_size(run[-1]))
+                    > owner.style.font_size * 0.15):
+                    break
+            run.append(character)
+            rendered += glyph
+            if not marker.startswith(rendered):
+                break
+            if rendered != marker:
+                continue
+            left = _character_bbox(run[0])
+            right = bbox
+            assert left is not None
+            # A suffix/prefix of a longer small-character run is not a marker.
+            if any(
+                item not in run
+                and (other := _character_bbox(item)) is not None
+                and _vertical_overlap_ratio(other, left if other[0] < left[0] else right) >= 0.50
+                and (0 <= left[0] - other[2] <= owner.style.font_size * 0.25
+                     if other[0] < left[0] else
+                     0 <= other[0] - right[2] <= owner.style.font_size * 0.25)
+                for item in small
+            ):
+                break
+            before = any(
+                (base := _character_bbox(item)) is not None
+                and _vertical_overlap_ratio(base, left) >= 0.25
+                and left[1] < base[1]
+                and left[3] <= base[3] - owner.style.font_size * 0.20
+                and 0 <= left[0] - base[2] <= owner.style.font_size * 0.50
+                for item in ordinary
+            )
+            after = any(
+                (base := _character_bbox(item)) is not None
+                and _vertical_overlap_ratio(base, right) >= 0.25
+                and right[1] < base[1]
+                and right[3] <= base[3] - owner.style.font_size * 0.20
+                and 0 <= base[0] - right[2] <= owner.style.font_size * 0.50
+                for item in ordinary
+            )
+            if before and after:
+                return True
+            break
+    return False
+
+
+def _isolated_marker_character(
+    marker_character: Mapping[str, object], owner: PdfBlock,
+    characters: Sequence[Mapping[str, object]],
+) -> bool:
+    """Reject one glyph that is actually part of a longer raised run."""
+    bbox = _character_bbox(marker_character)
+    if bbox is None:
+        return False
+    return not any(
+        other is not marker_character
+        and _character_fully_inside_bbox(other, owner.bbox)
+        and _character_size(other) <= owner.style.font_size * 0.85 + 1e-9
+        and (other_bbox := _character_bbox(other)) is not None
+        and _vertical_overlap_ratio(bbox, other_bbox) >= 0.50
+        and (
+            0 <= bbox[0] - other_bbox[2] <= owner.style.font_size * 0.25
+            or 0 <= other_bbox[0] - bbox[2] <= owner.style.font_size * 0.25
+        )
+        for other in characters
+    )
+
+
+def _continues_owned_footnote(
+    note: PdfBlock, candidate: PdfBlock, marker: str,
+    median_size: float, page_height: float,
+) -> bool:
+    if (candidate.kind != "paragraph" or candidate.page_number != note.page_number
+        or candidate.semantic_role != note.semantic_role
+        or candidate.bbox[1] < page_height * 0.75
+        or _leading_footnote_marker(candidate.source_text) is not None
+        or candidate.style.font_size > median_size * 0.85 + 1e-9
+        or abs(candidate.style.font_size - note.style.font_size)
+        > note.style.font_size * 0.15
+        or candidate.style.bold != note.style.bold):
+        return False
+    gap = candidate.bbox[1] - note.bbox[3]
+    horizontal_overlap = max(
+        0.0, min(note.bbox[2], candidate.bbox[2])
+        - max(note.bbox[0], candidate.bbox[0])
+    )
+    return (
+        -1e-9 <= gap <= note.style.font_size * 0.75
+        and abs(candidate.bbox[0] - note.bbox[0]) <= note.style.font_size * 0.25
+        and horizontal_overlap >= min(
+            note.bbox[2] - note.bbox[0], candidate.bbox[2] - candidate.bbox[0]
+        ) * 0.50
+    )
 
 
 def _trim_footnote_marker_extent(

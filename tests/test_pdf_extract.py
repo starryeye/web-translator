@@ -3858,6 +3858,231 @@ def test_detect_footnotes_pairs_a_lowercase_roman_marker() -> None:
     assert by_id["pdf:page-0001:block-0003"].kind == "footnote"
 
 
+def _inline_note_case(
+    marker: str = "ii", *, scale: float = 1.0,
+) -> tuple[list[PdfBlock], list[dict[str, object]]]:
+    normal = PdfBlockStyle(10.0 * scale, False, "left", 50.0 * scale, 0.0)
+    small = PdfBlockStyle(7.0 * scale, False, "left", 50.0 * scale, 0.0)
+    owner = PdfBlock(
+        id="pdf:page-0001:block-0001", page_number=1, order=0,
+        kind="paragraph", bbox=tuple(value * scale for value in (50, 100, 230, 112)),
+        style=normal, source_text=f"Prelude {marker} follows the marker",
+    )
+    context = replace(
+        owner, id="pdf:page-0001:block-0002", order=1,
+        bbox=tuple(value * scale for value in (50, 135, 230, 147)),
+        source_text="Ordinary context text", destination=None,
+    )
+    note = PdfBlock(
+        id="pdf:page-0001:block-0003", page_number=1, order=2,
+        kind="list-item", bbox=tuple(value * scale for value in (50, 175, 220, 184)),
+        style=small, source_text=f"{marker}. A compact page note begins",
+    )
+    raw = [
+        ("e", 93.0, 98.0, 103.0, 111.0, 10.0),
+        *((letter, 98.2 + i * 2.1, 100.1 + i * 2.1, 100.0, 106.0, 6.0)
+          for i, letter in enumerate(marker)),
+        ("f", 100.2 + len(marker) * 2.1, 105.2 + len(marker) * 2.1,
+         103.0, 111.0, 10.0),
+    ]
+    characters = [
+        {"text": text, "x0": x0 * scale, "x1": x1 * scale,
+         "top": top * scale, "bottom": bottom * scale, "size": size * scale}
+        for text, x0, x1, top, bottom, size in raw
+    ]
+    return [owner, context, note], characters
+
+
+@pytest.mark.parametrize("marker,scale", [("ii", 1.0), ("iii", 1.0), ("12", 1.0), ("ii", 1.7)])
+def test_detect_footnotes_pairs_attached_inline_multiglyph_marker(
+    marker: str, scale: float,
+) -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case(marker, scale=scale)
+    detected = detect_footnotes(blocks, characters, page_height=200.0 * scale)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[0].id].source_text == blocks[0].source_text
+    assert by_id[blocks[0].id].bbox == blocks[0].bbox
+    assert by_id[blocks[0].id].destination == blocks[2].id
+    assert by_id[blocks[2].id].kind == "footnote"
+
+
+@pytest.mark.parametrize("change", [
+    "ordinary_size", "wide_gap", "misaligned", "wrong_marker", "longer_run", "detached",
+])
+def test_detect_footnotes_rejects_unattached_inline_multiglyph_marker(change: str) -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    if change == "ordinary_size":
+        for character in characters[1:3]:
+            character["size"] = 10.0
+    elif change == "wide_gap":
+        characters[2]["x0"] = 107.0
+        characters[2]["x1"] = 108.9
+    elif change == "misaligned":
+        characters[2]["top"] = 88.0
+        characters[2]["bottom"] = 94.0
+    elif change == "wrong_marker":
+        characters[2]["text"] = "v"
+    elif change == "longer_run":
+        blocks[0] = replace(blocks[0], source_text="Prelude iii follows the marker")
+        characters.insert(3, {
+            "text": "i", "x0": 102.4, "x1": 104.3,
+            "top": 100.0, "bottom": 106.0, "size": 6.0,
+        })
+    else:
+        characters[0]["x0"] = 60.0
+        characters[0]["x1"] = 65.0
+        characters[-1]["x0"] = 130.0
+        characters[-1]["x1"] = 135.0
+    detected = detect_footnotes(blocks, characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[0].id].destination is None
+    assert by_id[blocks[2].id].kind == "list-item"
+
+
+def test_detect_footnotes_rejects_two_inline_multiglyph_owners() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    second = replace(blocks[0], id="pdf:page-0001:block-0004", order=3,
+                     bbox=(50.0, 120.0, 230.0, 132.0))
+    second_characters = [
+        {**character, "top": float(character["top"]) + 20.0,
+         "bottom": float(character["bottom"]) + 20.0}
+        for character in characters
+    ]
+    with pytest.raises(PdfExtractionError, match="ambiguous footnote marker"):
+        detect_footnotes([*blocks, second], [*characters, *second_characters],
+                         page_height=200.0)
+
+
+@pytest.mark.parametrize("run,short_marker", [("ii", "i"), ("12", "1")])
+def test_detect_footnotes_rejects_single_marker_inside_longer_superscript_run(
+    run: str, short_marker: str,
+) -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case(run)
+    blocks[2] = replace(blocks[2], source_text=f"{short_marker}. Different note marker")
+    detected = detect_footnotes(blocks, characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[0].id].destination is None
+    assert by_id[blocks[2].id].kind == "list-item"
+
+
+def test_detect_footnotes_keeps_ordinary_roman_list_without_owner() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    detected = detect_footnotes(blocks[1:], characters, page_height=200.0)
+    assert next(block for block in detected if block.id == blocks[2].id).kind == "list-item"
+
+
+def test_detect_footnotes_retains_same_page_nonhanging_note_continuation() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    continuation = replace(
+        blocks[2], id="pdf:page-0001:block-0004", order=3, kind="paragraph",
+        bbox=(50.0, 185.0, 220.0, 194.0),
+        source_text="and continues on the next baseline",
+    )
+    detected = detect_footnotes([*blocks, continuation], characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert continuation.id not in by_id
+    assert by_id[blocks[2].id].source_text == (
+        "ii. A compact page note begins and continues on the next baseline"
+    )
+    assert by_id[blocks[2].id].bbox == (50.0, 175.0, 220.0, 194.0)
+    assert by_id[blocks[2].id].kind == "footnote"
+
+
+@pytest.mark.parametrize("change", ["new_marker", "column", "large_gap", "large_font", "other_kind"])
+def test_detect_footnotes_stops_owned_note_at_structural_boundary(change: str) -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    candidate = replace(
+        blocks[2], id="pdf:page-0001:block-0004", order=3, kind="paragraph",
+        bbox=(50.0, 185.0, 220.0, 194.0), source_text="Further page text",
+    )
+    if change == "new_marker":
+        candidate = replace(candidate, source_text="iii. A separate note")
+    elif change == "column":
+        candidate = replace(candidate, bbox=(240.0, 185.0, 350.0, 194.0))
+    elif change == "large_gap":
+        candidate = replace(candidate, bbox=(50.0, 205.0, 220.0, 214.0))
+    elif change == "large_font":
+        candidate = replace(candidate, style=blocks[0].style)
+    else:
+        candidate = replace(candidate, kind="heading")
+    detected = detect_footnotes([*blocks, candidate], characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[2].id].source_text == blocks[2].source_text
+    assert by_id[candidate.id].source_text == candidate.source_text
+
+
+def test_inline_multiglyph_note_real_pdf_extracts_and_assembles_once(tmp_path: Path) -> None:
+    from pypdf import PdfReader
+    from tests.test_pdf_assemble import _assembly_run, _assemble_publication
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_flowables import read_pdf_layout
+
+    source = tmp_path / "inline-note.pdf"
+    canvas = Canvas(str(source), pagesize=(400, 300))
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.drawString(50, 260, "Inline note example")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(50, 225, "A claim with an inline")
+    canvas.setFont("Helvetica", 6)
+    canvas.drawString(145, 229, "ii")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(151, 225, "marker and following prose.")
+    canvas.drawString(50, 195, "Ordinary body context stays independent.")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(50, 30, "ii. A compact note begins here")
+    canvas.drawString(50, 20, "and continues at the marker margin.")
+    canvas.save()
+
+    run_dir, _, _ = _assembly_run(tmp_path)
+    (run_dir / "segments.jsonl").unlink()
+    document = extract_pdf(
+        source, run_dir / "document.json", run_dir / "segments.jsonl", run_dir / "media"
+    )
+    notes = [block for block in document.blocks if block.kind == "footnote"]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.source_text == (
+        "ii. A compact note begins here and continues at the marker margin."
+    )
+    owners = [block for block in document.blocks if block.destination == note.id]
+    assert len(owners) == 1
+    assert "marker and following prose." in owners[0].source_text
+    assert not any(
+        block.id != note.id and "continues at the marker margin" in block.source_text
+        for block in document.blocks
+    )
+
+    record = json.loads((run_dir / "source.json").read_text())
+    record.update(sha256=document.source_sha256, byte_length=source.stat().st_size)
+    (run_dir / "source.json").write_text(json.dumps(record))
+    output = _assemble_publication(run_dir, tmp_path / "output")
+    rendered = " ".join(
+        " ".join(page.extract_text() or "" for page in PdfReader(output).pages).split()
+    )
+    assert rendered.count(note.source_text) == 1
+    layout = read_pdf_layout(run_dir / "layout.json")
+    assert sum(flow.block_id == note.id for flow in layout.flowables) == 1
+
+
 def test_footnote_marker_does_not_treat_roman_letter_words_as_markers() -> None:
     from web_translator.pdf_layout import _leading_footnote_marker
 
