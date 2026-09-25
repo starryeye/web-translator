@@ -2734,7 +2734,19 @@ def _inline_marker_characters(
                     or not -owner.style.font_size * 0.10 <= bbox[0] - previous[2]
                     <= owner.style.font_size * 0.25
                     or abs(_character_size(character) - _character_size(run[-1]))
-                    > owner.style.font_size * 0.15):
+                    > owner.style.font_size * 0.15
+                    # Even a tight gap can contain an explicit source space or
+                    # another glyph: neither belongs to one marker token.
+                    or any(
+                        other is not run[-1] and other is not character
+                        and _character_fully_inside_bbox(other, owner.bbox)
+                        and (between := _character_bbox(other)) is not None
+                        and between[0] < bbox[0] - 1e-6
+                        and between[2] > previous[2] + 1e-6
+                        and _vertical_overlap_ratio(between, previous) >= 0.50
+                        and _vertical_overlap_ratio(between, bbox) >= 0.50
+                        for other in characters
+                    )):
                     break
             run.append(character)
             rendered += glyph

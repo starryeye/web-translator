@@ -3976,6 +3976,46 @@ def test_detect_footnotes_rejects_single_marker_inside_longer_superscript_run(
     assert by_id[blocks[2].id].kind == "list-item"
 
 
+@pytest.mark.parametrize("marker,intervening,size", [
+    ("ii", " ", 6.0), ("12", " ", 6.0),
+    ("ii", "x", 10.0), ("12", "x", 10.0),
+])
+def test_detect_footnotes_rejects_intervening_source_glyph_inside_marker_run(
+    marker: str, intervening: str, size: float,
+) -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case(marker)
+    characters[2]["x0"] = 102.0
+    characters[2]["x1"] = 103.9
+    characters.insert(2, {
+        "text": intervening, "x0": 100.1, "x1": 102.0,
+        "top": 100.0 if intervening == " " else 103.0,
+        "bottom": 106.0 if intervening == " " else 111.0,
+        "size": size,
+    })
+    detected = detect_footnotes(blocks, characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[0].id].destination is None
+    assert by_id[blocks[2].id].kind == "list-item"
+
+
+def test_detect_footnotes_accepts_contiguous_run_despite_unrelated_space() -> None:
+    from web_translator.pdf_layout import detect_footnotes
+
+    blocks, characters = _inline_note_case()
+    characters.append({
+        "text": " ", "x0": 100.1, "x1": 100.3,
+        "top": 108.0, "bottom": 111.0, "size": 6.0,
+    })
+    detected = detect_footnotes(blocks, characters, page_height=200.0)
+    by_id = {block.id: block for block in detected}
+
+    assert by_id[blocks[0].id].destination == blocks[2].id
+    assert by_id[blocks[2].id].kind == "footnote"
+
+
 def test_detect_footnotes_keeps_ordinary_roman_list_without_owner() -> None:
     from web_translator.pdf_layout import detect_footnotes
 
@@ -4081,6 +4121,35 @@ def test_inline_multiglyph_note_real_pdf_extracts_and_assembles_once(tmp_path: P
     assert rendered.count(note.source_text) == 1
     layout = read_pdf_layout(run_dir / "layout.json")
     assert sum(flow.block_id == note.id for flow in layout.flowables) == 1
+
+
+def test_spaced_superscript_real_pdf_does_not_claim_contiguous_note(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import extract_pdf
+
+    source = tmp_path / "spaced-inline-note.pdf"
+    canvas = Canvas(str(source), pagesize=(400, 300))
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.drawString(50, 260, "Inline note example")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(50, 225, "A claim with an inline")
+    canvas.setFont("Helvetica", 6)
+    canvas.drawString(145, 229, "i i")
+    canvas.setFont("Helvetica", 10)
+    canvas.drawString(151, 225, "marker and following prose.")
+    canvas.drawString(50, 195, "Ordinary body context stays independent.")
+    canvas.setFont("Helvetica", 7)
+    canvas.drawString(50, 30, "ii. A compact note begins here")
+    canvas.drawString(50, 20, "and continues at the marker margin.")
+    canvas.save()
+
+    document = extract_pdf(
+        source, tmp_path / "document.json", tmp_path / "segments.jsonl",
+        tmp_path / "media",
+    )
+    assert not any(block.kind == "footnote" for block in document.blocks)
+    assert not any(block.destination is not None for block in document.blocks)
+    assert any(block.kind == "list-item" and block.source_text.startswith("ii.")
+               for block in document.blocks)
 
 
 def test_footnote_marker_does_not_treat_roman_letter_words_as_markers() -> None:
