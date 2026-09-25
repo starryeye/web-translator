@@ -1693,12 +1693,18 @@ def _continues_hanging_list(
     # independently observed, side-by-side body peer can bound that extent.
     # Inspect page-local geometry, since column-major peers may occur later.
     if any(
-        peer_kind in {"paragraph", "list-item"}
+        peer is not current and peer_kind in {"paragraph", "list-item"}
         and peer.semantic_role == "body" and not peer.is_spanning
         and current.x1 > peer.x0
         and any(
             peer.x0 - line.x1 >= _MINIMUM_GUTTER
-            and line.vertical_overlap_ratio(peer) >= _VERTICAL_OVERLAP
+            and (
+                line.vertical_overlap_ratio(peer) >= _VERTICAL_OVERLAP
+                # A staggered peer may begin below the owned line but still
+                # occupy the candidate's extent. Even partial overlap is a
+                # conflict; separation stays anchored to the owned line.
+                or current.vertical_overlap_ratio(peer) > 0
+            )
             for line in owned
         )
         for peer_kind, peer in classified

@@ -620,6 +620,52 @@ def test_hanging_list_longer_continuation_respects_evidenced_column_boundary(
     )
 
 
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+@pytest.mark.parametrize("marker", ["•", "1."])
+@pytest.mark.parametrize("right_edge", [180, 290])
+@pytest.mark.parametrize("peer_top", [118, 122, 150, 250])
+def test_hanging_list_producer_path_checks_peer_overlapping_candidate(
+    scale: float, marker: str, right_edge: float, peer_top: float,
+) -> None:
+    from web_translator.pdf_layout import (
+        build_text_blocks, classify_document_lines, group_words_into_lines,
+        order_page_lines,
+    )
+
+    specs = [
+        (marker, 40, 44, 100),
+        ("Short first line", 50, 130, 100),
+        ("A wider continuation [PLACEHOLDER].", 50, right_edge, 112),
+        ("Right-column peer", 210, 310, peer_top),
+    ]
+    lines = group_words_into_lines([
+        _word(text, x0=x0*scale, x1=x1*scale, top=top*scale,
+              bottom=(top+10)*scale, size=10*scale)
+        for text, x0, x1, top in specs
+    ])
+    assert len(lines) == 3  # Staggered baselines survive the real word grouper.
+    classified = classify_document_lines([([
+        line.with_page_geometry(400*scale, 600*scale) for line in lines
+    ], 600*scale)])[0]
+    assert len(classified) == 3
+    assert all(line.semantic_role == "body" for line in classified)
+    ordered = order_page_lines(classified, 400*scale)
+    blocks = build_text_blocks(ordered, page_number=1)
+
+    crosses_local_peer = right_edge == 290 and peer_top == 118
+    expected_item = f"{marker} Short first line"
+    if not crosses_local_peer:
+        expected_item += " A wider continuation [PLACEHOLDER]."
+    assert blocks[0].kind == "list-item"
+    assert blocks[0].source_text == expected_item
+    assert blocks[-1].source_text == "Right-column peer"
+    if crosses_local_peer:
+        assert blocks[1].source_text == "A wider continuation [PLACEHOLDER]."
+    assert sum(len("".join(block.source_text.split())) for block in blocks) == sum(
+        line.character_count for line in lines
+    )
+
+
 @pytest.mark.parametrize("case", [
     "no-marker", "unknown-text-edge", "body-return", "column-jump", "wider-column",
     "heading", "caption", "other-role", "other-font", "other-size", "large-gap",
