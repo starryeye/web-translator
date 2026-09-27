@@ -1,6 +1,6 @@
 # PDF Logical Translation Units
 
-Status: proposed design for user review; implementation is not authorized yet.
+Status: design approved on 2026-09-28; implementation awaits written-plan approval.
 
 ## Intent and boundaries
 
