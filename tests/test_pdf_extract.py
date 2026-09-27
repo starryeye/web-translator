@@ -1371,6 +1371,231 @@ def test_running_band_inherits_one_page_token_free_label_from_neighbors() -> Non
     assert [page[-1].kind for page in classified] == ["footer", "footer", "footer"]
 
 
+def _bounded_band_lines(*, scale=1.0, gutter=15.0, left_end=135.0, tail=True):
+    from web_translator.pdf_layout import group_words_into_lines
+
+    specs = [
+        ("Surrounding prose before the local region.", 20, 280, 20),
+        ("Alpha first phrase.", 20, left_end, 60),
+        ("Omega first phrase.", left_end + gutter, 280, 60),
+        ("Alpha second PRODUC‐", 20, left_end, 72),
+        ("Omega second phrase.", left_end + gutter, 275, 72),
+    ]
+    if tail:
+        specs.append(("TION", 20.001, 44, 84))
+    specs.extend([
+        ("A separately arranged label", 20, 100, 112),
+        ("Independent value", 200, 280, 112),
+        ("Surrounding prose after the local region.", 20, 280, 150),
+    ])
+    return [line.with_page_geometry(300 * scale, 400 * scale)
+            for line in group_words_into_lines([
+                _word(text, x0=x0 * scale, x1=x1 * scale,
+                      top=top * scale, bottom=(top + 8) * scale,
+                      size=8 * scale, fontname="Sample-Regular")
+                for text, x0, x1, top in specs
+            ])]
+
+
+@pytest.mark.parametrize(("scale", "gutter", "left_end"), [
+    (0.7, 15, 135), (1, 15, 135), (1.8, 15, 135),
+    (1, 25, 90), (1.5, 25, 180),
+])
+def test_bounded_columns_preserve_surrounding_flow_and_normalize_final_adjacency(
+    scale: float, gutter: float, left_end: float,
+) -> None:
+    from web_translator.pdf_layout import (
+        build_text_blocks, classify_document_lines, classify_semantic_roles,
+        order_page_lines,
+    )
+
+    raw = _bounded_band_lines(scale=scale, gutter=gutter, left_end=left_end)
+    classified = classify_semantic_roles(classify_document_lines([(raw, 400 * scale)]))[0]
+    ordered = order_page_lines(classified, 300 * scale)
+    assert [line.text for line in ordered] == [
+        "Surrounding prose before the local region.",
+        "Alpha first phrase.", "Alpha second PRODUC‐", "TION",
+        "Omega first phrase.", "Omega second phrase.",
+        "A separately arranged label", "Independent value",
+        "Surrounding prose after the local region.",
+    ]
+    assert sorted(map(id, ordered)) == sorted(map(id, classified))
+    assert sorted(word.text for line in ordered for word in line.words) == sorted(
+        word.text for line in raw for word in line.words)
+    blocks = build_text_blocks(ordered, page_number=1)
+    assert [block.source_text for block in blocks] == [
+        "Surrounding prose before the local region.",
+        "Alpha first phrase. Alpha second PRODUCTION",
+        "Omega first phrase. Omega second phrase.",
+        "A separately arranged label", "Independent value",
+        "Surrounding prose after the local region.",
+    ]
+
+
+@pytest.mark.parametrize("case", [
+    "interior-crossing", "three-columns", "conflicting-rows", "wrong-leading",
+    "wrong-font", "table", "toc", "numeric", "furniture", "artwork",
+])
+def test_bounded_columns_do_not_invent_order_for_contradictory_regions(case: str) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    lines = _bounded_band_lines(gutter=25, tail=False)
+    if case == "interior-crossing":
+        lines.insert(3, group_words_into_lines([
+            _word("Crossing prose inside the region", x0=20, x1=280, top=70,
+                  bottom=78, size=8)])[0])
+    elif case == "three-columns":
+        lines = [replace(line, words=tuple(replace(w, x1=205) for w in line.words))
+                 if line.text.startswith("Omega") else line for line in lines]
+        lines.extend(group_words_into_lines([
+            _word("Third column phrase", x0=230, x1=280, top=y, bottom=y + 8, size=8)
+            for y in (60, 72)]))
+    elif case == "conflicting-rows":
+        lines[4] = replace(lines[4], words=tuple(replace(w, x0=w.x0 + 20) for w in lines[4].words))
+    elif case in {"wrong-leading", "wrong-font"}:
+        lines[3:5] = [replace(line, words=tuple(
+            replace(w, top=w.top + 12, bottom=w.bottom + 12) if case == "wrong-leading"
+            else replace(w, fontname="Other-Regular") for w in line.words))
+            for line in lines[3:5]]
+    elif case in {"table", "toc", "furniture"}:
+        lines[1:5] = [replace(line, kind="table-cell" if case == "table" else
+                            "header" if case == "furniture" else "paragraph",
+                            semantic_role="toc-entry" if case == "toc" else "body")
+                      for line in lines[1:5]]
+    elif case == "numeric":
+        lines[2] = replace(lines[2], words=(replace(lines[2].words[0], text="123.45"),))
+        lines[4] = replace(lines[4], words=(replace(lines[4].words[0], text="678.90"),))
+    boxes = [(10, 55, 290, 90)] if case == "artwork" else []
+    # Preserve the global fail-closed contract, not a guessed local ordering.
+    if case == "furniture":
+        assert order_page_lines(lines, 300) == lines
+        return
+    with pytest.raises(PdfExtractionError, match="column evidence"):
+        order_page_lines(lines, 300, spanning_bboxes=boxes)
+
+
+@pytest.mark.parametrize(("ending", "continuation"), [("‐", "TION"), ("\u00ad", "TION"), ("‐", "tion")])
+def test_fragment_repair_accepts_tiny_jitter_and_proven_uppercase(ending, continuation) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    lines = group_words_into_lines([
+        _word("A complete PRODUC" + ending, x0=20, x1=135, top=40, bottom=48, size=8),
+        _word(continuation, x0=20.001, x1=44, top=50, bottom=58, size=8),
+    ])
+    assert build_text_blocks(lines, 1)[0].source_text == "A complete PRODUC" + continuation
+    assert lines[0].text.endswith(ending)
+
+
+@pytest.mark.parametrize("case", ["ascii", "dash", "unrelated-capitals", "font", "leading", "stale"])
+def test_fragment_repair_requires_current_predecessor_and_positive_typography(case: str) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines, repair_line_fragments
+
+    first = {"ascii": "PRODUC-", "dash": "PRODUC—", "unrelated-capitals": "Notice ‐"}.get(case, "PRODUC‐")
+    lines = group_words_into_lines([
+        _word(first, x0=20, x1=135, top=40, bottom=48, size=8),
+        _word("TION", x0=20.001, x1=44, top=60 if case == "leading" else 50,
+              bottom=68 if case == "leading" else 58, size=8,
+              fontname="Different-Regular" if case == "font" else "Helvetica"),
+    ])
+    if case == "stale":
+        lines[1] = replace(lines[1], continues_discretionary_hyphen=True)
+        lines[0] = replace(lines[0], words=(replace(lines[0].words[0], text="Other—"),))
+    repaired = repair_line_fragments(lines)
+    assert not any(line.continues_discretionary_hyphen for line in repaired)
+    assert "PRODUCTION" not in " ".join(b.source_text for b in build_text_blocks(lines, 1))
+
+
+@pytest.mark.parametrize("case", ["font", "leading"])
+def test_fragment_repair_jitter_does_not_relax_typography_for_lowercase(case: str) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, repair_line_fragments
+
+    lines = group_words_into_lines([
+        _word("produc‐", x0=20, x1=135, top=40, bottom=48, size=8),
+        _word("tion", x0=20.001, x1=44, top=60 if case == "leading" else 50,
+              bottom=68 if case == "leading" else 58, size=8,
+              fontname="Other-Regular" if case == "font" else "Helvetica"),
+    ])
+    assert not repair_line_fragments(lines)[1].continues_discretionary_hyphen
+
+
+@pytest.mark.parametrize("case", ["single-column", "short-tail", "right-tail", "paired-tail", "wide-word-spacing"])
+def test_bounded_columns_observe_local_extent_and_spacing(case: str) -> None:
+    from web_translator.pdf_layout import group_words_into_lines, order_page_lines
+
+    lines = _bounded_band_lines()
+    if case == "single-column":
+        lines = [line for line in lines if not line.text.startswith("Omega")
+                 and line.text != "Independent value"]
+        assert order_page_lines(lines, 300) == lines
+        return
+    if case == "right-tail":
+        lines[5] = replace(lines[5], words=tuple(replace(w, x0=150, x1=180) for w in lines[5].words))
+    if case == "paired-tail":
+        lines.extend(group_words_into_lines([
+            _word("Omega ending.", x0=150, x1=210, top=84, bottom=92, size=8,
+                  fontname="Sample-Regular")]))
+    if case == "wide-word-spacing":
+        # The gap is not distinct from this region's own word spacing.
+        for index in (1, 3):
+            word = lines[index].words[0]
+            lines[index] = replace(lines[index], words=(
+                replace(word, text="Alpha", x1=80), replace(word, text="phrase", x0=90)))
+        assert order_page_lines(lines, 300) == lines
+        return
+    ordered = order_page_lines(lines, 300)
+    labels = [line.text for line in ordered]
+    if case == "right-tail":
+        assert labels[1:6] == ["Alpha first phrase.", "Alpha second PRODUC‐",
+                               "Omega first phrase.", "Omega second phrase.", "TION"]
+    else:
+        assert labels[1:4] == ["Alpha first phrase.", "Alpha second PRODUC‐", "TION"]
+    assert labels[-3:] == ["A separately arranged label", "Independent value",
+                            "Surrounding prose after the local region."]
+
+
+def test_bounded_columns_real_pdf_extracts_and_assembles_one_complete_word(tmp_path: Path) -> None:
+    from pypdf import PdfReader
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from tests.test_pdf_assemble import _assembly_run, _assemble_publication
+    from web_translator.pdf_extract import extract_pdf
+
+    pdfmetrics.registerFont(TTFont("LocalBandFixture", str(
+        Path(__file__).parents[1] / "src/web_translator/font_assets/NotoSansKR-Regular.ttf")))
+    source = tmp_path / "local-band.pdf"
+    canvas = Canvas(str(source), pagesize=(360, 400))
+    canvas.setFont("LocalBandFixture", 8)
+    before = "Opening prose surrounds a small local region with separate parallel text."
+    after = "Closing prose returns to the ordinary full width of the document page."
+    canvas.drawString(20, 360, before)
+    left = ["Alpha text introduces the local phrase.", "Alpha text ends with PRODUC‐"]
+    right_x = 20 + max(pdfmetrics.stringWidth(text, "LocalBandFixture", 8) for text in left) + 15
+    for index, text in enumerate(left):
+        canvas.drawString(20, 320 - index * 12, text)
+        canvas.drawString(right_x, 320 - index * 12, ["Omega starts here.", "Omega finishes here."][index])
+    canvas.drawString(20.001, 296, "TION")
+    canvas.drawString(20, 255, after)
+    canvas.save()
+    run_dir, _, _ = _assembly_run(tmp_path)
+    (run_dir / "segments.jsonl").unlink()
+    document = extract_pdf(source, run_dir / "document.json", run_dir / "segments.jsonl", run_dir / "media")
+    expected = [before, "Alpha text introduces the local phrase. Alpha text ends with PRODUCTION",
+                "Omega starts here. Omega finishes here.", after]
+    assert [block.source_text for block in document.blocks] == expected
+    assert [segment.source_text for segment in read_segments(run_dir / "segments.jsonl")] == expected
+    with pdfplumber.open(source) as pdf:
+        original = sorted(character["text"] for character in pdf.pages[0].chars
+                          if character["text"].strip())
+    assert sorted([*(char for text in expected for char in text if not char.isspace()), "‐"]) == original
+    record = json.loads((run_dir / "source.json").read_text())
+    record.update(sha256=document.source_sha256, byte_length=source.stat().st_size)
+    (run_dir / "source.json").write_text(json.dumps(record))
+    output = _assemble_publication(run_dir, tmp_path / "output")
+    rendered = " ".join(" ".join(page.extract_text() or "" for page in PdfReader(output).pages).split())
+    assert rendered.count("PRODUCTION") == 1
+    assert rendered.index("Alpha text") < rendered.index("Omega starts") < rendered.index(after)
+
+
 def test_repair_line_fragments_marks_discretionary_hyphen_without_mutating_evidence() -> None:
     from web_translator.pdf_layout import (
         build_text_blocks,

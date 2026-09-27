@@ -418,6 +418,9 @@ def order_page_lines(
     spanning_bboxes: Sequence[tuple[float, float, float, float]] = (),
 ) -> list[PdfLine]:
     """Order a single page top-to-bottom or by an unambiguous two-column gutter."""
+    bounded = _order_bounded_column_bands(lines, page_width, spanning_bboxes)
+    if bounded is not None:
+        return bounded
     gutter = find_clear_gutter(lines, page_width, minimum_width=_MINIMUM_GUTTER)
     if gutter is None:
         return sorted(lines, key=lambda item: (item.top, item.x0, item.text))
@@ -452,6 +455,135 @@ def order_page_lines(
         ),
         *bottom_edge,
     ]
+
+
+def _dominant_line_font(line: PdfLine) -> str:
+    weights: Counter[str] = Counter()
+    for word in line.words:
+        weights[word.fontname.split("+")[-1].casefold()] += word.character_count
+    return weights.most_common(1)[0][0]
+
+
+def _local_column_prose(line: PdfLine) -> bool:
+    return (
+        line.kind in {None, "paragraph"} and not line.is_heading
+        and not line.is_spanning and line.semantic_role == "body"
+        and split_list_marker(line.text) is None
+        and any(character.isalpha() for character in line.text)
+        and _TOC_DOT_LEADER_PATTERN.match(line.text) is None
+    )
+
+
+def _order_bounded_column_bands(
+    lines: Sequence[PdfLine], page_width: float,
+    spanning_bboxes: Sequence[tuple[float, float, float, float]],
+) -> list[PdfLine] | None:
+    """Use local spacing only inside independently enclosed, coherent text bands.
+
+    This does not relax the page-global gutter contract. A band needs two paired
+    rows, matching column starts/type/leading, whitespace transitions at both
+    ends, and enclosing full-width prose. Unresolved page evidence still passes
+    through the global validator before any local result can be returned.
+    """
+    ordered = sorted(lines, key=lambda line: (line.top, line.x0, line.text))
+    rows: list[list[PdfLine]] = []
+    for line in ordered:
+        if rows and any(line.vertical_overlap_ratio(peer) >= _VERTICAL_OVERLAP
+                        for peer in rows[-1]):
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+    bands: list[tuple[int, int, list[PdfLine]]] = []
+    start = 1
+    while start < len(rows) - 2:
+        first = sorted(rows[start], key=lambda line: line.x0)
+        if len(first) != 2 or not all(_local_column_prose(line) for line in first):
+            start += 1
+            continue
+        size = max(line.size for line in first)
+        before_gap = min(line.top for line in first) - max(line.bottom for line in rows[start - 1])
+        if before_gap < size * 0.75:
+            start += 1
+            continue
+        columns = [[first[0]], [first[1]]]
+        paired = 1
+        tails = 0
+        end = start + 1
+        while end < len(rows):
+            row = sorted(rows[end], key=lambda line: line.x0)
+            if len(row) not in {1, 2} or not all(_local_column_prose(line) for line in row):
+                break
+            assignments: list[tuple[int, PdfLine]] = []
+            for line in row:
+                matches = [index for index, column in enumerate(columns)
+                           if abs(line.x0 - column[0].x0) <= size * 0.25]
+                if len(matches) != 1:
+                    break
+                column = columns[matches[0]]
+                gap = line.top - column[-1].bottom
+                if (not -1e-9 <= gap <= size * 0.75
+                        or abs(line.size - column[0].size) > size * 0.15
+                        or _dominant_line_font(line) != _dominant_line_font(column[0])
+                        or (len(column) > 1 and abs(
+                            gap - (column[1].top - column[0].bottom)) > size * 0.25)
+                        or (len(row) == 1 and line.x1 > max(item.x1 for item in column) + size * 0.25)):
+                    break
+                assignments.append((matches[0], line))
+            if len(assignments) != len(row) or len({index for index, _ in assignments}) != len(row):
+                break
+            if len(row) == 1:
+                if paired < 2 or tails >= 2:
+                    break
+                tails += 1
+            elif tails:
+                break
+            else:
+                paired += 1
+            for index, line in assignments:
+                columns[index].append(line)
+            end += 1
+        band = [*columns[0], *columns[1]]
+        gutter = (max(line.x1 for line in columns[0]), min(line.x0 for line in columns[1]))
+        word_gaps = [right.x0 - left.x1 for line in band
+                     for left, right in zip(line.words, line.words[1:])
+                     if right.x0 > left.x1]
+        spacing = max(size * _WORD_GAP_FONT_MULTIPLIER,
+                      2 * max(word_gaps, default=0.0))
+        top, bottom = min(line.top for line in band), max(line.bottom for line in band)
+        enclosed = (
+            any(_local_column_prose(line) and line.crosses(gutter)
+                for row in rows[:start] for line in row)
+            and any(_local_column_prose(line) and line.crosses(gutter)
+                    for row in rows[end:] for line in row)
+        )
+        after_gap = (min(line.top for line in rows[end]) - bottom
+                     if end < len(rows) else -math.inf)
+        intersects_rich = any(
+            bbox[1] < bottom and bbox[3] > top
+            and bbox[0] < max(line.x1 for line in band)
+            and bbox[2] > min(line.x0 for line in band)
+            for bbox in spanning_bboxes
+        )
+        if (paired >= 2 and gutter[1] - gutter[0] > spacing and enclosed
+                and after_gap >= size * 0.75 and not intersects_rich):
+            bands.append((start, end, band))
+            start = end
+        else:
+            start += 1
+    if not bands:
+        return None
+    owned = {id(line) for _, _, band in bands for line in band}
+    remaining = [line for line in ordered if id(line) not in owned]
+    if order_page_lines(remaining, page_width, spanning_bboxes=spanning_bboxes) != remaining:
+        raise PdfExtractionError("conflicting column evidence outside bounded text bands")
+    result: list[PdfLine] = []
+    previous = 0
+    for start, end, band in bands:
+        result.extend(line for row in rows[previous:start] for line in row)
+        result.extend(band)
+        previous = end
+    result.extend(line for row in rows[previous:] for line in row)
+    return result
 
 
 def order_column_regions(
@@ -690,10 +822,9 @@ def repair_line_fragments(lines: Sequence[PdfLine]) -> list[PdfLine]:
     """Mark proven discretionary-hyphen continuations without changing evidence."""
     repaired: list[PdfLine] = []
     for line in lines:
-        if repaired and _is_wrapped_token_continuation(repaired[-1], line):
-            repaired.append(replace(line, continues_discretionary_hyphen=True))
-        else:
-            repaired.append(line)
+        continues = bool(repaired and _is_wrapped_token_continuation(repaired[-1], line))
+        repaired.append(replace(line, continues_discretionary_hyphen=continues)
+                        if line.continues_discretionary_hyphen != continues else line)
     return repaired
 
 
@@ -708,7 +839,7 @@ def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
     if abs(previous.x0 - current.x0) > max(previous.size, current.size):
         return False
     if (
-        not math.isclose(previous.x0, current.x0, abs_tol=1e-9)
+        abs(previous.x0 - current.x0) > max(previous.size, current.size) * 0.05
         and abs(previous.x1 - current.x1) > max(previous.size, current.size)
     ):
         return False
@@ -725,11 +856,27 @@ def _is_wrapped_token_continuation(previous: PdfLine, current: PdfLine) -> bool:
     leading = current.top - previous.bottom
     if leading > max(previous.size, current.size) * _PARAGRAPH_GAP_FONT_MULTIPLIER:
         return False
+    # The newly tolerated shorter ending with x0 jitter needs positive type and
+    # tight-leading evidence; retain the established exact-edge behavior.
+    if (not math.isclose(previous.x0, current.x0, abs_tol=1e-9)
+            and abs(previous.x1 - current.x1) > max(previous.size, current.size)
+            and (leading > max(previous.size, current.size) * 0.75
+                 or _dominant_line_font(previous) != _dominant_line_font(current))):
+        return False
     if abs(previous.size - current.size) > max(previous.size, current.size) * 0.15:
         return False
     first_character = current.text.lstrip()[:1]
-    if not first_character or not first_character.isalpha() or not first_character.islower():
+    if not first_character or not first_character.isalpha():
         return False
+    if not first_character.islower():
+        terminal = re.search(r"([A-Z]{2,})[\u00ad\u2010]$", previous.text.rstrip())
+        initial = re.match(r"[A-Z]{2,}(?:\b|$)", current.text.lstrip())
+        if (terminal is None or initial is None
+                or abs(previous.x0 - current.x0) > max(previous.size, current.size) * 0.05
+                or current.x1 > previous.x1
+                or leading > max(previous.size, current.size) * 0.75
+                or _dominant_line_font(previous) != _dominant_line_font(current)):
+            return False
     return previous.text.rstrip()[-1:] in _DISCRETIONARY_HYPHENS
 
 
@@ -1800,7 +1947,7 @@ def _paragraphs_are_contiguous(previous: PdfLine, current: PdfLine) -> bool:
 
 def build_text_blocks(lines: Sequence[PdfLine], page_number: int) -> list[PdfBlock]:
     """Build strict page-local text blocks with stable IDs."""
-    classified = [classify_line(line) for line in lines]
+    classified = [classify_line(line) for line in repair_line_fragments(lines)]
     merged = merge_contiguous_paragraph_lines(classified)
     blocks: list[PdfBlock] = []
     for index, (kind, block_lines) in enumerate(merged):
