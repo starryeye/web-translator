@@ -694,11 +694,6 @@ class PdfDocument:
     flow_findings: list[PdfFlowFinding] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
-        if self.schema_version == "1.2":
-            from web_translator.pdf_units import validate_unit_membership
-            validate_unit_membership(self)
-            if any(unit.segment_id is None for unit in self.translation_units):
-                raise PdfContractError("PdfDocument serialized units require assigned segment IDs")
         data: dict[str, object] = {
             "schema_version": self.schema_version,
             "source_sha256": self.source_sha256,
@@ -715,6 +710,8 @@ class PdfDocument:
             data.update(extracted_schema_version=self.extracted_schema_version,
                         translation_units=[unit.to_dict() for unit in self.translation_units],
                         flow_findings=[finding.to_dict() for finding in self.flow_findings])
+            # Direct constructors bypass from_dict; never publish an invalid nested record.
+            type(self).from_dict(data)
         return data
 
     @classmethod

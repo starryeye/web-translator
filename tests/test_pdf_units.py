@@ -154,3 +154,20 @@ def test_flow_finding_requires_known_blocks_and_required_severity() -> None:
     payload["flow_findings"][0]["severity"] = "warning"
     with pytest.raises(PdfContractError, match="severity"):
         PdfDocument.from_dict(payload)
+
+
+@pytest.mark.parametrize("malformed", ["operation", "evidence"])
+def test_unit_document_refuses_to_serialize_invalid_nested_join(malformed: str) -> None:
+    doc = make_unit_document()
+    unit = doc.translation_units[0]
+    join = unit.joins[0]
+    if malformed == "operation":
+        join = replace(join, operation="concatenate")
+    else:
+        line = replace(join.evidence.left.first_line, font_size=float("nan"))
+        boundary = replace(join.evidence.left, first_line=line)
+        join = replace(join, evidence=replace(join.evidence, left=boundary))
+    doc.translation_units[0] = replace(unit, joins=(join,))
+
+    with pytest.raises(PdfContractError, match="operation|font_size"):
+        doc.to_dict()
