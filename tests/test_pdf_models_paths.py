@@ -85,6 +85,29 @@ def test_pdf_document_upgrades_schema_1_blocks_to_body_role() -> None:
     assert [block.semantic_role for block in loaded.blocks] == ["body"]
 
 
+def test_pdf_document_reads_explicit_schema_1_2_units() -> None:
+    payload = make_pdf_document().to_dict()
+    payload.update(
+        schema_version="1.2",
+        extracted_schema_version="1.1",
+        translation_units=[{
+            "id": "pdf:unit-000001",
+            "source_block_ids": ["pdf:page-0001:block-0001"],
+            "kind": "paragraph",
+            "semantic_role": "body",
+            "segment_id": "seg-000001",
+            "joins": [],
+        }],
+        flow_findings=[],
+    )
+
+    loaded = PdfDocument.from_dict(payload)
+
+    assert loaded.schema_version == "1.2"
+    assert loaded.extracted_schema_version == "1.1"
+    assert loaded.to_dict() == payload
+
+
 def test_pdf_block_preserves_legacy_positional_constructor_order() -> None:
     block = PdfBlock(
         "pdf:page-0001:block-0001", 1, 0, "paragraph",

@@ -31,6 +31,7 @@ _TABLE_ID = re.compile(r"pdf:page-(?P<page>\d{4}):table-\d{4}\Z")
 _TABLE_CELL_ID = re.compile(r"pdf:page-\d{4}:table-\d{4}:row-\d{4}:cell-\d{4}\Z")
 _LINK_ID = re.compile(r"pdf:page-(?P<page>\d{4}):link-\d{4}\Z")
 _SEGMENT_ID = re.compile(r"seg-\d{6}\Z")
+_UNIT_ID = re.compile(r"pdf:unit-\d{6}\Z")
 _BLOCK_KINDS = {
     "heading", "paragraph", "list-item", "table-cell", "figure",
     "caption", "footnote", "header", "footer", "page-number",
@@ -518,6 +519,165 @@ class PdfLinkEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfBoundaryLine:
+    bbox: BBox
+    font_size: float
+    font_family: str
+    text: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"bbox": list(self.bbox), "font_size": self.font_size,
+                "font_family": self.font_family, "text": self.text}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfBoundaryLine:
+        context = "PdfBoundaryLine"
+        data = _require_exact_fields(data, context, {"bbox", "font_size", "font_family", "text"})
+        return cls(_require_bbox(data, context), _require_positive_float(data, "font_size", context),
+                   _require_string(data, "font_family", context), _require_string(data, "text", context))
+
+
+@dataclass(frozen=True, slots=True)
+class PdfBlockBoundary:
+    block_id: str
+    first_line: PdfBoundaryLine
+    last_line: PdfBoundaryLine
+    column_bbox: BBox
+    text_indent: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {"block_id": self.block_id, "first_line": self.first_line.to_dict(),
+                "last_line": self.last_line.to_dict(), "column_bbox": list(self.column_bbox),
+                "text_indent": self.text_indent}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfBlockBoundary:
+        context = "PdfBlockBoundary"
+        data = _require_exact_fields(data, context, {"block_id", "first_line", "last_line", "column_bbox", "text_indent"})
+        block_id = _require_string(data, "block_id", context)
+        if _BLOCK_ID.fullmatch(block_id) is None:
+            raise PdfContractError(f"{context}.block_id must be a stable block ID")
+        column_data = {"bbox": data["column_bbox"]}
+        return cls(block_id,
+                   PdfBoundaryLine.from_dict(_require_mapping_value(data, "first_line", context)),
+                   PdfBoundaryLine.from_dict(_require_mapping_value(data, "last_line", context)),
+                   _require_bbox(column_data, f"{context}.column"),
+                   _require_finite_float(data, "text_indent", context))
+
+
+@dataclass(frozen=True, slots=True)
+class PdfJoinEvidence:
+    left: PdfBlockBoundary
+    right: PdfBlockBoundary
+    left_page_size: tuple[float, float]
+    right_page_size: tuple[float, float]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"left": self.left.to_dict(), "right": self.right.to_dict(),
+                "left_page_size": list(self.left_page_size), "right_page_size": list(self.right_page_size)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfJoinEvidence:
+        context = "PdfJoinEvidence"
+        data = _require_exact_fields(data, context, {"left", "right", "left_page_size", "right_page_size"})
+        return cls(PdfBlockBoundary.from_dict(_require_mapping_value(data, "left", context)),
+                   PdfBlockBoundary.from_dict(_require_mapping_value(data, "right", context)),
+                   _require_page_size(data, "left_page_size", context),
+                   _require_page_size(data, "right_page_size", context))
+
+
+@dataclass(frozen=True, slots=True)
+class PdfTextJoin:
+    left_block_id: str
+    right_block_id: str
+    operation: Literal["space", "remove-discretionary-hyphen"]
+    evidence: PdfJoinEvidence
+
+    def to_dict(self) -> dict[str, object]:
+        return {"left_block_id": self.left_block_id, "right_block_id": self.right_block_id,
+                "operation": self.operation, "evidence": self.evidence.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfTextJoin:
+        context = "PdfTextJoin"
+        data = _require_exact_fields(data, context, {"left_block_id", "right_block_id", "operation", "evidence"})
+        left = _require_string(data, "left_block_id", context)
+        right = _require_string(data, "right_block_id", context)
+        operation = _require_string(data, "operation", context)
+        if _BLOCK_ID.fullmatch(left) is None or _BLOCK_ID.fullmatch(right) is None:
+            raise PdfContractError(f"{context} block IDs must be stable")
+        if operation not in {"space", "remove-discretionary-hyphen"}:
+            raise PdfContractError(f"{context}.operation is not supported")
+        evidence = PdfJoinEvidence.from_dict(_require_mapping_value(data, "evidence", context))
+        if evidence.left.block_id != left or evidence.right.block_id != right:
+            raise PdfContractError(f"{context}.evidence block IDs must match join")
+        return cls(left, right, operation, evidence)
+
+
+@dataclass(frozen=True, slots=True)
+class PdfTranslationUnit:
+    id: str
+    source_block_ids: tuple[str, ...]
+    kind: PdfBlockKind
+    semantic_role: PdfSemanticRole
+    segment_id: str | None
+    joins: tuple[PdfTextJoin, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"id": self.id, "source_block_ids": list(self.source_block_ids), "kind": self.kind,
+                "semantic_role": self.semantic_role, "segment_id": self.segment_id,
+                "joins": [join.to_dict() for join in self.joins]}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfTranslationUnit:
+        context = "PdfTranslationUnit"
+        data = _require_exact_fields(data, context, {"id", "source_block_ids", "kind", "semantic_role", "segment_id", "joins"})
+        identifier = _require_string(data, "id", context)
+        if _UNIT_ID.fullmatch(identifier) is None:
+            raise PdfContractError(f"{context}.id must be a stable unit ID")
+        members = tuple(_require_string_list(data, "source_block_ids", context))
+        if not members or len(set(members)) != len(members) or any(_BLOCK_ID.fullmatch(member) is None for member in members):
+            raise PdfContractError(f"{context}.source_block_ids must contain unique stable members")
+        kind = _require_string(data, "kind", context)
+        role = _require_string(data, "semantic_role", context)
+        if kind not in _BLOCK_KINDS or role not in _SEMANTIC_ROLES:
+            raise PdfContractError(f"{context} kind or semantic_role is not supported")
+        segment_id = _require_optional_string(data, "segment_id", context)
+        if segment_id is not None and _SEGMENT_ID.fullmatch(segment_id) is None:
+            raise PdfContractError(f"{context}.segment_id must be a stable segment ID")
+        joins = tuple(PdfTextJoin.from_dict(_require_mapping(item, f"{context}.joins[{index}]"))
+                      for index, item in enumerate(_require_list(data, "joins", context)))
+        return cls(identifier, members, kind, role, segment_id, joins)
+
+
+@dataclass(frozen=True, slots=True)
+class PdfFlowFinding:
+    code: str
+    left_block_id: str
+    right_block_id: str
+    severity: Literal["required"]
+    message: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"code": self.code, "left_block_id": self.left_block_id,
+                "right_block_id": self.right_block_id, "severity": self.severity, "message": self.message}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PdfFlowFinding:
+        context = "PdfFlowFinding"
+        data = _require_exact_fields(data, context, {"code", "left_block_id", "right_block_id", "severity", "message"})
+        code = _require_string(data, "code", context)
+        left = _require_string(data, "left_block_id", context)
+        right = _require_string(data, "right_block_id", context)
+        severity = _require_string(data, "severity", context)
+        if _BLOCK_ID.fullmatch(left) is None or _BLOCK_ID.fullmatch(right) is None:
+            raise PdfContractError(f"{context} block IDs must be stable")
+        if severity != "required":
+            raise PdfContractError(f"{context}.severity must be required")
+        return cls(code, left, right, severity, _require_string(data, "message", context))
+
+
+@dataclass(frozen=True, slots=True)
 class PdfDocument:
     schema_version: str
     source_sha256: str
@@ -529,9 +689,17 @@ class PdfDocument:
     table_cells: list[PdfTableCell] = field(default_factory=list)
     links: list[PdfLinkEvidence] = field(default_factory=list)
     extraction_warnings: list[str] = field(default_factory=list)
+    extracted_schema_version: str | None = None
+    translation_units: list[PdfTranslationUnit] = field(default_factory=list)
+    flow_findings: list[PdfFlowFinding] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        if self.schema_version == "1.2":
+            from web_translator.pdf_units import validate_unit_membership
+            validate_unit_membership(self)
+            if any(unit.segment_id is None for unit in self.translation_units):
+                raise PdfContractError("PdfDocument serialized units require assigned segment IDs")
+        data: dict[str, object] = {
             "schema_version": self.schema_version,
             "source_sha256": self.source_sha256,
             "page_count": self.page_count,
@@ -543,20 +711,26 @@ class PdfDocument:
             "links": [link.to_dict() for link in self.links],
             "extraction_warnings": list(self.extraction_warnings),
         }
+        if self.schema_version == "1.2":
+            data.update(extracted_schema_version=self.extracted_schema_version,
+                        translation_units=[unit.to_dict() for unit in self.translation_units],
+                        flow_findings=[finding.to_dict() for finding in self.flow_findings])
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PdfDocument:
         context = "PdfDocument"
-        data = _require_exact_fields(
-            data, context,
-            {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"},
-        )
+        base_fields = {"schema_version", "source_sha256", "page_count", "selectable_characters", "scan_candidate_pages", "pages", "blocks", "table_cells", "links", "extraction_warnings"}
+        data = _require_mapping(data, context)
         root_version = _require_string(data, "schema_version", context)
+        data = _require_exact_fields(data, context, base_fields | (
+            {"extracted_schema_version", "translation_units", "flow_findings"}
+            if root_version == "1.2" else set()))
         if root_version == "1.0":
             data = upgrade_pdf_document_v1(data)
-        elif root_version != PDF_DOCUMENT_SCHEMA_VERSION:
+        elif root_version not in {PDF_DOCUMENT_SCHEMA_VERSION, "1.2"}:
             raise PdfContractError(
-                f"{context}.schema_version must be {PDF_DOCUMENT_SCHEMA_VERSION}"
+                f"{context}.schema_version must be 1.0, {PDF_DOCUMENT_SCHEMA_VERSION}, or 1.2"
             )
         pages = [PdfPage.from_dict(_require_mapping(item, f"{context}.pages[{index}]")) for index, item in enumerate(_require_list(data, "pages", context))]
         page_count = _require_positive_int(data, "page_count", context)
@@ -638,8 +812,19 @@ class PdfDocument:
             raise PdfContractError(
                 f"{context}.extraction_warnings must be sorted and unique"
             )
-        return cls(
-            schema_version=_require_pdf_document_schema_version(data, context),
+        extracted_schema_version = None
+        translation_units: list[PdfTranslationUnit] = []
+        flow_findings: list[PdfFlowFinding] = []
+        if root_version == "1.2":
+            extracted_schema_version = _require_string(data, "extracted_schema_version", context)
+            if extracted_schema_version not in {"1.0", "1.1"}:
+                raise PdfContractError(f"{context}.extracted_schema_version must be 1.0 or 1.1")
+            translation_units = [PdfTranslationUnit.from_dict(_require_mapping(item, f"{context}.translation_units[{index}]"))
+                                 for index, item in enumerate(_require_list(data, "translation_units", context))]
+            flow_findings = [PdfFlowFinding.from_dict(_require_mapping(item, f"{context}.flow_findings[{index}]"))
+                             for index, item in enumerate(_require_list(data, "flow_findings", context))]
+        document = cls(
+            schema_version=root_version if root_version == "1.2" else _require_pdf_document_schema_version(data, context),
             source_sha256=_require_sha256(data, "source_sha256", context),
             page_count=page_count,
             selectable_characters=_require_nonnegative_int(data, "selectable_characters", context),
@@ -649,7 +834,16 @@ class PdfDocument:
             table_cells=table_cells,
             links=links,
             extraction_warnings=extraction_warnings,
+            extracted_schema_version=extracted_schema_version,
+            translation_units=translation_units,
+            flow_findings=flow_findings,
         )
+        if root_version == "1.2":
+            from web_translator.pdf_units import validate_unit_membership
+            validate_unit_membership(document)
+            if any(unit.segment_id is None for unit in document.translation_units):
+                raise PdfContractError("PdfDocument serialized units require assigned segment IDs")
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -878,6 +1072,36 @@ def upgrade_pdf_document_v1(data: Mapping[str, Any]) -> dict[str, Any]:
     return upgraded
 
 
+def upgrade_pdf_document_to_units(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Explicitly adapt a validated 1.0/1.1 extraction to singleton units."""
+    from web_translator.pdf_units import TRANSLATABLE_KINDS
+
+    data = _require_mapping(data, "PdfDocument")
+    origin = _require_string(data, "schema_version", "PdfDocument")
+    if origin not in {"1.0", "1.1"}:
+        raise PdfContractError("PdfDocument unit upgrade requires schema 1.0 or 1.1")
+    legacy = PdfDocument.from_dict(data)
+    upgraded = legacy.to_dict()
+    units = []
+    for block in legacy.blocks:
+        if block.kind not in TRANSLATABLE_KINDS or not block.source_text.strip():
+            continue
+        if block.segment_id is None:
+            raise PdfContractError("PdfDocument legacy target lacks a segment ID")
+        units.append(PdfTranslationUnit(
+            id=f"pdf:unit-{len(units) + 1:06d}",
+            source_block_ids=(block.id,),
+            kind=block.kind,
+            semantic_role=block.semantic_role,
+            segment_id=block.segment_id,
+            joins=(),
+        ).to_dict())
+    upgraded.update(schema_version="1.2", extracted_schema_version=origin,
+                    translation_units=units, flow_findings=[])
+    PdfDocument.from_dict(upgraded)
+    return upgraded
+
+
 def _require_rotation(data: Mapping[str, Any], context: str) -> int:
     rotation = _require_int_value(data["rotation"], f"{context}.rotation")
     if rotation not in {0, 90, 180, 270}:
@@ -898,6 +1122,17 @@ def _require_bbox(data: Mapping[str, Any], context: str) -> BBox:
     if x1 <= x0 or bottom <= top:
         raise PdfContractError(f"{context}.bbox must have positive width and height")
     return (x0, top, x1, bottom)
+
+
+def _require_page_size(data: Mapping[str, Any], field: str, context: str) -> tuple[float, float]:
+    value = data[field]
+    if not isinstance(value, list) or len(value) != 2:
+        raise PdfContractError(f"{context}.{field} must be a width/height pair")
+    width, height = value
+    if any(type(item) not in {int, float} or not math.isfinite(float(item)) or item <= 0
+           for item in (width, height)):
+        raise PdfContractError(f"{context}.{field} must contain positive finite numbers")
+    return (float(width), float(height))
 
 
 def _require_optional_relative_path(data: Mapping[str, Any], field: str, context: str) -> str | None:
