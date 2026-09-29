@@ -4,9 +4,323 @@ from dataclasses import replace
 
 import pytest
 
-from tests.pdf_unit_fixtures import make_unit_document
+from tests.pdf_unit_fixtures import make_flow_case, make_observed_flow, make_unit_document
 from web_translator.pdf_models import PdfContractError, PdfDocument, PdfFlowFinding, upgrade_pdf_document_to_units
 from web_translator.pdf_units import project_unit_text, unit_for_block, validate_unit_membership
+from web_translator import pdf_units
+
+
+def build_flow(case, *, scale=1.0):
+    assert hasattr(pdf_units, "build_translation_units"), "logical flow builder is missing"
+    blocks, pages, boundaries = make_flow_case(case, scale=scale)
+    return blocks, pdf_units.build_translation_units(blocks, pages, boundaries)
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.0, 1.7])
+def test_cross_page_discretionary_word_is_one_unit(scale):
+    blocks, (units, findings) = build_flow("discretionary", scale=scale)
+    assert not findings
+    assert len(units) == 1
+    assert units[0].source_block_ids == tuple(b.id for b in blocks)
+    assert units[0].segment_id is None
+    assert project_unit_text(units[0], {b.id: b for b in blocks}).text == "A paragraph continues."
+
+
+@pytest.mark.parametrize("case", ["blank-page", "new-indent", "new-list", "nested-list", "heading", "table", "figure", "column-change", "sentence-end"])
+def test_structural_boundary_is_not_joined(case):
+    _, (units, findings) = build_flow(case)
+    assert all(len(u.source_block_ids) == 1 for u in units)
+    assert not findings
+
+
+def test_three_page_chain_preserves_order():
+    blocks, (units, findings) = build_flow("three-page")
+    assert not findings
+    assert len(units) == 1
+    assert units[0].source_block_ids == tuple(b.id for b in blocks)
+    assert project_unit_text(units[0], {b.id: b for b in blocks}).text == "A paragraph continues."
+
+
+def test_list_continuation_keeps_one_marker():
+    blocks, (units, findings) = build_flow("list")
+    assert not findings
+    assert len(units) == 1
+    assert units[0].kind == "list-item"
+    text = project_unit_text(units[0], {b.id: b for b in blocks}).text
+    assert text == "• A paragraph continues."
+    assert text.count("•") == 1
+
+
+def test_recto_verso_normalizes_observed_column_margins():
+    _, (units, findings) = build_flow("recto-verso")
+    assert len(units) == 1 and not findings
+    evidence = units[0].joins[0].evidence
+    assert evidence.left.column_bbox == (72, 72, 540, 720)
+    assert evidence.right.column_bbox == (90, 72, 558, 720)
+
+
+def test_conflicting_continuation_has_required_finding():
+    blocks, (units, findings) = build_flow("conflict")
+    assert len(units) == 2
+    assert len(findings) == 1
+    assert findings[0].severity == "required"
+    assert (findings[0].left_block_id, findings[0].right_block_id) == tuple(b.id for b in blocks)
+    assert findings[0].code == "ambiguous-page-continuation"
+    assert "font" in findings[0].message
+
+
+@pytest.mark.parametrize("case,status", [("space", "join"), ("short-tail", "ambiguous"), ("sentence-end", "separate")])
+def test_nonhyphen_join_requires_filled_tail(case, status):
+    assert hasattr(pdf_units, "decide_page_join"), "page join decision is missing"
+    blocks, pages, boundaries = make_flow_case(case)
+    decision = pdf_units.decide_page_join(*blocks, *(boundaries[b.id] for b in blocks), {p.number: p for p in pages})
+    assert decision.status == status
+    assert (decision.join is not None) == (status == "join")
+    assert (decision.finding is not None) == (status == "ambiguous")
+
+
+@pytest.mark.parametrize("field,value", [("line_pitch", 0), ("line_pitch", float("nan")), ("line_pitch", -1), ("column_count", 0), ("column_index", 1)])
+def test_boundary_rejects_invalid_observed_context(field, value):
+    from web_translator.pdf_models import PdfBlockBoundary
+    data = make_unit_document().translation_units[0].joins[0].evidence.left.to_dict()
+    data.update(line_pitch=18, column_index=0, column_count=1)
+    data[field] = value
+    with pytest.raises(PdfContractError):
+        PdfBlockBoundary.from_dict(data)
+
+
+def test_boundary_roundtrip_retains_optional_observed_context():
+    from web_translator.pdf_models import PdfBlockBoundary
+    data = make_unit_document().translation_units[0].joins[0].evidence.left.to_dict()
+    data.update(line_pitch=18, column_index=1, column_count=2)
+    assert PdfBlockBoundary.from_dict(data).to_dict() == data
+    data.update(line_pitch=None, column_index=None, column_count=None)
+    assert PdfBlockBoundary.from_dict(data).to_dict() == data
+
+
+@pytest.mark.parametrize("columns", [1, 2])
+@pytest.mark.parametrize("scale", [0.75, 1.0, 1.7])
+def test_collected_owned_lines_supply_real_column_and_pitch_evidence(columns, scale):
+    from web_translator import pdf_extract
+    assert hasattr(pdf_extract, "collect_flow_boundaries"), "boundary producer is missing"
+    blocks, pages, lines = make_observed_flow(columns=columns, scale=scale)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines)
+    tail = next(b for b in blocks if b.source_text.endswith("A para‐"))
+    head = next(b for b in blocks if b.source_text.startswith("graph continues."))
+    assert boundaries[tail.id].last_line.text == "A para‐"
+    assert boundaries[tail.id].last_line.bbox[1] == 708 * scale
+    assert boundaries[tail.id].first_line.bbox[1] == 672 * scale
+    assert boundaries[tail.id].line_pitch == pytest.approx(18 * scale)
+    assert boundaries[tail.id].column_index == columns - 1
+    assert boundaries[head.id].column_index == 0
+    assert boundaries[tail.id].column_count == columns
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert not findings
+    assert [u.source_block_ids for u in units if len(u.source_block_ids) > 1] == [(tail.id, head.id)]
+    assert len(units) == len(blocks) - 1
+
+
+@pytest.mark.parametrize("problem", ["duplicate-owner", "wrong-text", "missing-lines", "sparse-frame"])
+def test_collector_does_not_invent_unproven_boundaries(problem):
+    from web_translator import pdf_extract
+    assert hasattr(pdf_extract, "collect_flow_boundaries"), "boundary producer is missing"
+    blocks, pages, lines = make_observed_flow()
+    target = blocks[0]
+    if problem == "duplicate-owner":
+        blocks.append(replace(target, id="pdf:page-0001:block-0099"))
+    elif problem == "wrong-text":
+        blocks[0] = replace(target, source_text="not owned by these lines")
+    elif problem == "missing-lines":
+        lines[1] = lines[1][1:]
+    else:
+        lines[1] = lines[1][:1]
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines)
+    assert target.id not in boundaries
+
+
+@pytest.mark.parametrize("field,value", [("line_pitch", None), ("column_index", None), ("column_count", None)])
+def test_missing_observed_context_cannot_prove_join(field, value):
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    boundaries[blocks[0].id] = replace(boundaries[blocks[0].id], **{field: value})
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert len(units) == 2 and len(findings) == 1
+    assert findings[0].severity == "required"
+
+
+@pytest.mark.parametrize("left_index,right_index,status", [(1, 0, "join"), (0, 0, "separate"), (1, 1, "separate")])
+def test_only_outer_reading_order_column_edges_may_join(left_index, right_index, status):
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    left, right = [boundaries[b.id] for b in blocks]
+    decision = pdf_units.decide_page_join(*blocks,
+        replace(left, column_count=2, column_index=left_index),
+        replace(right, column_count=2, column_index=right_index), {p.number: p for p in pages})
+    assert decision.status == status
+
+
+@pytest.mark.parametrize("dimension,inside,outside", [("font", 1.8, 1.801), ("indent", 3.0, 3.001), ("filled-tail", 12.0, 12.001), ("placement", 9.0, 9.001), ("width", 3.0, 3.001)])
+def test_join_tolerance_has_exact_inside_outside_boundary(dimension, inside, outside):
+    for delta, want in ((inside, "join"), (outside, "separate" if dimension in {"indent", "width"} else "ambiguous")):
+        blocks, pages, boundaries = make_flow_case("space")
+        left, right = [boundaries[b.id] for b in blocks]
+        if dimension == "font":
+            left = replace(left, last_line=replace(left.last_line, font_size=12 - delta))
+        elif dimension == "indent":
+            right = replace(right, first_line=replace(right.first_line, bbox=(72 + delta, 72, 540, 84)))
+        elif dimension == "filled-tail":
+            left = replace(left, last_line=replace(left.last_line, bbox=(72, 708, 540 - delta, 720)))
+        elif dimension == "placement":
+            left = replace(left, last_line=replace(left.last_line, bbox=(72, 708 - delta, 540, 720 - delta)))
+        else:
+            right = replace(right, column_bbox=(72, 72, 540 - delta, 720))
+        decision = pdf_units.decide_page_join(*blocks, left, right, {p.number: p for p in pages})
+        assert decision.status == want, (dimension, delta)
+
+
+@pytest.mark.parametrize("kind", ["heading", "figure", "table", "caption"])
+def test_builder_does_not_chain_through_intervening_structure(kind):
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    blocker = replace(blocks[0], id="pdf:page-0001:block-0002", order=1, kind=kind)
+    blocks[1] = replace(blocks[1], order=2)
+    units, findings = pdf_units.build_translation_units([blocks[0], blocker, blocks[1]], pages, boundaries)
+    assert all(len(u.source_block_ids) == 1 for u in units)
+    assert not findings
+
+
+def test_linked_page_edge_note_and_furniture_do_not_break_body_flow():
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    note = replace(blocks[0], id="pdf:page-0001:block-0002", order=1, kind="footnote", source_text="1 A note.")
+    footer = replace(note, id="pdf:page-0001:block-0003", order=2, kind="footer")
+    blocks[0] = replace(blocks[0], destination=note.id)
+    blocks[1] = replace(blocks[1], order=3)
+    units, findings = pdf_units.build_translation_units([blocks[0], note, footer, blocks[1]], pages, boundaries)
+    assert not findings
+    assert [u.source_block_ids for u in units] == [(blocks[0].id, blocks[1].id), (note.id,)]
+
+
+def test_multiple_candidate_successors_create_required_finding():
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    competitor = replace(blocks[1], id="pdf:page-0002:block-0002", order=2)
+    boundaries[competitor.id] = replace(boundaries[blocks[1].id], block_id=competitor.id)
+    units, findings = pdf_units.build_translation_units([*blocks, competitor], pages, boundaries)
+    assert len(units) == 3 and len(findings) == 1
+    assert findings[0].severity == "required"
+
+
+@pytest.mark.parametrize("case", ["sentence-end"])
+def test_clear_paragraph_end_stays_separate_without_boundary(case):
+    blocks, pages, _ = make_flow_case(case)
+    units, findings = pdf_units.build_translation_units(blocks, pages, {})
+    assert len(units) == 2 and not findings
+
+
+@pytest.mark.parametrize("text", ["A paragraph.\"", "A paragraph.)"])
+def test_quoted_sentence_end_is_not_continuation(text):
+    blocks, pages, boundaries = make_flow_case("space")
+    blocks[0] = replace(blocks[0], source_text=text)
+    left = boundaries[blocks[0].id]
+    boundaries[blocks[0].id] = replace(left, last_line=replace(left.last_line, text=text))
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert len(units) == 2 and not findings
+
+
+@pytest.mark.parametrize("mark", ["-", "−", "–", "—"])
+def test_non_discretionary_marks_are_never_removed(mark):
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    text = "A para" + mark
+    blocks[0] = replace(blocks[0], source_text=text)
+    left = boundaries[blocks[0].id]
+    boundaries[blocks[0].id] = replace(left, last_line=replace(left.last_line, text=text))
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert not findings and len(units) == 1
+    assert project_unit_text(units[0], {b.id: b for b in blocks}).text == text + " graph continues."
+
+
+@pytest.mark.parametrize("problem", ["short-frame", "outside-frame", "wrong-own-tail", "wrong-own-head"])
+def test_incomplete_or_conflicting_frame_does_not_prove_overflow(problem):
+    blocks, pages, boundaries = make_flow_case("space")
+    left, right = [boundaries[b.id] for b in blocks]
+    if problem == "short-frame":
+        left = replace(left, column_bbox=(72, 672, 540, 720))
+        right = replace(right, column_bbox=(72, 672, 540, 720), first_line=replace(right.first_line, bbox=(72, 672, 540, 684)))
+    elif problem == "outside-frame":
+        left = replace(left, last_line=replace(left.last_line, bbox=(72, 708, 560, 720)))
+    elif problem == "wrong-own-tail":
+        left = replace(left, column_bbox=(72, 72, 540, 760))
+    else:
+        right = replace(right, column_bbox=(72, 32, 540, 720))
+    decision = pdf_units.decide_page_join(*blocks, left, right, {p.number: p for p in pages})
+    assert decision.status == "ambiguous" and decision.finding.severity == "required"
+
+
+def test_potential_competitor_without_provable_boundary_prevents_join():
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    competitor = replace(blocks[1], id="pdf:page-0002:block-0002", order=2)
+    units, findings = pdf_units.build_translation_units([*blocks, competitor], pages, boundaries)
+    assert len(units) == 3 and len(findings) == 1
+
+
+def test_collector_does_not_mistake_paragraph_spacing_for_line_pitch():
+    from web_translator.pdf_extract import collect_flow_boundaries
+    from web_translator.pdf_layout import build_text_blocks
+    blocks, pages, lines = make_observed_flow()
+    selected = []
+    for line, top in zip(lines[1][:3], (72, 200, 328)):
+        selected.append(replace(line, words=tuple(replace(word, top=top, bottom=top + 12) for word in line.words)))
+    blocks = build_text_blocks(selected, 1)
+    boundaries = collect_flow_boundaries(blocks, pages[:1], {1: selected})
+    assert all(boundary.line_pitch is None for boundary in boundaries.values())
+
+
+def test_builder_preserves_every_physical_field_and_order():
+    blocks, pages, boundaries = make_flow_case("three-page")
+    before = [b.to_dict() for b in blocks]
+    units, findings = pdf_units.build_translation_units(list(reversed(blocks)), pages, boundaries)
+    assert len(units) == 1 and not findings
+    assert [b.to_dict() for b in blocks] == before
+    assert units[0].source_block_ids == tuple(b.id for b in blocks)
+
+
+@pytest.mark.parametrize("height,status", [(72.0, "join"), (71.999, "ambiguous")])
+def test_observed_frame_needs_four_line_pitches(height, status):
+    blocks, pages, boundaries = make_flow_case("space")
+    left, right = [boundaries[b.id] for b in blocks]
+    frame = (72, 72, 540, 72 + height)
+    left = replace(left, column_bbox=frame, last_line=replace(left.last_line, bbox=(72, 60 + height, 540, 72 + height)))
+    right = replace(right, column_bbox=frame)
+    decision = pdf_units.decide_page_join(*blocks, left, right, {p.number: p for p in pages})
+    assert decision.status == status
+
+
+def test_observed_list_continuation_uses_marker_body_word_margin():
+    from web_translator.pdf_extract import collect_flow_boundaries
+    blocks, pages, lines = make_observed_flow(list_item=True)
+    boundaries = collect_flow_boundaries(blocks, pages, lines)
+    tail = next(b for b in blocks if b.kind == "list-item")
+    head = next(b for b in blocks if b.source_text.startswith("graph continues."))
+    assert boundaries[tail.id].text_indent == 18
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert not findings
+    joined = [u for u in units if len(u.source_block_ids) > 1]
+    assert len(joined) == 1
+    assert joined[0].source_block_ids == (tail.id, head.id)
+    assert project_unit_text(joined[0], {b.id: b for b in blocks}).text.count("•") == 1
+
+
+@pytest.mark.parametrize("role", ["reference-entry", "callout-body", "epigraph", "chapter-title"])
+def test_semantic_boundary_stays_separate(role):
+    blocks, pages, boundaries = make_flow_case("discretionary")
+    blocks[1] = replace(blocks[1], semantic_role=role)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert len(units) == 2 and not findings
+
+
+@pytest.mark.parametrize("field,value", [("column_index", None), ("column_count", None), ("column_index", -1), ("column_count", True), ("line_pitch", True)])
+def test_observed_context_rejects_unpaired_or_wrong_types(field, value):
+    from web_translator.pdf_models import PdfBlockBoundary
+    data = make_flow_case("discretionary")[2]["pdf:page-0001:block-0001"].to_dict()
+    data[field] = value
+    with pytest.raises(PdfContractError):
+        PdfBlockBoundary.from_dict(data)
 
 
 def test_unit_roundtrip_preserves_physical_members() -> None:

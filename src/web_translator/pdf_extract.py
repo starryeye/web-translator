@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -40,9 +41,14 @@ from web_translator.pdf_layout import (
     detect_footnotes,
     detect_tables,
     extract_link_evidence,
+    find_clear_gutter,
     group_words_into_lines,
     order_page_lines,
     pair_figure_captions,
+    repair_line_fragments,
+    split_list_marker,
+    _block_source_text,
+    _paragraphs_are_contiguous,
 )
 from web_translator.pdf_media import (
     FigureRegion,
@@ -54,7 +60,9 @@ from web_translator.pdf_media import (
 )
 from web_translator.pdf_models import (
     PdfBlock,
+    PdfBlockBoundary,
     PdfBlockStyle,
+    PdfBoundaryLine,
     PdfDocument,
     PdfPage,
     PdfPageEvidence,
@@ -93,6 +101,99 @@ class _PageMaterial:
     figure_regions: tuple[FigureRegion, ...]
     figure_character_count: int
     characters: tuple[dict[str, object], ...]
+
+
+def _flow_font(line: PdfLine) -> str:
+    weights: Counter[str] = Counter()
+    for word in line.words:
+        weights[word.fontname.split("+")[-1].casefold()] += word.character_count
+    return weights.most_common(1)[0][0]
+
+
+def collect_flow_boundaries(
+    blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
+    lines_by_page: Mapping[int, Sequence[PdfLine]],
+) -> dict[str, PdfBlockBoundary]:
+    """Collect observed line evidence without changing the extraction writer.
+
+    A line must have one physical owner, whose complete text and bounds can be
+    reconstructed. Frames come from observed column lines, never block boxes.
+    Complex/ambiguous column layouts fail closed rather than inventing margins.
+    """
+    result: dict[str, PdfBlockBoundary] = {}
+    for page in pages:
+        page_blocks = [block for block in blocks if block.page_number == page.number]
+        lines = repair_line_fragments(lines_by_page.get(page.number, ()))
+        owned: dict[str, list[PdfLine]] = {block.id: [] for block in page_blocks}
+        for line in lines:
+            bbox = (line.x0, line.top, line.x1, line.bottom)
+            owners = [block for block in page_blocks if _bbox_inside(bbox, block.bbox)]
+            if len(owners) == 1:
+                owned[owners[0].id].append(line)
+        proven: dict[str, list[PdfLine]] = {}
+        for block in page_blocks:
+            members = owned[block.id]
+            if (block.kind not in {"paragraph", "list-item"} or block.semantic_role != "body"
+                    or not members or _block_source_text(members) != block.source_text):
+                continue
+            bbox = (min(line.x0 for line in members), min(line.top for line in members),
+                    max(line.x1 for line in members), max(line.bottom for line in members))
+            if all(abs(a - b) <= 1e-7 for a, b in zip(bbox, block.bbox)):
+                proven[block.id] = members
+        context = [line for members in proven.values() for line in members]
+        if len(context) < 3:
+            continue
+        try:
+            gutter = find_clear_gutter(context, page.width)
+        except PdfExtractionError:
+            continue
+        if gutter is None:
+            # A no-gutter result alone does not prove a single column. Every
+            # line must overlap a shared horizontal interval.
+            if max(line.x0 for line in context) >= min(line.x1 for line in context):
+                continue
+            columns = [context]
+        else:
+            if any(line.x0 < gutter[1] and line.x1 > gutter[0] for line in context):
+                continue
+            columns = [[line for line in context if line.x1 <= gutter[0]],
+                       [line for line in context if line.x0 >= gutter[1]]]
+        for index, column in enumerate(columns):
+            if len(column) < 3:
+                continue
+            frame = (min(line.x0 for line in column), min(line.top for line in column),
+                     max(line.x1 for line in column), max(line.bottom for line in column))
+            for block in page_blocks:
+                members = proven.get(block.id, [])
+                if not members or any(line not in column for line in members):
+                    continue
+                first, last = members[0], members[-1]
+                peers = sorted((line for line in column
+                                if _flow_font(line) == _flow_font(last)
+                                and abs(line.size - last.size) <= last.size * 0.15),
+                               key=lambda line: line.top)
+                pitches = [right.top - left.top for left, right in zip(peers, peers[1:])
+                           if right.top > left.top and _paragraphs_are_contiguous(left, right)]
+                # Two agreeing observed intervals are the minimum evidence of
+                # regular leading. Paragraph gaps cannot establish pitch alone.
+                pitch = min(pitches) if pitches else None
+                if pitch is None or sum(abs(value - pitch) <= last.size * 0.15 for value in pitches) < 2:
+                    pitch = None
+                marker = split_list_marker(first.text)
+                if block.kind == "list-item":
+                    if marker is None or len(first.words) < 2 or first.words[0].text != marker[0]:
+                        continue
+                    margin = first.words[1].x0
+                else:
+                    margin = min(line.x0 for line in members)
+                def boundary_line(line: PdfLine) -> PdfBoundaryLine:
+                    return PdfBoundaryLine((line.x0, line.top, line.x1, line.bottom),
+                                           line.size, _flow_font(line), line.text)
+                result[block.id] = PdfBlockBoundary(
+                    block.id, boundary_line(first), boundary_line(last), frame,
+                    margin - frame[0], pitch, index, len(columns),
+                )
+    return result
 
 
 @contextmanager

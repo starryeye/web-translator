@@ -544,25 +544,34 @@ class PdfBlockBoundary:
     last_line: PdfBoundaryLine
     column_bbox: BBox
     text_indent: float
+    line_pitch: float | None = None
+    column_index: int | None = None
+    column_count: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {"block_id": self.block_id, "first_line": self.first_line.to_dict(),
                 "last_line": self.last_line.to_dict(), "column_bbox": list(self.column_bbox),
-                "text_indent": self.text_indent}
+                "text_indent": self.text_indent, "line_pitch": self.line_pitch,
+                "column_index": self.column_index, "column_count": self.column_count}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PdfBlockBoundary:
         context = "PdfBlockBoundary"
-        data = _require_exact_fields(data, context, {"block_id", "first_line", "last_line", "column_bbox", "text_indent"})
+        data = _require_exact_fields(data, context, {"block_id", "first_line", "last_line", "column_bbox", "text_indent", "line_pitch", "column_index", "column_count"})
         block_id = _require_string(data, "block_id", context)
         if _BLOCK_ID.fullmatch(block_id) is None:
             raise PdfContractError(f"{context}.block_id must be a stable block ID")
         column_data = {"bbox": data["column_bbox"]}
+        pitch = None if data["line_pitch"] is None else _require_positive_float(data, "line_pitch", context)
+        index = _require_optional_nonnegative_int(data, "column_index", context)
+        count = None if data["column_count"] is None else _require_positive_int(data, "column_count", context)
+        if (index is None) != (count is None) or (index is not None and index >= count):
+            raise PdfContractError(f"{context}.column_index must belong to column_count")
         return cls(block_id,
                    PdfBoundaryLine.from_dict(_require_mapping_value(data, "first_line", context)),
                    PdfBoundaryLine.from_dict(_require_mapping_value(data, "last_line", context)),
                    _require_bbox(column_data, f"{context}.column"),
-                   _require_finite_float(data, "text_indent", context))
+                   _require_finite_float(data, "text_indent", context), pitch, index, count)
 
 
 @dataclass(frozen=True, slots=True)
