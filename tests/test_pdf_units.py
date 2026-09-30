@@ -26,7 +26,7 @@ def test_cross_page_discretionary_word_is_one_unit(scale):
     assert project_unit_text(units[0], {b.id: b for b in blocks}).text == "A paragraph continues."
 
 
-@pytest.mark.parametrize("case", ["blank-page", "new-indent", "new-list", "nested-list", "heading", "table", "figure", "column-change", "sentence-end"])
+@pytest.mark.parametrize("case", ["blank-page", "new-indent", "new-list", "nested-list", "heading", "table", "figure", "column-change"])
 def test_structural_boundary_is_not_joined(case):
     _, (units, findings) = build_flow(case)
     assert all(len(u.source_block_ids) == 1 for u in units)
@@ -69,7 +69,7 @@ def test_conflicting_continuation_has_required_finding():
     assert "font" in findings[0].message
 
 
-@pytest.mark.parametrize("case,status", [("space", "join"), ("short-tail", "ambiguous"), ("sentence-end", "separate")])
+@pytest.mark.parametrize("case,status", [("space", "join"), ("short-tail", "ambiguous"), ("sentence-end", "ambiguous")])
 def test_nonhyphen_join_requires_filled_tail(case, status):
     assert hasattr(pdf_units, "decide_page_join"), "page join decision is missing"
     blocks, pages, boundaries = make_flow_case(case)
@@ -207,20 +207,41 @@ def test_multiple_candidate_successors_create_required_finding():
 
 
 @pytest.mark.parametrize("case", ["sentence-end"])
-def test_clear_paragraph_end_stays_separate_without_boundary(case):
+def test_sentence_end_without_boundary_requires_review(case):
     blocks, pages, _ = make_flow_case(case)
     units, findings = pdf_units.build_translation_units(blocks, pages, {})
-    assert len(units) == 2 and not findings
+    assert len(units) == 2 and len(findings) == 1
+    assert findings[0].severity == "required"
 
 
 @pytest.mark.parametrize("text", ["A paragraph.\"", "A paragraph.)"])
-def test_quoted_sentence_end_is_not_continuation(text):
+def test_quoted_sentence_end_does_not_prove_paragraph_boundary(text):
     blocks, pages, boundaries = make_flow_case("space")
     blocks[0] = replace(blocks[0], source_text=text)
     left = boundaries[blocks[0].id]
     boundaries[blocks[0].id] = replace(left, last_line=replace(left.last_line, text=text))
     units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
-    assert len(units) == 2 and not findings
+    assert len(units) == 2 and len(findings) == 1
+    assert findings[0].severity == "required"
+
+
+@pytest.mark.parametrize("new_indent", [False, True])
+def test_multisentence_page_break_requires_independent_paragraph_evidence(new_indent):
+    blocks, pages, boundaries = make_flow_case("sentence-end")
+    # A new sentence may begin with a capital even within the same paragraph.
+    blocks[1] = replace(blocks[1], source_text="Another sentence follows.")
+    right = boundaries[blocks[1].id]
+    head = replace(right.first_line, text=blocks[1].source_text,
+                   bbox=(96 if new_indent else 72, 72, 540, 84))
+    boundaries[blocks[1].id] = replace(right, first_line=head)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert len(units) == 2  # Neither condition authorizes an automatic join.
+    if new_indent:
+        assert not findings
+    else:
+        assert len(findings) == 1
+        assert findings[0].severity == "required"
+        assert "sentence" in findings[0].message
 
 
 @pytest.mark.parametrize("mark", ["-", "−", "–", "—"])
@@ -304,6 +325,62 @@ def test_observed_list_continuation_uses_marker_body_word_margin():
     assert len(joined) == 1
     assert joined[0].source_block_ids == (tail.id, head.id)
     assert project_unit_text(joined[0], {b.id: b for b in blocks}).text.count("•") == 1
+
+
+def test_raw_head_discretionary_line_matches_page_local_normalized_block():
+    from web_translator.pdf_extract import collect_flow_boundaries
+    blocks, pages, lines = make_observed_flow(head_discretionary=True)
+    boundaries = collect_flow_boundaries(blocks, pages, lines)
+    tail = next(b for b in blocks if b.source_text.endswith("A para‐"))
+    head = next(b for b in blocks if b.source_text.startswith("graph continues within"))
+    assert boundaries[head.id].first_line.text == "graph contin‐"
+    assert head.source_text == "graph continues within the page. Observed prose 2 0 2."
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert not findings
+    joined = [unit for unit in units if len(unit.source_block_ids) > 1]
+    assert len(joined) == 1
+    assert joined[0].source_block_ids == (tail.id, head.id)
+    assert joined[0].joins[0].evidence.right.first_line.text == "graph contin‐"
+    assert project_unit_text(joined[0], {b.id: b for b in blocks}).text == (
+        "Observed prose 1 0 3. Observed prose 1 0 4. "
+        "A paragraph continues within the page. Observed prose 2 0 2."
+    )
+
+
+def test_observed_sentence_boundary_overflow_has_required_finding():
+    from web_translator.pdf_extract import collect_flow_boundaries
+    blocks, pages, lines = make_observed_flow(sentence_boundary=True)
+    boundaries = collect_flow_boundaries(blocks, pages, lines)
+    tail = next(b for b in blocks if b.source_text.endswith("A sentence ends."))
+    head = next(b for b in blocks if b.source_text.startswith("Another sentence follows."))
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert all(len(unit.source_block_ids) == 1 for unit in units)
+    assert len(findings) == 1
+    assert findings[0].severity == "required"
+    assert (findings[0].left_block_id, findings[0].right_block_id) == (tail.id, head.id)
+    assert "sentence end" in findings[0].message
+
+
+@pytest.mark.parametrize("mismatch", ["ascii-hyphen", "changed-word", "inserted-space", "single-line"])
+def test_normalized_head_matching_does_not_allow_unrelated_text_changes(mismatch):
+    from web_translator.pdf_extract import collect_flow_boundaries
+    blocks, pages, lines = make_observed_flow(head_discretionary=True)
+    boundaries = collect_flow_boundaries(blocks, pages, lines)
+    tail = next(b for b in blocks if b.source_text.endswith("A para‐"))
+    head = next(b for b in blocks if b.source_text.startswith("graph continues within"))
+    boundary = boundaries[head.id]
+    if mismatch == "ascii-hyphen":
+        boundary = replace(boundary, first_line=replace(boundary.first_line, text="graph contin-"))
+    elif mismatch == "changed-word":
+        head = replace(head, source_text="unrelated words follow")
+    elif mismatch == "inserted-space":
+        head = replace(head, source_text="graph contin ues within the page.")
+    else:
+        boundary = replace(boundary, last_line=boundary.first_line)
+    decision = pdf_units.decide_page_join(tail, head, boundaries[tail.id], boundary,
+                                          {page.number: page for page in pages})
+    assert decision.status == "ambiguous"
+    assert "text does not match" in decision.finding.message
 
 
 @pytest.mark.parametrize("role", ["reference-entry", "callout-body", "epigraph", "chapter-title"])

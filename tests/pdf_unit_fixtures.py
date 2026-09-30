@@ -114,7 +114,8 @@ def make_flow_case(case: str, *, scale: float = 1.0):
     return blocks, pages, boundaries
 
 
-def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool = False):
+def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool = False,
+                       head_discretionary: bool = False, sentence_boundary: bool = False):
     """Synthetic words run through the real page-local extraction pipeline."""
     from web_translator.pdf_layout import (
         build_text_blocks, classify_document_lines, classify_semantic_roles,
@@ -129,9 +130,13 @@ def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool 
             for index, top in enumerate((72, 90, 108, 672, 690, 708)):
                 text = f"Observed prose {page.number} {column} {index}."
                 if page.number == 1 and column == columns - 1 and index == 5:
-                    text = "A para‐"
+                    text = "A sentence ends." if sentence_boundary else "A para‐"
                 if page.number == 2 and column == 0 and index == 0:
-                    text = "graph continues."
+                    text = "graph contin‐" if head_discretionary else "graph continues."
+                    if sentence_boundary:
+                        text = "Another sentence follows."
+                if head_discretionary and page.number == 2 and column == 0 and index == 1:
+                    text = "ues within the page."
                 start = x0
                 if list_item and ((page.number == 1 and index >= 3) or (page.number == 2 and index <= 2)):
                     start += 18

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal, Mapping, Sequence
 
-from web_translator.pdf_layout import split_list_marker
+from web_translator.pdf_layout import _DISCRETIONARY_HYPHENS, split_list_marker
 from web_translator.pdf_models import (
     PdfBlock, PdfBlockBoundary, PdfContractError, PdfDocument, PdfFlowFinding,
     PdfJoinEvidence, PdfPage, PdfTextJoin, PdfTranslationUnit,
@@ -36,8 +36,24 @@ def _flow_pair(left: PdfBlock, right: PdfBlock) -> bool:
             and left.kind in {"paragraph", "list-item"} and right.kind == "paragraph"
             and left.semantic_role == right.semantic_role == "body"
             and bool(left.source_text.strip()) and bool(right.source_text.strip())
-            and split_list_marker(right.source_text) is None
-            and not left.source_text.rstrip().rstrip("\"'”’)]}").endswith((".", "!", "?", ":", ";", "。", "！", "？")))
+            and split_list_marker(right.source_text) is None)
+
+
+def _matches_owned_head(block: PdfBlock, boundary: PdfBlockBoundary) -> bool:
+    """Accept the collector-proven page-local projection, retaining raw evidence."""
+    raw = boundary.first_line.text
+    if block.source_text.startswith(raw):
+        return True
+    # The collector already reconstructs the complete owned block with
+    # _block_source_text. Its first line can therefore have lost a terminal
+    # discretionary mark when the next physical line continues that word.
+    # Only that established normalization is permitted, never arbitrary trim.
+    if (raw[-1:] not in _DISCRETIONARY_HYPHENS or not raw
+            or boundary.first_line.bbox == boundary.last_line.bbox):
+        return False
+    prefix = raw[:-1]
+    return (block.source_text.startswith(prefix)
+            and block.source_text[len(prefix):len(prefix) + 1].isalpha())
 
 
 def decide_page_join(
@@ -91,8 +107,13 @@ def decide_page_join(
             or abs(tail.font_size / lp.width - head.font_size / rp.width) > size * 0.15 + 1e-9
             or left.style.bold != right.style.bold):
         return _ambiguous(left, right, "incompatible boundary font evidence")
-    if (tail.text != left.source_text and not left.source_text.endswith(tail.text)) or not right.source_text.startswith(head.text):
+    if not left.source_text.endswith(tail.text) or not _matches_owned_head(right, right_boundary):
         return _ambiguous(left, right, "boundary line text does not match physical fragments")
+    # A sentence can end at a page break inside one logical paragraph. Only
+    # independent structure/margins above can prove separation; punctuation
+    # alone must not authorize either a join or silently independent targets.
+    if left.source_text.rstrip().rstrip("\"'”’)]}").endswith((".", "!", "?", ":", ";", "。", "！", "？")):
+        return _ambiguous(left, right, "sentence end does not establish a paragraph boundary")
     if (lc[2] - tail.bbox[2]) / lp.width > size + 1e-9:
         return _ambiguous(left, right, "tail line is not filled to its observed column edge")
     if not head.text or not head.text[0].islower():
