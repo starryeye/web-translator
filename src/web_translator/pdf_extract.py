@@ -63,10 +63,12 @@ from web_translator.pdf_models import (
     PdfBlockBoundary,
     PdfBlockStyle,
     PdfBoundaryLine,
+    PdfContractError,
     PdfDocument,
     PdfPage,
     PdfPageEvidence,
     PdfTableCell,
+    PdfTranslationUnit,
     font_size_bucket,
 )
 from web_translator.protection import protect_fragment
@@ -1012,6 +1014,52 @@ def _build_segments(blocks: list[PdfBlock]) -> tuple[list[PdfBlock], list[Segmen
     return [
         replace(block, segment_id=segment_by_block.get(block.id)) for block in blocks
     ], segments
+
+
+def build_pdf_unit_segments(
+    blocks: Sequence[PdfBlock], units: Sequence[PdfTranslationUnit],
+) -> tuple[list[PdfBlock], list[PdfTranslationUnit], list[Segment]]:
+    """Assign one shared target per logical unit without selecting the 1.2 writer."""
+    from web_translator.pdf_units import _unit_protection, project_unit_text
+
+    by_id = {block.id: block for block in blocks}
+    reference_blocks = [block for block in blocks if block.semantic_role == "reference-entry"]
+    reference_lengths = _reference_core_lengths(reference_blocks) if reference_blocks else {}
+    heading_sizes = sorted({font_size_bucket(by_id[unit.source_block_ids[0]].style.font_size)
+                            for unit in units if unit.kind == "heading"}, reverse=True)
+    identifiers = [f"seg-{index:06d}" for index in range(1, len(units) + 1)]
+    headings: list[str] = []
+    drafts = []
+    segment_by_block: dict[str, str] = {}
+    assigned_units: list[PdfTranslationUnit] = []
+    for identifier, unit in zip(identifiers, units, strict=True):
+        first = by_id[unit.source_block_ids[0]]
+        source_text, occurrences = _unit_protection(unit, by_id, reference_lengths)
+        drafts.append((unit, identifier, list(headings), source_text, occurrences))
+        assigned_units.append(replace(unit, segment_id=identifier))
+        for block_id in unit.source_block_ids:
+            if block_id in segment_by_block:
+                raise PdfContractError(f"{unit.id}: duplicate ownership of {block_id}")
+            segment_by_block[block_id] = identifier
+        if unit.kind == "heading":
+            level = _block_heading_level(first, heading_sizes)
+            headings = headings[:level - 1]
+            while len(headings) < level - 1:
+                headings.append("")
+            headings.append(project_unit_text(unit, by_id).text)
+
+    segments = [Segment(
+        id=identifier,
+        locator=unit.source_block_ids[0],
+        semantic_type=unit.kind,
+        heading_path=heading_path,
+        source_text=source_text,
+        protected=[ProtectedToken(item.placeholder, item.kind, item.value) for item in occurrences],
+        context_ids=identifiers[max(0, index - 1):index] + identifiers[index + 1:index + 2],
+        target=True,
+    ) for index, (unit, identifier, heading_path, source_text, occurrences) in enumerate(drafts)]
+    return ([replace(block, segment_id=segment_by_block.get(block.id)) for block in blocks],
+            assigned_units, segments)
 
 
 _PDF_PLACEHOLDER_PATTERN = re.compile(r"⟦WT:(\d{6})⟧")

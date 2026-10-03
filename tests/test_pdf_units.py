@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from tests.pdf_unit_fixtures import make_flow_case, make_observed_flow, make_unit_document
+from web_translator import pdf_extract
 from web_translator.pdf_models import PdfContractError, PdfDocument, PdfFlowFinding, upgrade_pdf_document_to_units
 from web_translator.pdf_units import project_unit_text, unit_for_block, validate_unit_membership
 from web_translator import pdf_units
@@ -412,6 +413,163 @@ def test_unit_roundtrip_preserves_physical_members() -> None:
     assert [(s.source_start, s.source_end, s.unit_start, s.unit_end) for s in projection.spans] == [
         (0, 6, 0, 6), (6, 7, 6, 6), (0, 16, 6, 22),
     ]
+
+
+def test_unit_segments_have_one_target_and_all_member_mappings():
+    doc = make_unit_document()
+    blocks, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    assert len(segments) == 1
+    assert segments[0].locator == blocks[0].id
+    assert {b.segment_id for b in blocks} == {segments[0].id}
+    assert units[0].segment_id == segments[0].id
+
+
+def test_unit_segments_keep_heading_paths_and_neighbor_context_in_unit_order():
+    from web_translator.pdf_models import PdfTranslationUnit
+    doc = make_unit_document(("Scope", "The body follows"), operation="space")
+    blocks = [replace(doc.blocks[0], kind="heading"), doc.blocks[1]]
+    units = [
+        PdfTranslationUnit("pdf:unit-000001", (blocks[0].id,), "heading", "body", None, ()),
+        PdfTranslationUnit("pdf:unit-000002", (blocks[1].id,), "paragraph", "body", None, ()),
+    ]
+    assigned_blocks, assigned_units, segments = pdf_extract.build_pdf_unit_segments(blocks, units)
+    assert [segment.locator for segment in segments] == [block.id for block in blocks]
+    assert [segment.heading_path for segment in segments] == [[], ["Scope"]]
+    assert [segment.context_ids for segment in segments] == [["seg-000002"], ["seg-000001"]]
+    assert [block.segment_id for block in assigned_blocks] == [unit.segment_id for unit in assigned_units]
+
+
+def test_oversized_logical_unit_is_not_split():
+    from web_translator.zones import ZoneContractError, build_zones
+    doc = make_unit_document(("A" * 6001, "B" * 6000), operation="space")
+    _, _, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    with pytest.raises(PdfContractError, match="12002") as error:
+        pdf_units.require_pdf_unit_budget(doc, segments, max_chars=12000)
+    assert doc.translation_units[0].id in str(error.value)
+    assert all(b.id in str(error.value) for b in doc.blocks)
+    with pytest.raises(ZoneContractError):
+        build_zones(segments, max_chars=12000)
+
+
+def test_joined_product_and_protected_spans_keep_source_offsets():
+    from web_translator.protection import restore_tokens
+    doc = make_unit_document(("Use Postgre‐", "SQL at https://example.org/2024."))
+    blocks, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    segment = segments[0]
+    occurrences = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in blocks})
+    assert restore_tokens(segment.source_text, segment.protected) == "Use PostgreSQL at https://example.org/2024."
+    assert "PostgreSQL" in segment.source_text
+    assert [(o.placeholder, o.value, o.kind) for o in occurrences] == [
+        (t.token, t.value, t.kind) for t in segment.protected
+    ]
+    url = next(o for o in occurrences if o.kind == "url")
+    assert [(s.block_id, s.source_start, s.source_end) for s in url.source_spans] == [
+        (blocks[1].id, 7, 31),
+    ]
+
+
+def test_protected_token_crossing_removed_mark_retains_both_physical_spans():
+    from web_translator.protection import restore_tokens
+    doc = make_unit_document(("Go to https://exam‐", "ple.org/path now"))
+    blocks, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    occurrence = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in blocks})[0]
+    assert occurrence.kind == "url"
+    assert occurrence.value == "https://example.org/path"
+    assert [(s.block_id, s.source_start, s.source_end, s.unit_start, s.unit_end)
+            for s in occurrence.source_spans] == [
+        (blocks[0].id, 6, 18, 6, 18),
+        (blocks[0].id, 18, 19, 18, 18),
+        (blocks[1].id, 0, 12, 18, 30),
+    ]
+    assert restore_tokens(segments[0].source_text, segments[0].protected) == "Go to https://example.org/path now"
+
+
+def test_number_after_removed_mark_keeps_physical_offset():
+    from web_translator.protection import restore_tokens
+    doc = make_unit_document(("Postgre‐", "SQL 2024 is ready"))
+    blocks, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    occurrence = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in blocks})[0]
+    assert (occurrence.kind, occurrence.value) == ("number", "2024")
+    assert [(span.block_id, span.source_start, span.source_end) for span in occurrence.source_spans] == [
+        (blocks[1].id, 4, 8),
+    ]
+    assert restore_tokens(segments[0].source_text, segments[0].protected) == "PostgreSQL 2024 is ready"
+
+
+def test_recognized_literal_code_crossing_join_restores_exact_text():
+    from web_translator.protection import restore_tokens
+    doc = make_unit_document(("Run <code>SELECT‐", "1</code> now"))
+    blocks, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    occurrence = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in blocks})[0]
+    assert (occurrence.kind, occurrence.value) == ("code", "<code>SELECT1</code>")
+    assert [span.block_id for span in occurrence.source_spans] == [blocks[0].id, blocks[0].id, blocks[1].id]
+    assert restore_tokens(segments[0].source_text, segments[0].protected) == "Run <code>SELECT1</code> now"
+
+
+def test_reference_singletons_keep_existing_core_protection():
+    from web_translator.protection import restore_tokens
+    citation = '[1] A. Writer: "Data replication", Press, 2024.'
+    doc = make_unit_document((citation + " Note: Use https://example.org/2025.",))
+    doc.blocks[0] = replace(doc.blocks[0], semantic_role="reference-entry")
+    doc.translation_units[0] = replace(doc.translation_units[0], semantic_role="reference-entry")
+    _, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    occurrences = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in doc.blocks})
+    assert occurrences[0].kind == "bibliography"
+    assert occurrences[0].value == citation
+    assert occurrences[0].source_spans[0].source_start == 0
+    assert occurrences[0].source_spans[0].source_end == len(citation)
+    assert restore_tokens(segments[0].source_text, segments[0].protected) == doc.blocks[0].source_text
+
+
+def test_repeated_visible_note_markers_keep_distinct_occurrences():
+    from web_translator.pdf_models import PdfTranslationUnit
+    doc = make_unit_document(("First i appears", "and second i appears"), operation="space")
+    owners = [replace(block, destination=f"pdf:page-{index + 1:04d}:block-0002")
+              for index, block in enumerate(doc.blocks)]
+    notes = [replace(block, id=owner.destination, kind="footnote", order=index + 2,
+                     source_text=f"i. Note {index + 1}", destination=None)
+             for index, (block, owner) in enumerate(zip(doc.blocks, owners, strict=True))]
+    blocks = [*owners, *notes]
+    units = [doc.translation_units[0], *[
+        PdfTranslationUnit(f"pdf:unit-{index + 2:06d}", (note.id,), "footnote", "body", None, ())
+        for index, note in enumerate(notes)
+    ]]
+    _, assigned_units, segments = pdf_extract.build_pdf_unit_segments(blocks, units)
+    occurrences = pdf_units.project_protected_occurrences(assigned_units[0], {b.id: b for b in blocks})
+    markers = [o for o in occurrences if o.kind == "footnote-marker"]
+    assert len(markers) == 2
+    assert len({marker.placeholder for marker in markers}) == 2
+    assert [(marker.owner_block_id, marker.note_id, marker.value) for marker in markers] == [
+        (owners[0].id, notes[0].id, "i"), (owners[1].id, notes[1].id, "i"),
+    ]
+    assert [(marker.source_spans[0].block_id, marker.source_spans[0].source_start)
+            for marker in markers] == [(owners[0].id, 6), (owners[1].id, 11)]
+    assert all(segments[0].source_text.count(marker.placeholder) == 1 for marker in markers)
+
+
+def test_shared_protection_uses_actual_match_not_earlier_unprotected_substring():
+    doc = make_unit_document(("MUSTARD MUST",))
+    _, units, segments = pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    occurrences = pdf_units.project_protected_occurrences(units[0], {b.id: b for b in doc.blocks})
+    assert [(item.value, item.source_spans[0].source_start, item.source_spans[0].source_end)
+            for item in occurrences] == [("MUST", 8, 12)]
+    assert segments[0].source_text == "MUSTARD ⟦WT:000000⟧"
+
+
+def test_footnote_leading_marker_retains_physical_owner_and_note_identity():
+    from web_translator.pdf_models import PdfTranslationUnit
+    doc = make_unit_document(("A note i",))
+    owner = replace(doc.blocks[0], destination="pdf:page-0001:block-0002")
+    note = replace(owner, id=owner.destination, order=1, kind="footnote",
+                   source_text="i. Footnote text", destination=None)
+    units = [doc.translation_units[0], PdfTranslationUnit(
+        "pdf:unit-000002", (note.id,), "footnote", "body", None, (),
+    )]
+    _, assigned_units, _ = pdf_extract.build_pdf_unit_segments([owner, note], units)
+    occurrence = pdf_units.project_protected_occurrences(assigned_units[1],
+                                                         {owner.id: owner, note.id: note})[0]
+    assert (occurrence.kind, occurrence.value) == ("footnote-marker", "i.")
+    assert (occurrence.owner_block_id, occurrence.note_id) == (note.id, note.id)
 
 
 def test_duplicate_member_is_rejected() -> None:

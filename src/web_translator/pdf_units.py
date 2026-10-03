@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Literal, Mapping, Sequence
 
+from web_translator.models import Segment
 from web_translator.pdf_layout import _DISCRETIONARY_HYPHENS, split_list_marker
 from web_translator.pdf_models import (
     PdfBlock, PdfBlockBoundary, PdfContractError, PdfDocument, PdfFlowFinding,
     PdfJoinEvidence, PdfPage, PdfTextJoin, PdfTranslationUnit,
 )
+from web_translator.protection import protect_fragment
 
 
 TRANSLATABLE_KINDS = frozenset({
@@ -200,6 +203,16 @@ class PdfUnitProjection:
     spans: tuple[PdfSourceSpan, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PdfProtectedOccurrence:
+    placeholder: str
+    value: str
+    kind: str
+    source_spans: tuple[PdfSourceSpan, ...]
+    owner_block_id: str | None
+    note_id: str | None
+
+
 def validate_unit_membership(document: PdfDocument) -> None:
     """Check physical ownership and ordered joins, allowing pre-segmentation units."""
     by_id = {block.id: block for block in document.blocks}
@@ -304,3 +317,168 @@ def project_unit_text(unit: PdfTranslationUnit, blocks: Mapping[str, PdfBlock]) 
             else:
                 raise PdfContractError("PdfTranslationUnit join operation is not supported")
     return PdfUnitProjection("".join(chunks), tuple(spans))
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedRange:
+    start: int
+    end: int
+    kind: str
+    owner_block_id: str | None = None
+    note_id: str | None = None
+
+
+def _occurrence_spans(
+    projection: PdfUnitProjection, start: int, end: int,
+) -> tuple[PdfSourceSpan, ...]:
+    spans: list[PdfSourceSpan] = []
+    for source in projection.spans:
+        if source.unit_start == source.unit_end:
+            if start < source.unit_start < end:
+                spans.append(source)
+            continue
+        lo = max(start, source.unit_start)
+        hi = min(end, source.unit_end)
+        if lo >= hi:
+            continue
+        if source.source_start == source.source_end:
+            spans.append(PdfSourceSpan(source.block_id, source.source_start, source.source_end, lo, hi))
+        else:
+            spans.append(PdfSourceSpan(
+                source.block_id,
+                source.source_start + lo - source.unit_start,
+                source.source_start + hi - source.unit_start,
+                lo, hi,
+            ))
+    return tuple(spans)
+
+
+def _unit_protection(
+    unit: PdfTranslationUnit, blocks: Mapping[str, PdfBlock],
+    reference_lengths: Mapping[str, int] | None = None,
+) -> tuple[str, tuple[PdfProtectedOccurrence, ...]]:
+    """Allocate tokens once from the projection; segments and provenance share it.
+
+    Imports stay local because the unchanged 1.1 extraction writer owns the
+    established PDF marker/reference recognizers and may later call this adapter.
+    """
+    from web_translator.pdf_extract import (
+        PdfExtractionError, _PDF_LEADING_MARKER_PATTERN, _PDF_NUMBER_PATTERN,
+        _PDF_PLACEHOLDER_PATTERN, _pdf_leading_marker_value, _reference_core_lengths,
+    )
+
+    projection = project_unit_text(unit, blocks)
+    raw = projection.text
+    ranges: list[_ProtectedRange] = []
+    if unit.semantic_role == "reference-entry":
+        if reference_lengths is None:
+            first = blocks[unit.source_block_ids[0]]
+            reference_group = first.continuation_of or first.id
+            relevant = [block for block in blocks.values()
+                        if block.semantic_role == "reference-entry"
+                        and (block.continuation_of or block.id) == reference_group]
+            reference_lengths = _reference_core_lengths(relevant)
+        core_length = reference_lengths.get(unit.source_block_ids[0], 0)
+        if core_length:
+            ranges.append(_ProtectedRange(0, core_length, "bibliography"))
+
+    shared_raw = raw[core_length:] if ranges else raw
+    shared_rendered, shared = protect_fragment(shared_raw)
+    source_cursor = core_length if ranges else 0
+    rendered_cursor = 0
+    for token in shared:
+        placeholder_at = shared_rendered.find(token.token, rendered_cursor)
+        if placeholder_at < 0:
+            raise PdfContractError(f"{unit.id}: shared protection lost its source offset")
+        literal = shared_rendered[rendered_cursor:placeholder_at]
+        if not raw.startswith(literal, source_cursor):
+            raise PdfContractError(f"{unit.id}: shared protection changed source text")
+        start = source_cursor + len(literal)
+        if not raw.startswith(token.value, start):
+            raise PdfContractError(f"{unit.id}: shared protection lost its source offset")
+        ranges.append(_ProtectedRange(start, start + len(token.value), token.kind))
+        source_cursor = start + len(token.value)
+        rendered_cursor = placeholder_at + len(token.token)
+    if raw[source_cursor:] != shared_rendered[rendered_cursor:]:
+        raise PdfContractError(f"{unit.id}: shared protection changed source text")
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(start < item.end and item.start < end for item in ranges)
+
+    for block_id in unit.source_block_ids:
+        block = blocks[block_id]
+        physical = next(span for span in projection.spans
+                        if span.block_id == block_id and span.source_start == 0)
+        if block.kind == "footnote":
+            marker = _PDF_LEADING_MARKER_PATTERN.search(block.source_text)
+            if marker is not None:
+                start = physical.unit_start + marker.start("marker")
+                end = physical.unit_start + marker.end("marker")
+                if not overlaps(start, end):
+                    ranges.append(_ProtectedRange(start, end, "footnote-marker", block.id, block.id))
+        if block.destination:
+            note = blocks.get(block.destination)
+            note_marker = (_pdf_leading_marker_value(note.source_text)
+                           if note is not None and note.kind == "footnote" else None)
+            if note_marker is None:
+                continue
+            pattern = re.compile(rf"(?<!\w){re.escape(note_marker)}(?!\w)", re.IGNORECASE)
+            matches = list(pattern.finditer(block.source_text))
+            if len(matches) != 1:
+                raise PdfExtractionError(f"ambiguous owner footnote marker {note_marker!r}: {block.id}")
+            match = matches[0]
+            start = physical.unit_start + match.start()
+            end = physical.unit_start + match.end()
+            if overlaps(start, end):
+                raise PdfContractError(f"{unit.id}: footnote marker overlaps another protected fragment")
+            ranges.append(_ProtectedRange(start, end, "footnote-marker", block.id, note.id))
+
+    for match in _PDF_NUMBER_PATTERN.finditer(raw):
+        if not overlaps(*match.span()):
+            ranges.append(_ProtectedRange(*match.span(), "number"))
+
+    ranges.sort(key=lambda item: (item.start, item.end))
+    used = set(_PDF_PLACEHOLDER_PATTERN.findall(raw))
+    rendered: list[str] = []
+    occurrences: list[PdfProtectedOccurrence] = []
+    cursor = 0
+    next_index = 0
+    for item in ranges:
+        rendered.append(raw[cursor:item.start])
+        placeholder = f"⟦WT:{next_index:06d}⟧"
+        while _PDF_PLACEHOLDER_PATTERN.fullmatch(placeholder).group(1) in used:
+            next_index += 1
+            placeholder = f"⟦WT:{next_index:06d}⟧"
+        next_index += 1
+        rendered.append(placeholder)
+        occurrences.append(PdfProtectedOccurrence(
+            placeholder, raw[item.start:item.end], item.kind,
+            _occurrence_spans(projection, item.start, item.end),
+            item.owner_block_id, item.note_id,
+        ))
+        cursor = item.end
+    rendered.append(raw[cursor:])
+    return "".join(rendered), tuple(occurrences)
+
+
+def project_protected_occurrences(
+    unit: PdfTranslationUnit, blocks: Mapping[str, PdfBlock],
+) -> tuple[PdfProtectedOccurrence, ...]:
+    """Project canonical protected occurrences onto their physical sources."""
+    return _unit_protection(unit, blocks)[1]
+
+
+def require_pdf_unit_budget(
+    document: PdfDocument, segments: Sequence[Segment], max_chars: int,
+) -> None:
+    """Report indivisible PDF oversize with unit and physical member evidence."""
+    by_segment = {segment.id: segment for segment in segments}
+    for unit in document.translation_units:
+        if unit.segment_id is None or unit.segment_id not in by_segment:
+            raise PdfContractError(f"{unit.id}: assigned segment is missing")
+        size = len(by_segment[unit.segment_id].source_text)
+        if size > max_chars:
+            raise PdfContractError(
+                f"{unit.id} members {', '.join(unit.source_block_ids)} measure {size} characters "
+                f"against PDF unit budget {max_chars}"
+            )
