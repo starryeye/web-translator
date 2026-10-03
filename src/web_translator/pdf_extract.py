@@ -1020,9 +1020,13 @@ def build_pdf_unit_segments(
     blocks: Sequence[PdfBlock], units: Sequence[PdfTranslationUnit],
 ) -> tuple[list[PdfBlock], list[PdfTranslationUnit], list[Segment]]:
     """Assign one shared target per logical unit without selecting the 1.2 writer."""
-    from web_translator.pdf_units import _unit_protection, project_unit_text
+    from web_translator.pdf_units import (
+        _require_supported_unit_members, _unit_protection, project_unit_text,
+    )
 
     by_id = {block.id: block for block in blocks}
+    for unit in units:
+        _require_supported_unit_members(unit, by_id)
     reference_blocks = [block for block in blocks if block.semantic_role == "reference-entry"]
     reference_lengths = _reference_core_lengths(reference_blocks) if reference_blocks else {}
     heading_sizes = sorted({font_size_bucket(by_id[unit.source_block_ids[0]].style.font_size)

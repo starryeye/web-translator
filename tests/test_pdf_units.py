@@ -521,6 +521,32 @@ def test_reference_singletons_keep_existing_core_protection():
     assert restore_tokens(segments[0].source_text, segments[0].protected) == doc.blocks[0].source_text
 
 
+def test_joined_reference_unit_is_rejected_at_every_entry_point():
+    doc = make_unit_document((
+        '[1] A. Writer: "Data replication",',
+        'Press, 2024. Note: Commentary',
+    ), operation="space")
+    payload = doc.to_dict()
+    for block in payload["blocks"]:
+        block["semantic_role"] = "reference-entry"
+    payload["translation_units"][0]["semantic_role"] = "reference-entry"
+    doc.blocks[:] = [replace(block, semantic_role="reference-entry") for block in doc.blocks]
+    doc.translation_units[0] = replace(doc.translation_units[0], semantic_role="reference-entry")
+    unit = doc.translation_units[0]
+    by_id = {block.id: block for block in doc.blocks}
+
+    with pytest.raises(PdfContractError, match="multi-member"):
+        validate_unit_membership(doc)
+    with pytest.raises(PdfContractError, match="multi-member"):
+        project_unit_text(unit, by_id)
+    with pytest.raises(PdfContractError, match="multi-member"):
+        pdf_units.project_protected_occurrences(unit, by_id)
+    with pytest.raises(PdfContractError, match="multi-member"):
+        pdf_extract.build_pdf_unit_segments(doc.blocks, doc.translation_units)
+    with pytest.raises(PdfContractError, match="multi-member"):
+        PdfDocument.from_dict(payload)
+
+
 def test_repeated_visible_note_markers_keep_distinct_occurrences():
     from web_translator.pdf_models import PdfTranslationUnit
     doc = make_unit_document(("First i appears", "and second i appears"), operation="space")

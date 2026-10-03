@@ -213,6 +213,24 @@ class PdfProtectedOccurrence:
     note_id: str | None
 
 
+def _require_supported_unit_members(
+    unit: PdfTranslationUnit, blocks: Mapping[str, PdfBlock],
+) -> None:
+    """Only body paragraph/list continuations may span physical blocks."""
+    if len(unit.source_block_ids) <= 1:
+        return
+    if unit.semantic_role != "body" or unit.kind not in {"paragraph", "list-item"}:
+        raise PdfContractError(f"{unit.id}: multi-member unit must be a body paragraph or list-item")
+    for index, block_id in enumerate(unit.source_block_ids):
+        try:
+            block = blocks[block_id]
+        except KeyError as error:
+            raise PdfContractError(f"{unit.id}: member {block_id} is missing") from error
+        expected_kind = unit.kind if index == 0 else "paragraph"
+        if block.semantic_role != "body" or block.kind != expected_kind:
+            raise PdfContractError(f"{unit.id}: multi-member unit must contain only body continuations")
+
+
 def validate_unit_membership(document: PdfDocument) -> None:
     """Check physical ownership and ordered joins, allowing pre-segmentation units."""
     by_id = {block.id: block for block in document.blocks}
@@ -249,6 +267,7 @@ def validate_unit_membership(document: PdfDocument) -> None:
             if (member.kind, member.semantic_role) != (unit.kind, unit.semantic_role):
                 if not (unit.kind == "list-item" and member.kind == "paragraph" and member.semantic_role == "body"):
                     raise PdfContractError("PdfDocument.translation_units cannot mix member kinds or roles")
+        _require_supported_unit_members(unit, by_id)
         if unit.segment_id is not None:
             if unit.segment_id in segment_ids:
                 raise PdfContractError("PdfDocument.translation_units segment IDs must be unique")
@@ -285,6 +304,7 @@ def unit_for_block(document: PdfDocument, block_id: str) -> PdfTranslationUnit:
 def project_unit_text(unit: PdfTranslationUnit, blocks: Mapping[str, PdfBlock]) -> PdfUnitProjection:
     if len(unit.joins) != len(unit.source_block_ids) - 1:
         raise PdfContractError("PdfTranslationUnit joins must match member boundaries")
+    _require_supported_unit_members(unit, blocks)
     chunks: list[str] = []
     spans: list[PdfSourceSpan] = []
     cursor = 0

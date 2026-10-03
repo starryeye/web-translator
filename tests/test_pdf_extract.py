@@ -2276,6 +2276,45 @@ def test_reference_author_suffix_preserves_core_and_annotation(citation: str, an
     assert blocks[0].bbox == block.bbox
 
 
+def test_unit_adapter_preserves_separate_legacy_reference_fragments_and_annotation():
+    from tests.pdf_unit_fixtures import make_unit_document
+    from web_translator.pdf_extract import build_pdf_unit_segments
+    from web_translator.pdf_models import PdfDocument, PdfTranslationUnit
+    from web_translator.protection import restore_tokens
+    from web_translator.pdf_units import project_protected_occurrences
+
+    first_text = '[1] A. Writer: "Data replication",'
+    second_core = "Press, 2024."
+    second_text = second_core + " Note: Commentary"
+    doc = make_unit_document((first_text, second_text), operation="space")
+    first = replace(doc.blocks[0], semantic_role="reference-entry")
+    second = replace(doc.blocks[1], semantic_role="reference-entry", continuation_of=first.id)
+    units = [
+        PdfTranslationUnit("pdf:unit-000001", (first.id,), "paragraph", "reference-entry", None, ()),
+        PdfTranslationUnit("pdf:unit-000002", (second.id,), "paragraph", "reference-entry", None, ()),
+    ]
+
+    blocks, assigned, segments = build_pdf_unit_segments([first, second], units)
+
+    assert [unit.source_block_ids for unit in assigned] == [(first.id,), (second.id,)]
+    assert [block.segment_id for block in blocks] == [segment.id for segment in segments]
+    assert [segment.source_text for segment in segments] == [
+        "⟦WT:000000⟧", "⟦WT:000000⟧ Note: Commentary",
+    ]
+    assert [[token.value for token in segment.protected] for segment in segments] == [
+        [first_text], [second_core],
+    ]
+    assert [restore_tokens(segment.source_text, segment.protected) for segment in segments] == [
+        first_text, second_text,
+    ]
+    occurrences = project_protected_occurrences(assigned[1], {block.id: block for block in blocks})
+    assert [(item.value, item.source_spans[0].block_id,
+             item.source_spans[0].source_start, item.source_spans[0].source_end)
+            for item in occurrences] == [(second_core, second.id, 0, len(second_core))]
+    loaded = PdfDocument.from_dict(replace(doc, blocks=blocks, translation_units=assigned).to_dict())
+    assert [unit.source_block_ids for unit in loaded.translation_units] == [(first.id,), (second.id,)]
+
+
 @pytest.mark.parametrize("citation", [
     '[1] Writer et al.: "A study of systems," at Example Conference, October 2024.',
     '[1] Writer et al.: "A study of systems", at Example Conference, October 2024.',
