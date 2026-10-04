@@ -198,6 +198,67 @@ def test_native_assignment_does_not_replace_racing_empty_destination(tmp_path, m
     assert list((run / "assignments").iterdir()) == []
 
 
+@pytest.mark.parametrize("mutation", ["none", "content", "identity", "source", "reopen-error"])
+def test_native_assignment_closed_descendant_publication_protocol(tmp_path, monkeypatch, capsys, mutation):
+    import web_translator.pdf_unit_bindings as bindings
+    import web_translator.pdf_qa as pdf_qa
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    original_open = pdf_assemble_module._open_anchored_input_file
+    original_rename = pdf_qa._rename_anchored_directory_no_replace
+    descendants = []
+    def opened(directory, name, label):
+        if mutation == "reopen-error" and directory.path == run / "assignments" and name.endswith("binding.json"):
+            raise PdfAssemblyError("injected published binding reopen error")
+        item = original_open(directory, name, label)
+        if directory.path.name == "assignments":
+            descendants.append(item)
+        return item
+    def rename(source_parent, source_name, identity, destination_parent, destination_name, **kwargs):
+        # Emulate the established Windows constraint, not the Windows ABI.
+        if any(not item.stream.closed for item in descendants):
+            raise OSError("nonempty directory has open descendants")
+        package = source_parent.path / source_name / "zone-001.json"
+        if mutation == "content":
+            package.write_bytes(package.read_bytes() + b" ")
+        elif mutation == "identity":
+            payload = package.read_bytes()
+            package.rename(run / "old-assignment.json")
+            package.write_bytes(payload)
+        elif mutation == "source":
+            document = run / "document.json"
+            document.write_bytes(document.read_bytes() + b" ")
+        return original_rename(source_parent, source_name, identity, destination_parent, destination_name, **kwargs)
+    from web_translator.pdf_assemble import PdfAssemblyError
+    monkeypatch.setattr(bindings, "_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS", True, raising=False)
+    monkeypatch.setattr(pdf_assemble_module, "_open_anchored_input_file", opened)
+    monkeypatch.setattr(pdf_qa, "_rename_anchored_directory_no_replace", rename)
+    status = main(["prepare-assignments", "--run-dir", str(run)])
+    errors = capsys.readouterr().err
+    if mutation == "none":
+        assert status == 0, errors
+        with bindings.hold_pdf_unit_binding(run):
+            pass
+    else:
+        assert status == cli_module.EXIT_CONTRACT_FAILURE
+        expected = {"content": "changed content", "identity": "changed identity", "source": "changed content", "reopen-error": "reopen error"}[mutation]
+        assert expected in errors
+        if mutation == "identity":
+            assert (run / "assignments" / "zone-001.json").is_file()
+        else:
+            assert not (run / "assignments").exists()
+    assert all(item.stream.closed for item in descendants)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows nonempty assignment directory rename semantics")
+def test_windows_native_assignment_publication_releases_descendants(tmp_path):
+    from tests.test_pdf_unit_bindings import make_unit_run, binding_api
+    run = make_unit_run(tmp_path)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    with binding_api().hold_pdf_unit_binding(run):
+        pass
+
+
 def test_native_pdf_translation_validation_rejects_stale_binding(tmp_path):
     from tests.test_pdf_unit_bindings import make_unit_run
     run = make_unit_run(tmp_path)

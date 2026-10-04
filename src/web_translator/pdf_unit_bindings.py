@@ -19,6 +19,7 @@ from web_translator.pdf_models import PdfContractError, PdfDocument, PdfSourceRe
 PDF_UNIT_BINDING_NAME = ".pdf-unit-binding.json"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _ZONE_FILE = re.compile(r"zone-\d{3}\.json\Z")
+_WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS = os.name == "nt"
 
 
 class PdfUnitBindingError(ValueError):
@@ -243,6 +244,7 @@ def _publish_pdf_unit_assignments(
             )
             completed = False
             publication_handle: int | None = None
+            reopened: dict[str, Any] = {}
             try:
                 yield binding
                 opened = anchored._open_anchored_input_file(
@@ -257,6 +259,10 @@ def _publish_pdf_unit_assignments(
                 snapshot.verify()
                 parent.verify_visible()
                 anchored._require_anchored_name_absent(inputs.run_anchor, "assignments")
+                expected_identities = {name: item.identity for name, item in opened_files.items()}
+                if _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS:
+                    for item in opened_files.values():
+                        anchored._close_opened_file(item)
                 publication_handle = _rename_anchored_directory_no_replace(
                     parent, temporary.name, staged.identity, inputs.run_anchor, "assignments",
                     retain_windows_handle=True,
@@ -264,10 +270,23 @@ def _publish_pdf_unit_assignments(
                 if publication_handle is not None:
                     stack.callback(anchored.pdf_acquire_module._close_windows_handle, publication_handle)
                 staged.path = inputs.run_anchor.path / "assignments"
+                if _WINDOWS_RENAME_REQUIRES_CLOSED_DESCENDANTS:
+                    staged.verify_visible()
+                    for name, identity in expected_identities.items():
+                        item = anchored._open_anchored_input_file(staged, name, "published PDF assignment")
+                        stack.callback(anchored._close_opened_file, item)
+                        reopened[name] = item
+                        if item.identity != identity:
+                            raise PdfUnitBindingError(f"PDF assignment changed identity: {name}")
+                    # Only verified identities replace the ownership records.
+                    # Exact saved bytes and child sets are checked below.
+                    opened_files.update(reopened)
                 snapshot.verify()
                 completed = True
             finally:
                 if not completed:
+                    for item in reopened.values():
+                        anchored._close_opened_file(item)
                     # A rename may succeed and then raise: inspect ownership, not
                     # a success flag. Never remove a racer's directory or files.
                     staged.path = inputs.run_anchor.path / "assignments"
