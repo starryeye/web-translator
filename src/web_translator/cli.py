@@ -6,7 +6,7 @@ import argparse
 import base64
 import binascii
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 import hashlib
 import io
@@ -54,6 +54,11 @@ from web_translator.pdf_review import (
     validate_pdf_semantic_review,
     validate_pdf_semantic_review_snapshot,
 )
+from web_translator.pdf_unit_bindings import (
+    PDF_UNIT_BINDING_NAME, PdfUnitBindingError, _hold_pdf_unit_inputs,
+    build_pdf_unit_binding, hold_pdf_unit_binding, require_assignable_pdf,
+)
+from web_translator.pdf_units import require_pdf_unit_budget
 from web_translator.qa import run_qa
 from web_translator.report import write_manifest, write_review_report
 from web_translator.translations import TranslationContractError, merge_translations
@@ -186,7 +191,8 @@ def _hold_command_run_contract(args: argparse.Namespace) -> Iterator[object]:
             output_root=output_root,
         ) as contract:
             yield_started = True
-            yield contract
+            with _hold_command_pdf_units(args, contract.run):
+                yield contract
     except ValueError as error:
         if yield_started:
             raise
@@ -201,7 +207,36 @@ def _command_output_root(args: argparse.Namespace, run_dir: Path) -> str:
         return "translated-pages"
     # Shared stages run only after acquisition/capture. The exact source marker is
     # checked again by the stage while the run root remains held.
-    return "translated-pdfs" if (run_dir / "source.pdf").is_file() else "translated-pages"
+    return "translated-pdfs" if (run_dir / "source.json").exists() or (run_dir / "source.pdf").is_file() else "translated-pages"
+
+
+@contextmanager
+def _hold_command_pdf_units(args: argparse.Namespace, run_anchor: Any) -> Iterator[None]:
+    """Use the validated source record, never a filename extension, for shared stages."""
+    import web_translator.pdf_assemble as anchored
+    args._pdf_unit_inputs = None
+    if args.command not in {"plan-zones", "prepare-assignments", "validate-translations"}:
+        yield
+        return
+    names = anchored._anchored_directory_names(run_anchor)
+    if "source.json" not in names:
+        if "source.pdf" in names:
+            raise CLIContractError("PDF source record is missing")
+        yield
+        return
+    directories = () if args.command == "plan-zones" else ("zones",)
+    try:
+        with ExitStack() as stack:
+            inputs = stack.enter_context(_hold_pdf_unit_inputs(run_anchor, directories))
+            # Explicit compatibility route until the extraction writer switches.
+            if inputs.document.schema_version == "1.2":
+                require_assignable_pdf(inputs.document)
+                args._pdf_unit_inputs = inputs
+                if args.command == "validate-translations":
+                    stack.enter_context(hold_pdf_unit_binding(run_anchor))
+            yield
+    except (PdfUnitBindingError, PdfContractError) as error:
+        raise CLIContractError(str(error)) from error
 
 
 def console_main() -> None:
@@ -433,19 +468,24 @@ def _plan_zones_command(args: argparse.Namespace) -> None:
             f"target-zones must be from 1 through {MAX_TARGET_ZONES}"
         )
     _validate_run_root(args.run_dir)
-    segments = _read_segments(args.run_dir)
+    inputs = args._pdf_unit_inputs
+    segments = _read_segments(args.run_dir, inputs)
     try:
+        if inputs is not None:
+            require_pdf_unit_budget(inputs.document, segments, args.max_chars)
         zones = build_zones(
             segments,
             max_chars=args.max_chars,
             target_zones=args.target_zones,
         )
-    except ZoneContractError as error:
+    except (ZoneContractError, PdfContractError) as error:
         raise CLIContractError(str(error)) from error
     zone_dir = args.run_dir / "zones"
     if zone_dir.exists():
         raise CLIContractError(f"zone directory already exists: {zone_dir}")
     try:
+        if inputs is not None:
+            inputs.verify()
         zone_dir.mkdir(parents=False)
         for zone in zones:
             _write_json_atomic(zone_dir / f"{zone.id}.json", _zone_payload(zone))
@@ -455,8 +495,8 @@ def _plan_zones_command(args: argparse.Namespace) -> None:
 
 def _validate_translations_command(args: argparse.Namespace) -> None:
     _validate_run_root(args.run_dir)
-    segments = _read_segments(args.run_dir)
-    zones = _read_zones(args.run_dir)
+    segments = _read_segments(args.run_dir, args._pdf_unit_inputs)
+    zones = _read_zones(args.run_dir, args._pdf_unit_inputs)
     if args.zone_id is not None:
         matches = [zone for zone in zones if zone.id == args.zone_id]
         if len(matches) != 1:
@@ -476,8 +516,9 @@ def _validate_translations_command(args: argparse.Namespace) -> None:
 
 def _prepare_assignments_command(args: argparse.Namespace) -> None:
     _validate_run_root(args.run_dir)
-    segments = _read_segments(args.run_dir)
-    zones = _read_zones(args.run_dir)
+    inputs = args._pdf_unit_inputs
+    segments = _read_segments(args.run_dir, inputs)
+    zones = _read_zones(args.run_dir, inputs)
     glossary = _read_glossary(args.run_dir / "glossary.json")
     summary_path = args.run_dir / "document-summary.txt"
     try:
@@ -531,6 +572,14 @@ def _prepare_assignments_command(args: argparse.Namespace) -> None:
                     "zone_id": zone.id,
                 }
                 _write_json_atomic(temporary / f"{zone.id}.json", payload)
+            if inputs is not None:
+                binding = build_pdf_unit_binding(
+                    inputs.payloads["document.json"], inputs.payloads["segments.jsonl"],
+                    {name.removeprefix("zones/"): data for name, data in inputs.payloads.items() if name.startswith("zones/")},
+                    {f"{zone.id}.json": (temporary / f"{zone.id}.json").read_bytes() for zone in zones},
+                )
+                _write_json_atomic(temporary / PDF_UNIT_BINDING_NAME, binding.to_dict())
+                inputs.verify()
             os.replace(temporary, destination)
     except CLIContractError:
         raise
@@ -657,9 +706,11 @@ def _qa_command(args: argparse.Namespace) -> None:
         raise QAFailure(f"required QA checks failed: {codes or 'unknown finding'}")
 
 
-def _read_segments(run_dir: Path) -> list[Segment]:
+def _read_segments(run_dir: Path, unit_inputs: Any = None) -> list[Segment]:
     path = run_dir / "segments.jsonl"
     try:
+        if unit_inputs is not None:
+            return read_segments_stream(io.StringIO(unit_inputs.payloads["segments.jsonl"].decode("utf-8")))
         _require_safe_file(path)
         return read_segments(path)
     except (CLIContractError, SegmentContractError, OSError, UnicodeError) as error:
@@ -735,17 +786,19 @@ def _semantic_snapshot_values(
         raise CLIContractError(f"cannot parse held PDF semantic inputs: {error}") from error
 
 
-def _read_zones(run_dir: Path) -> list[Zone]:
+def _read_zones(run_dir: Path, unit_inputs: Any = None) -> list[Zone]:
     zone_dir = run_dir / "zones"
-    _require_safe_directory(zone_dir)
+    if unit_inputs is None:
+        _require_safe_directory(zone_dir)
     try:
-        entries = sorted(zone_dir.iterdir(), key=lambda path: path.name)
+        entries = (sorted(zone_dir.iterdir(), key=lambda path: path.name) if unit_inputs is None else
+                   [run_dir / name for name in sorted(unit_inputs.payloads) if name.startswith("zones/")])
     except OSError as error:
         raise CLIContractError(f"cannot read zone directory {zone_dir}: {error}") from error
     invalid = [
         path.name
         for path in entries
-        if not path.is_file()
+        if (unit_inputs is None and not path.is_file())
         or not path.name.startswith("zone-")
         or path.suffix != ".json"
     ]
@@ -753,8 +806,16 @@ def _read_zones(run_dir: Path) -> list[Zone]:
         raise CLIContractError(f"unexpected zone entries: {', '.join(invalid)}")
     zones: list[Zone] = []
     for path in entries:
-        _require_safe_file(path)
-        data = _read_json_object(path)
+        if unit_inputs is None:
+            _require_safe_file(path)
+            data = _read_json_object(path)
+        else:
+            try:
+                data = json.loads(unit_inputs.payloads[f"zones/{path.name}"])
+                if not isinstance(data, Mapping):
+                    raise ValueError("zone must be an object")
+            except (ValueError, UnicodeError) as error:
+                raise CLIContractError(f"invalid held PDF zone: {error}") from error
         try:
             zone = Zone(
                 id=_string(data, "id", path),

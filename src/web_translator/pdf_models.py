@@ -823,8 +823,8 @@ class PdfDocument:
         flow_findings: list[PdfFlowFinding] = []
         if root_version == "1.2":
             extracted_schema_version = _require_string(data, "extracted_schema_version", context)
-            if extracted_schema_version not in {"1.0", "1.1"}:
-                raise PdfContractError(f"{context}.extracted_schema_version must be 1.0 or 1.1")
+            if extracted_schema_version not in {"1.0", "1.1", "1.2"}:
+                raise PdfContractError(f"{context}.extracted_schema_version must be 1.0, 1.1, or 1.2")
             translation_units = [PdfTranslationUnit.from_dict(_require_mapping(item, f"{context}.translation_units[{index}]"))
                                  for index, item in enumerate(_require_list(data, "translation_units", context))]
             flow_findings = [PdfFlowFinding.from_dict(_require_mapping(item, f"{context}.flow_findings[{index}]"))

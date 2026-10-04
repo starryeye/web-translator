@@ -18,6 +18,52 @@ from web_translator.pdf_review import (
     validate_pdf_semantic_review,
 )
 from web_translator.zones import Zone
+from tests.test_pdf_unit_bindings import bound_unit_run
+
+
+def test_native_review_includes_document_and_binding(bound_unit_run):
+    snapshot = build_pdf_semantic_review_input(bound_unit_run)
+    names = {item.path for item in snapshot.files}
+    assert "document.json" in names
+    assert "assignments/.pdf-unit-binding.json" in names
+
+
+def test_native_review_rejects_stale_binding(bound_unit_run):
+    path = bound_unit_run / "document.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(PdfSemanticReviewError, match="binding"):
+        build_pdf_semantic_review_input(bound_unit_run)
+
+
+def test_native_review_rejects_foreign_assignment_file(bound_unit_run):
+    (bound_unit_run / "assignments" / ".unknown.json").write_text("{}")
+    with pytest.raises(PdfSemanticReviewError):
+        build_pdf_semantic_review_input(bound_unit_run)
+
+
+def test_rebinding_changed_unit_evidence_does_not_reuse_old_review(bound_unit_run):
+    from tests.test_pdf_unit_bindings import BINDING, manual_binding, write_json
+    run = bound_unit_run
+    old = build_pdf_semantic_review_input(run)
+    path = run / "document.json"
+    value = json.loads(path.read_bytes())
+    value["translation_units"][0]["joins"][0]["evidence"]["left"]["text_indent"] = 2.0
+    write_json(path, value)
+    write_json(run / "assignments" / BINDING, manual_binding(run))
+    review = {"semantic_input_sha256": old.semantic_input_sha256, "retries": {}, "section_findings": {}, "unresolved_required": []}
+    with pytest.raises(PdfSemanticReviewError, match="digest does not match"):
+        validate_pdf_semantic_review(run, review)
+
+
+def test_native_semantic_consumption_retains_document_identity(bound_unit_run):
+    from web_translator.pdf_review import hold_pdf_semantic_inputs
+    path = bound_unit_run / "document.json"
+    with pytest.raises(PdfSemanticReviewError, match="changed identity"):
+        with hold_pdf_semantic_inputs(bound_unit_run) as snapshot:
+            payload = path.read_bytes()
+            path.rename(path.with_name("old-document.json"))
+            path.write_bytes(payload)
+            snapshot.verify()
 
 
 _DIMENSIONS = (

@@ -13,6 +13,11 @@ import re
 import stat
 from typing import Any
 
+from web_translator.pdf_models import PdfContractError, PdfDocument
+from web_translator.pdf_unit_bindings import (
+    PDF_UNIT_BINDING_NAME, PdfUnitBindingError, _binding_from_payloads,
+)
+
 
 TERMINOLOGY_POLICY_ID = "korean-first-technical-terms"
 TERMINOLOGY_POLICY_VERSION = "2.0"
@@ -175,6 +180,18 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
             )
             for name, opened in root_files.items()
         }
+        logical_units = False
+        if "document.json" in anchored._anchored_directory_names(run_anchor):
+            opened = anchored._open_anchored_input_file(run_anchor, "document.json", "PDF document")
+            root_files["document.json"] = opened
+            document_bytes = anchored._read_opened_bytes(opened, run_anchor.path / "document.json", "PDF document")
+            document = PdfDocument.from_dict(json.loads(document_bytes))
+            logical_units = document.schema_version == "1.2"
+            if logical_units:
+                payloads["document.json"] = document_bytes
+                opened = anchored._open_anchored_input_file(run_anchor, "source.json", "PDF source record")
+                root_files["source.json"] = opened
+                payloads["source.json"] = anchored._read_opened_bytes(opened, run_anchor.path / "source.json", "PDF source record")
         zone_ids: dict[str, set[str]] = {}
         for directory_name, suffix in (
             ("zones", ".json"),
@@ -186,13 +203,16 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
             )
             directories[directory_name] = directory
             names = anchored._anchored_directory_names(directory)
+            package_names = [name for name in names if not (
+                logical_units and directory_name == "assignments" and name == PDF_UNIT_BINDING_NAME
+            )]
             stems = {
                 name[: -len(suffix)]
                 for name in names
                 if name.endswith(suffix)
                 and _ZONE.fullmatch(name[: -len(suffix)])
             }
-            if not names or len(stems) != len(names):
+            if not package_names or len(stems) != len(package_names):
                 raise PdfSemanticReviewError(
                     f"PDF {directory_name} must contain only zone-NNN{suffix} files"
                 )
@@ -212,6 +232,8 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
             raise PdfSemanticReviewError(
                 "PDF zones, assignments, and translations must exactly cover the same zones"
             )
+        if logical_units:
+            _binding_from_payloads(payloads)
         files = tuple(
             PdfSemanticInputFile(
                 path=path,
@@ -236,6 +258,8 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
         yield snapshot
     except PdfSemanticReviewError:
         raise
+    except (PdfUnitBindingError, PdfContractError, UnicodeError, json.JSONDecodeError) as error:
+        raise PdfSemanticReviewError(str(error)) from error
     except anchored.PdfAssemblyError as error:
         if yield_started:
             raise

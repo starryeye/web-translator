@@ -223,6 +223,8 @@ def assemble_pdf(
     owned_staging_identity: tuple[int, int] | None = None
     owned_pdf_identity: _PublishedFile | None = None
     owned_layout_identity: _PublishedFile | None = None
+    binding_stack = ExitStack()
+    binding_inputs: Any | None = None
     staging = run_dir / "staged-output"
     try:
         run_anchor = _open_directory_anchor(run_dir, "run")
@@ -250,11 +252,22 @@ def assemble_pdf(
         )
         if source.sha256 != document.source_sha256:
             raise PdfAssemblyError("source.json SHA-256 does not match document.json")
-        if semantic_snapshot is None:
-            segments = _read_pdf_segments(
-                evidence_files["segments.jsonl"],
-                run_dir / "segments.jsonl",
+        if document.schema_version == "1.2":
+            from web_translator.pdf_unit_bindings import _binding_from_payloads, _hold_pdf_unit_inputs
+
+            binding_inputs = binding_stack.enter_context(
+                _hold_pdf_unit_inputs(run_anchor, ("zones", "assignments"))
             )
+            _binding_from_payloads(binding_inputs.payloads)
+            # The document consumed below is precisely the held bound document.
+            document = binding_inputs.document
+        if semantic_snapshot is None:
+            if binding_inputs is None:
+                segments = _read_pdf_segments(
+                    evidence_files["segments.jsonl"], run_dir / "segments.jsonl",
+                )
+            else:
+                segments = read_segments_stream(io.StringIO(binding_inputs.payloads["segments.jsonl"].decode("utf-8")))
             consumed_translations = translations
             consumed_glossary = glossary
         else:
@@ -381,6 +394,8 @@ def assemble_pdf(
         temporary_anchor.verify_visible()
 
         _verify_anchored_evidence(run_anchor, evidence_files)
+        if binding_inputs is not None:
+            binding_inputs.verify()
         if semantic_snapshot is not None:
             _verify_semantic_snapshot(semantic_snapshot, run_anchor)
         staging_anchor = _create_child_directory(
@@ -406,6 +421,9 @@ def assemble_pdf(
         )
         run_anchor.verify_visible()
         staging_anchor.verify_visible()
+        if binding_inputs is not None:
+            binding_inputs.verify()
+        binding_stack.close()
         return staging / "translated.pdf"
     except PdfAssemblyError:
         raise
@@ -415,6 +433,7 @@ def assemble_pdf(
         raise PdfAssemblyError(f"cannot assemble staged PDF: {error}") from error
     finally:
         active_exception = sys.exc_info()[0] is not None
+        binding_stack.__exit__(*sys.exc_info())
         _close_opened_file(temporary_layout)
         _close_opened_file(temporary_pdf)
         if active_exception:

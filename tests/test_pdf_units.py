@@ -655,7 +655,7 @@ def test_projection_preserves_ascii_hyphen() -> None:
 
 @pytest.mark.parametrize("field,value", [
     ("schema_version", "1.3"),
-    ("extracted_schema_version", "1.2"),
+    ("extracted_schema_version", "1.3"),
 ])
 def test_units_reject_bad_versions(field: str, value: str) -> None:
     data = make_unit_document().to_dict()

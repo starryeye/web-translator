@@ -34,6 +34,128 @@ from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
 
+def test_native_pdf_assignment_publishes_binding_with_unchanged_package_shape(tmp_path):
+    from tests.test_pdf_unit_bindings import BINDING, make_unit_run, manual_binding
+    run = make_unit_run(tmp_path)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    assert json.loads((run / "assignments" / BINDING).read_bytes()) == manual_binding(run)
+    payload = json.loads((run / "assignments" / "zone-001.json").read_bytes())
+    assert set(payload) == {"context_after", "context_before", "document_summary", "glossary", "schema_version", "targets", "zone_id"}
+
+
+@pytest.mark.parametrize("command", ["plan-zones", "prepare-assignments"])
+def test_required_flow_finding_prevents_assignment(tmp_path, command):
+    from tests.test_pdf_unit_bindings import make_unit_run, write_json
+    run = make_unit_run(tmp_path)
+    document = json.loads((run / "document.json").read_bytes())
+    document["flow_findings"] = [{"code": "ambiguous-page-continuation", "left_block_id": document["blocks"][0]["id"], "right_block_id": document["blocks"][1]["id"], "severity": "required", "message": "Uncertain continuation"}]
+    write_json(run / "document.json", document)
+    if command == "plan-zones":
+        (run / "zones" / "zone-001.json").unlink()
+        (run / "zones").rmdir()
+    assert main([command, "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+    if command == "plan-zones":
+        assert not (run / "zones").exists()
+
+
+def test_native_pdf_planning_rejects_unit_budget_before_writes(tmp_path, capsys):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    (run / "zones" / "zone-001.json").unlink()
+    (run / "zones").rmdir()
+    assert main(["plan-zones", "--run-dir", str(run), "--max-chars", "3"]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert "pdf:unit-000001" in capsys.readouterr().err
+    assert not (run / "zones").exists()
+
+
+def test_native_pdf_assignment_failed_rename_publishes_nothing(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    original = os.replace
+    def fail_assignment(source, destination, *args, **kwargs):
+        if Path(destination) == run / "assignments":
+            raise OSError("injected assignment rename failure")
+        return original(source, destination, *args, **kwargs)
+    monkeypatch.setattr(os, "replace", fail_assignment)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+    assert not list(run.glob(".assignments-*"))
+
+
+def test_native_pdf_translation_validation_rejects_stale_binding(tmp_path):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    (run / "translations").mkdir()
+    (run / "translations" / "zone-001.jsonl").write_text(json.dumps(Translation("seg-000001", "번역 문장").to_dict()) + "\n")
+    path = run / "document.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    assert main(["validate-translations", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+
+
+@pytest.mark.parametrize("origin", ["1.0", "1.1"])
+def test_adapted_pdf_cannot_prepare_new_assignments(tmp_path, origin):
+    from tests.test_pdf_unit_bindings import make_unit_run, write_json
+    run = make_unit_run(tmp_path)
+    path = run / "document.json"
+    value = json.loads(path.read_bytes())
+    value["extracted_schema_version"] = origin
+    write_json(path, value)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+
+
+def test_native_assignment_rejects_source_mutation_before_publish(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    original = cli_module._assignment_records
+    def mutate(*args):
+        path = run / "document.json"
+        path.write_bytes(path.read_bytes() + b" ")
+        return original(*args)
+    monkeypatch.setattr(cli_module, "_assignment_records", mutate)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+
+
+def test_native_assignment_consumes_held_segments_during_swap_restore(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    original = cli_module._read_segments
+    def swap_restore(run_dir, unit_inputs=None):
+        path = run_dir / "segments.jsonl"
+        held = run_dir / "held-segments.jsonl"
+        value = json.loads(path.read_text())
+        value["source_text"] = "Unbound substitute"
+        path.rename(held)
+        try:
+            path.write_text(json.dumps(value) + "\n")
+            return original(run_dir, unit_inputs)
+        finally:
+            path.unlink()
+            held.rename(path)
+    monkeypatch.setattr(cli_module, "_read_segments", swap_restore)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    payload = json.loads((run / "assignments" / "zone-001.json").read_bytes())
+    assert payload["targets"][0]["source_text"] == "A paragraph continues."
+
+
+def test_web_assignment_payload_is_unchanged_and_has_no_pdf_binding(tmp_path):
+    from tests.test_pipeline import _web_cli_paths, write_single_segment_run_contract
+    run, _ = _web_cli_paths(tmp_path)
+    write_single_segment_run_contract(run)
+    (run / "document-summary.txt").write_text("Summary")
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    assert sorted(path.name for path in (run / "assignments").iterdir()) == ["zone-001.json"]
+    assert json.loads((run / "assignments" / "zone-001.json").read_bytes()) == {
+        "context_after": [], "context_before": [], "document_summary": "Summary",
+        "glossary": {}, "schema_version": "1.0", "zone_id": "zone-001",
+        "targets": [{"heading_path": [], "id": "seg-000001", "protected": [],
+                     "semantic_type": "paragraph", "source_text": "OAuth"}],
+    }
+
+
 REVIEW_DIMENSIONS = (
     "semantic_fidelity",
     "qualification_preservation",
