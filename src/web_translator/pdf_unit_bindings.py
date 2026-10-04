@@ -193,3 +193,102 @@ def hold_pdf_unit_binding(run: Path | Any) -> Iterator[PdfUnitBinding]:
     """Hold and verify exact bound inputs throughout the caller's consumption."""
     with _hold_pdf_unit_inputs(run, ("zones", "assignments")) as snapshot:
         yield _binding_from_payloads(snapshot.payloads)
+
+
+@contextmanager
+def _publish_pdf_unit_assignments(
+    inputs: _PdfUnitInputs, temporary: Path,
+) -> Iterator[PdfUnitBinding]:
+    """Hold staged packages through no-clobber publication and owned rollback.
+
+    The caller writes the yielded binding into the held temporary directory.
+    Successful exit validates that file and publishes the whole directory.
+    """
+    import web_translator.pdf_assemble as anchored
+    from web_translator.pdf_qa import PdfQAFailure, _rename_anchored_directory_no_replace
+
+    try:
+        with ExitStack() as stack:
+            parent = anchored._open_existing_child_directory(
+                inputs.run_anchor, temporary.parent.name, "assignment staging parent"
+            )
+            stack.callback(parent.close)
+            staged = anchored._open_existing_child_directory(
+                parent, temporary.name, "staged assignments"
+            )
+            stack.callback(staged.close)
+            opened_files: dict[str, Any] = {}
+            payloads = dict(inputs.payloads)
+            expected_names = sorted(inputs.files["zones"])
+            if anchored._anchored_directory_names(staged) != expected_names:
+                raise PdfUnitBindingError("staged assignment filenames do not match zones")
+            for name in expected_names:
+                opened = anchored._open_anchored_input_file(staged, name, "staged assignment")
+                stack.callback(anchored._close_opened_file, opened)
+                opened_files[name] = opened
+                payloads[f"assignments/{name}"] = anchored._read_opened_bytes(
+                    opened, staged.path / name, "staged assignment"
+                )
+            snapshot = _PdfUnitInputs(
+                inputs.run_anchor, inputs.roots,
+                {**inputs.directories, "assignments": staged},
+                {**inputs.files, "assignments": opened_files},
+                payloads, inputs.document,
+            )
+            snapshot.verify()
+            binding = build_pdf_unit_binding(
+                payloads["document.json"], payloads["segments.jsonl"],
+                {name: payloads[f"zones/{name}"] for name in expected_names},
+                {name: payloads[f"assignments/{name}"] for name in expected_names},
+            )
+            completed = False
+            publication_handle: int | None = None
+            try:
+                yield binding
+                opened = anchored._open_anchored_input_file(
+                    staged, PDF_UNIT_BINDING_NAME, "staged PDF binding"
+                )
+                stack.callback(anchored._close_opened_file, opened)
+                opened_files[PDF_UNIT_BINDING_NAME] = opened
+                payloads[f"assignments/{PDF_UNIT_BINDING_NAME}"] = anchored._read_opened_bytes(
+                    opened, staged.path / PDF_UNIT_BINDING_NAME, "staged PDF binding"
+                )
+                _binding_from_payloads(payloads)
+                snapshot.verify()
+                parent.verify_visible()
+                anchored._require_anchored_name_absent(inputs.run_anchor, "assignments")
+                publication_handle = _rename_anchored_directory_no_replace(
+                    parent, temporary.name, staged.identity, inputs.run_anchor, "assignments",
+                    retain_windows_handle=True,
+                )
+                if publication_handle is not None:
+                    stack.callback(anchored.pdf_acquire_module._close_windows_handle, publication_handle)
+                staged.path = inputs.run_anchor.path / "assignments"
+                snapshot.verify()
+                completed = True
+            finally:
+                if not completed:
+                    # A rename may succeed and then raise: inspect ownership, not
+                    # a success flag. Never remove a racer's directory or files.
+                    staged.path = inputs.run_anchor.path / "assignments"
+                    try:
+                        staged.verify_visible()
+                    except anchored.PdfAssemblyError:
+                        pass
+                    else:
+                        for name, opened in opened_files.items():
+                            anchored._close_opened_file(opened)
+                            anchored._remove_owned_file(
+                                staged, name, anchored._PublishedFile(opened.identity)
+                            )
+                        if publication_handle is not None:
+                            # The retained rename handle has DELETE access; the
+                            # ordinary held-directory reader deliberately does not.
+                            if not anchored._anchored_directory_names(staged):
+                                anchored._windows_delete_open_file(publication_handle)
+                        else:
+                            anchored._remove_owned_directory(
+                                inputs.run_anchor, "assignments", staged.identity, child=staged
+                            )
+    except (anchored.PdfAssemblyError, PdfQAFailure, OSError) as error:
+        raise PdfUnitBindingError(f"cannot publish PDF assignment binding: {error}") from error

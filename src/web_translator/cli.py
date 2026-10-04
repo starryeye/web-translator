@@ -56,7 +56,7 @@ from web_translator.pdf_review import (
 )
 from web_translator.pdf_unit_bindings import (
     PDF_UNIT_BINDING_NAME, PdfUnitBindingError, _hold_pdf_unit_inputs,
-    build_pdf_unit_binding, hold_pdf_unit_binding, require_assignable_pdf,
+    _publish_pdf_unit_assignments, hold_pdf_unit_binding, require_assignable_pdf,
 )
 from web_translator.pdf_units import require_pdf_unit_budget
 from web_translator.qa import run_qa
@@ -573,14 +573,10 @@ def _prepare_assignments_command(args: argparse.Namespace) -> None:
                 }
                 _write_json_atomic(temporary / f"{zone.id}.json", payload)
             if inputs is not None:
-                binding = build_pdf_unit_binding(
-                    inputs.payloads["document.json"], inputs.payloads["segments.jsonl"],
-                    {name.removeprefix("zones/"): data for name, data in inputs.payloads.items() if name.startswith("zones/")},
-                    {f"{zone.id}.json": (temporary / f"{zone.id}.json").read_bytes() for zone in zones},
-                )
-                _write_json_atomic(temporary / PDF_UNIT_BINDING_NAME, binding.to_dict())
-                inputs.verify()
-            os.replace(temporary, destination)
+                with _publish_pdf_unit_assignments(inputs, temporary) as binding:
+                    _write_json_atomic(temporary / PDF_UNIT_BINDING_NAME, binding.to_dict())
+            else:
+                os.replace(temporary, destination)
     except CLIContractError:
         raise
     except OSError as error:

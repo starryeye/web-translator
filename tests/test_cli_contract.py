@@ -70,6 +70,7 @@ def test_native_pdf_planning_rejects_unit_budget_before_writes(tmp_path, capsys)
 
 
 def test_native_pdf_assignment_failed_rename_publishes_nothing(tmp_path, monkeypatch):
+    import web_translator.pdf_qa as pdf_qa
     from tests.test_pdf_unit_bindings import make_unit_run
     run = make_unit_run(tmp_path)
     original = os.replace
@@ -78,9 +79,123 @@ def test_native_pdf_assignment_failed_rename_publishes_nothing(tmp_path, monkeyp
             raise OSError("injected assignment rename failure")
         return original(source, destination, *args, **kwargs)
     monkeypatch.setattr(os, "replace", fail_assignment)
+    def fail_anchored_assignment(*args, **kwargs):
+        raise OSError("injected assignment rename failure")
+    monkeypatch.setattr(pdf_qa, "_rename_anchored_directory_no_replace", fail_anchored_assignment)
     assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
     assert not (run / "assignments").exists()
     assert not list(run.glob(".assignments-*"))
+
+
+def test_native_assignment_rejects_package_changed_after_binding_write(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import BINDING, make_unit_run
+    run = make_unit_run(tmp_path)
+    original = cli_module._write_json_atomic
+    def mutate_package(path, value):
+        original(path, value)
+        if path.name == BINDING:
+            package = path.parent / "zone-001.json"
+            package.write_bytes(package.read_bytes() + b" ")
+    monkeypatch.setattr(cli_module, "_write_json_atomic", mutate_package)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+    assert not list(run.glob(".assignments-*"))
+
+
+def _inject_assignment_rename(monkeypatch, run, mutation):
+    """Exercise both the existing and anchored no-clobber publication boundaries."""
+    import web_translator.pdf_qa as pdf_qa
+    original_replace = os.replace
+    original_rename = pdf_qa._rename_anchored_directory_no_replace
+    def replace(source, destination, *args, **kwargs):
+        result = original_replace(source, destination, *args, **kwargs)
+        if Path(destination) == run / "assignments":
+            mutation()
+        return result
+    def rename(source_parent, source_name, identity, destination_parent, destination_name, **kwargs):
+        result = original_rename(source_parent, source_name, identity, destination_parent, destination_name, **kwargs)
+        if destination_name == "assignments":
+            mutation()
+        return result
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(pdf_qa, "_rename_anchored_directory_no_replace", rename)
+
+
+def test_native_assignment_source_mutation_at_rename_rolls_back_and_allows_retry(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run, binding_api
+    run = make_unit_run(tmp_path)
+    document = run / "document.json"
+    payload = document.read_bytes()
+    with monkeypatch.context() as patch:
+        _inject_assignment_rename(patch, run, lambda: document.write_bytes(payload + b" "))
+        assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+    assert not list(run.glob(".assignments-*"))
+    document.write_bytes(payload)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == 0
+    with binding_api().hold_pdf_unit_binding(run):
+        pass
+
+
+def test_native_assignment_output_mutation_at_rename_rolls_back(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    def mutate():
+        package = run / "assignments" / "zone-001.json"
+        package.write_bytes(package.read_bytes() + b" ")
+    _inject_assignment_rename(monkeypatch, run, mutate)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+
+
+def test_native_assignment_rename_error_after_move_rolls_back(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    def raise_after_move():
+        raise OSError("injected error after completed directory move")
+    _inject_assignment_rename(monkeypatch, run, raise_after_move)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert not (run / "assignments").exists()
+
+
+def test_native_assignment_rollback_preserves_foreign_replaced_file(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    def replace_file():
+        path = run / "assignments" / "zone-001.json"
+        path.rename(run / "old-assignment.json")
+        path.write_text("foreign content")
+    _inject_assignment_rename(monkeypatch, run, replace_file)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert (run / "assignments" / "zone-001.json").read_text() == "foreign content"
+
+
+def test_native_assignment_rollback_preserves_foreign_replacement(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import make_unit_run
+    run = make_unit_run(tmp_path)
+    def replace_output():
+        (run / "assignments").rename(run / "moved-assignments")
+        (run / "assignments").mkdir()
+        (run / "assignments" / "foreign.txt").write_text("keep")
+    _inject_assignment_rename(monkeypatch, run, replace_output)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert (run / "assignments" / "foreign.txt").read_text() == "keep"
+
+
+def test_native_assignment_does_not_replace_racing_empty_destination(tmp_path, monkeypatch):
+    from tests.test_pdf_unit_bindings import BINDING, make_unit_run
+    run = make_unit_run(tmp_path)
+    original = cli_module._write_json_atomic
+    foreign_identity = []
+    def race_destination(path, value):
+        original(path, value)
+        if path.name == BINDING:
+            (run / "assignments").mkdir()
+            foreign_identity.append((run / "assignments").stat().st_ino)
+    monkeypatch.setattr(cli_module, "_write_json_atomic", race_destination)
+    assert main(["prepare-assignments", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert (run / "assignments").stat().st_ino == foreign_identity[0]
+    assert list((run / "assignments").iterdir()) == []
 
 
 def test_native_pdf_translation_validation_rejects_stale_binding(tmp_path):
