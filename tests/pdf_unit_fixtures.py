@@ -6,7 +6,7 @@ from dataclasses import replace
 
 from web_translator.pdf_models import (
     PdfBlock, PdfBlockBoundary, PdfBlockStyle, PdfBoundaryLine, PdfDocument,
-    PdfJoinEvidence, PdfPage, PdfTextJoin, PdfTranslationUnit,
+    PdfJoinEvidence, PdfLinkEvidence, PdfPage, PdfTextJoin, PdfTranslationUnit,
 )
 
 
@@ -158,3 +158,108 @@ def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool 
         blocks.extend(build_text_blocks(ordered, page.number))
     blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
     return blocks, pages, lines_by_page
+
+
+def make_render_unit_run(root, *, case="joined"):
+    """Selectable invented source plus fixed test-only Korean text and exact binding."""
+    import hashlib
+    import json
+    from reportlab.pdfgen.canvas import Canvas
+    from tests.pdf_fixtures import make_pdf_source_record
+    from web_translator.models import Translation, write_segments
+    from web_translator.pdf_extract import build_pdf_unit_segments
+
+    run = root / "run"
+    run.mkdir(parents=True)
+    notes = case == "multiple-note"
+    texts = (("First member * continues", "second member * ends.") if notes
+             else ("7. A paragraph" if case == "list" else "A paragraph", "continues."))
+    if case == "links":
+        texts = ("First Alpha continues", "second Beta ends.")
+    document = make_unit_document(texts, operation="space")
+    blocks = document.blocks
+    unit = document.translation_units[0]
+    if case == "list":
+        blocks = [replace(blocks[0], kind="list-item"), blocks[1]]
+        unit = replace(unit, kind="list-item")
+    units = [unit]
+    if case == "links":
+        document = replace(document, links=[PdfLinkEvidence(
+            id=f"pdf:page-{index + 1:04d}:link-0001", page_number=index + 1,
+            source_block_id=block.id,
+            source_span=(block.source_text.index(label), block.source_text.index(label) + len(label)),
+            bounds=block.bbox, visible_label=label,
+            uri="https://example.org/second" if index else None,
+            destination=None if index else blocks[1].id, reconstructed=True, reason=None)
+            for index, (block, label) in enumerate(zip(blocks, ("Alpha", "Beta"), strict=True))])
+    if notes:
+        body = [replace(block, order=index * 2,
+                        destination=f"pdf:page-{index + 1:04d}:block-0002")
+                for index, block in enumerate(blocks)]
+        blocks = []
+        for index, block in enumerate(body):
+            note = replace(block, id=block.destination, order=block.order + 1,
+                           kind="footnote", bbox=(72.0, 690.0, 540.0, 714.0),
+                           source_text="* First note." if index == 0 else "* Second note.",
+                           segment_id=None, destination=None)
+            blocks.extend((block, note))
+            units.append(PdfTranslationUnit(f"pdf:unit-{index + 2:06d}", (note.id,),
+                                            "footnote", "body", None, ()))
+        document = replace(document, links=[PdfLinkEvidence(
+            id=f"pdf:page-{block.page_number:04d}:link-0001", page_number=block.page_number,
+            source_block_id=block.id,
+            source_span=(block.source_text.index("*"), block.source_text.index("*") + 1),
+            bounds=block.bbox, visible_label="*", uri=None,
+            destination=block.destination, reconstructed=True, reason=None)
+            for block in body])
+    source_path = run / "source.pdf"
+    canvas = Canvas(str(source_path), pagesize=(612, 792))
+    for page in (1, 2):
+        for block in blocks:
+            if block.page_number == page:
+                canvas.drawString(block.bbox[0], 792 - block.bbox[3], block.source_text)
+        canvas.showPage()
+    canvas.save()
+    blocks, units, segments = build_pdf_unit_segments(blocks, units)
+    document = replace(document, blocks=blocks, translation_units=units,
+                       extracted_schema_version="1.2",
+                       source_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest())
+    document = PdfDocument.from_dict(document.to_dict())
+
+    def write_json(path, data):
+        path.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    write_json(run / "document.json", document.to_dict())
+    write_json(run / "source.json", replace(make_pdf_source_record(),
+               sha256=document.source_sha256, byte_length=source_path.stat().st_size).to_dict())
+    write_segments(run / "segments.jsonl", segments)
+    bind_render_unit_run(run)
+    body_text = "문단 전체를 번역한 검증 문장"
+    if case == "links":
+        body_text += " Alpha 내부 참조와 Beta 외부 참조입니다."
+    if case == "list":
+        body_text = segments[0].protected[0].token + ". " + body_text
+    if notes:
+        markers = [token.token for token in segments[0].protected if token.kind == "footnote-marker"]
+        body_text += " 첫째표식 " + markers[0] + " " + ("분할 확인을 위한 긴 본문입니다. " * 150)
+        body_text += " 둘째표식 " + markers[1] + " 마지막 문장입니다."
+    translations = {segments[0].id: Translation(segments[0].id, body_text)}
+    for index, segment in enumerate(segments[1:]):
+        translations[segment.id] = Translation(segment.id,
+            segment.protected[0].token + (" 첫째 각주 내용입니다." if index == 0 else " 둘째 각주 내용입니다."))
+    return run, document, segments, translations
+
+
+def bind_render_unit_run(run):
+    """Bind generated render fixtures using production exact-byte binding logic."""
+    import json
+    from web_translator.pdf_unit_bindings import build_pdf_unit_binding
+    for directory in ("zones", "assignments"):
+        (run / directory).mkdir()
+        (run / directory / "zone-001.json").write_text('{"zone_id":"zone-001"}\n', encoding="utf-8")
+    binding = build_pdf_unit_binding((run / "document.json").read_bytes(),
+        (run / "segments.jsonl").read_bytes(),
+        {"zone-001.json": (run / "zones/zone-001.json").read_bytes()},
+        {"zone-001.json": (run / "assignments/zone-001.json").read_bytes()})
+    (run / "assignments/.pdf-unit-binding.json").write_text(
+        json.dumps(binding.to_dict()) + "\n", encoding="utf-8")

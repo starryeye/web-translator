@@ -86,9 +86,13 @@ class PdfFlowableLayout:
     semantic_role: PdfSemanticRole = "body"
     footnote_owner_id: str | None = None
     footnote_ownership: str | None = None
+    unit_id: str | None = None
+    source_block_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
+            **({"unit_id": self.unit_id, "source_block_ids": list(self.source_block_ids)}
+               if self.unit_id is not None else {}),
             **({"footnote_owner_id": self.footnote_owner_id, "footnote_ownership": self.footnote_ownership}
                if self.footnote_owner_id is not None else {}),
             "block_id": self.block_id,
@@ -109,6 +113,8 @@ class PdfFlowableLayout:
         context = f"flowables[{index}]"
         ownership_fields = {"footnote_owner_id", "footnote_ownership"}
         ownership_present = ownership_fields.intersection(value) if isinstance(value, Mapping) else set()
+        unit_fields = {"unit_id", "source_block_ids"}
+        unit_present = unit_fields.intersection(value) if isinstance(value, Mapping) else set()
         data = _exact_mapping(
             value,
             context,
@@ -121,10 +127,11 @@ class PdfFlowableLayout:
                 "page_number",
                 "source_order",
                 "split_part",
-            } | ({"semantic_role"} if schema_version == "1.1" else set()) | ownership_present,
+            } | ({"semantic_role"} if schema_version != "1.0" else set()) | ownership_present
+            | (unit_present if schema_version == "1.2" else set()),
         )
         semantic_role = (
-            _string(data, "semantic_role", context) if schema_version == "1.1" else "body"
+            _string(data, "semantic_role", context) if schema_version != "1.0" else "body"
         )
         if semantic_role not in get_args(PdfSemanticRole):
             raise PdfAssemblyError(f"{context}.semantic_role is not supported")
@@ -134,6 +141,16 @@ class PdfFlowableLayout:
         kind = _string(data, "kind", context)
         if kind not in _KINDS:
             raise PdfAssemblyError(f"{context}.kind is not a supported flowable kind")
+        if unit_present:
+            members = data.get("source_block_ids")
+            if (unit_present != unit_fields or kind in {"figure", "header", "footer", "page-number"}
+                    or re.fullmatch(r"pdf:unit-\d{6}", _string(data, "unit_id", context)) is None
+                    or not isinstance(members, list) or not members
+                    or any(not isinstance(item, str) or _BLOCK_ID.fullmatch(item) is None for item in members)
+                    or len(members) != len(set(members)) or members[0] != block_id):
+                raise PdfAssemblyError(f"{context} has invalid unit/member provenance")
+        elif schema_version == "1.2" and kind in {"heading", "paragraph", "list-item", "caption", "footnote"}:
+            raise PdfAssemblyError(f"{context} requires unit/member provenance")
         if ownership_present:
             if ownership_present != ownership_fields or kind != "footnote":
                 raise PdfAssemblyError(f"{context} ownership requires a footnote and complete fields")
@@ -156,6 +173,8 @@ class PdfFlowableLayout:
             semantic_role=semantic_role,  # type: ignore[arg-type]
             footnote_owner_id=data.get("footnote_owner_id"),
             footnote_ownership=data.get("footnote_ownership"),
+            unit_id=data.get("unit_id"),
+            source_block_ids=tuple(data.get("source_block_ids", ())),
         )
 
 
@@ -231,7 +250,7 @@ class PdfAssemblyLayout:
                 "toc_entries": [asdict(item) for item in self.toc_entries],
                 "footnote_continuations": [asdict(item) for item in self.footnote_continuations],
                 "anchor_pages": dict(self.anchor_pages),
-            } if self.schema_version == "1.1" else {}),
+            } if self.schema_version != "1.0" else {}),
             "flowables": [
                 {
                     key: value for key, value in item.to_dict().items()
@@ -266,8 +285,8 @@ class PdfAssemblyLayout:
             root_message="layout fields must be exactly",
         )
         schema_version = _string(data, "schema_version", "layout")
-        if schema_version not in {"1.0", "1.1"}:
-            raise PdfAssemblyError("layout.schema_version must be '1.0' or '1.1'")
+        if schema_version not in {"1.0", "1.1", "1.2"}:
+            raise PdfAssemblyError("layout.schema_version must be '1.0', '1.1' or '1.2'")
         digest = _string(data, "staged_pdf_sha256", "layout")
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise PdfAssemblyError("layout.staged_pdf_sha256 must be lowercase SHA-256")
@@ -294,6 +313,20 @@ class PdfAssemblyLayout:
         except (PdfContractError, TypeError, ValueError) as error:
             raise PdfAssemblyError(f"layout link evidence is invalid: {error}") from error
         pairs = [(item.block_id, item.split_part) for item in flowables]
+        provenance: dict[str, tuple[str, tuple[str, ...], int]] = {}
+        unit_members: dict[str, tuple[str, ...]] = {}
+        member_owners: dict[str, str] = {}
+        for item in flowables:
+            if item.unit_id is None:
+                continue
+            identity = (item.unit_id, item.source_block_ids, item.source_order)
+            if provenance.setdefault(item.block_id, identity) != identity:
+                raise PdfAssemblyError("layout split parts must retain identical unit provenance")
+            if unit_members.setdefault(item.unit_id, item.source_block_ids) != item.source_block_ids:
+                raise PdfAssemblyError("layout unit must retain one ordered member list")
+            for member in item.source_block_ids:
+                if member_owners.setdefault(member, item.unit_id) != item.unit_id:
+                    raise PdfAssemblyError("layout unit members must have one owner")
         if len(pairs) != len(set(pairs)):
             raise PdfAssemblyError(
                 "layout flowable block and split-part pairs must be unique"
@@ -370,6 +403,9 @@ class TrackedFlowable(Flowable):
         semantic_role: PdfSemanticRole = "body",
         footnote_owner_id: str | None = None,
         footnote_ownership: str | None = None,
+        unit_id: str | None = None,
+        source_block_ids: tuple[str, ...] = (),
+        anchor_aliases: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self._content = content
@@ -386,6 +422,9 @@ class TrackedFlowable(Flowable):
         self._semantic_role = semantic_role
         self._footnote_owner_id = footnote_owner_id
         self._footnote_ownership = footnote_ownership
+        self._unit_id = unit_id
+        self._source_block_ids = source_block_ids
+        self._anchor_aliases = anchor_aliases
         self.hAlign = getattr(content, "hAlign", "LEFT")
         self.width = 0.0
         self.height = 0.0
@@ -433,6 +472,9 @@ class TrackedFlowable(Flowable):
                 semantic_role=self._semantic_role,
                 footnote_owner_id=self._footnote_owner_id,
                 footnote_ownership=self._footnote_ownership,
+                unit_id=self._unit_id,
+                source_block_ids=self._source_block_ids,
+                anchor_aliases=self._anchor_aliases,
             )
             for index, part in enumerate(parts)
         ]
@@ -473,14 +515,11 @@ class TrackedFlowable(Flowable):
         if self._anchor_name is not None and not any(
             record.block_id == self._block_id for record in self._records
         ):
-            canvas.bookmarkHorizontalAbsolute(
-                self._anchor_name,
-                bounds[1] + bounds[3],
-                left=bounds[0],
-            )
             document = getattr(canvas, "_doctemplate", None)
-            if hasattr(document, "anchor_pages"):
-                document.anchor_pages.setdefault(self._anchor_name, page_number)
+            for name in (self._anchor_name, *self._anchor_aliases):
+                canvas.bookmarkHorizontalAbsolute(name, bounds[1] + bounds[3], left=bounds[0])
+                if hasattr(document, "anchor_pages"):
+                    document.anchor_pages.setdefault(name, page_number)
         if self._on_draw is not None:
             self._on_draw(canvas, page_number, self._content)
         self._content.drawOn(canvas, x, y)
@@ -502,6 +541,8 @@ class TrackedFlowable(Flowable):
                 semantic_role=self._semantic_role,
                 footnote_owner_id=self._footnote_owner_id,
                 footnote_ownership=self._footnote_ownership,
+                unit_id=self._unit_id,
+                source_block_ids=self._source_block_ids,
             )
         )
 

@@ -69,6 +69,168 @@ UNICODE_RANGES = [
 ]
 
 
+@pytest.fixture
+def rendered_unit_case(tmp_path, request):
+    return lambda: _render_unit_case(tmp_path, getattr(request, "param", "joined"))
+
+
+def _render_unit_case(tmp_path, case):
+    from tests.pdf_unit_fixtures import make_render_unit_run
+    run, document, segments, translations = make_render_unit_run(
+        tmp_path, case=case)
+    original = (run / "document.json").read_bytes()
+    pdf = assemble_pdf(run, translations, {}, tmp_path / "output")
+    assert (run / "document.json").read_bytes() == original
+    with pdfplumber.open(run / "source.pdf") as source:
+        assert len(source.pages) == 2
+        assert all(page.extract_text() for page in source.pages)
+    with pdfplumber.open(pdf) as output:
+        text = "\n".join(page.extract_text() or "" for page in output.pages)
+    return document, read_pdf_layout(run / "layout.json"), text, pdf, segments
+
+
+def test_joined_unit_renders_once_with_all_source_members(rendered_unit_case):
+    document, layout, text, _pdf, _segments = rendered_unit_case()
+    unit = document.translation_units[0]
+    records = [record for record in layout.flowables if record.unit_id == unit.id]
+    assert records and layout.schema_version == "1.2"
+    assert all(record.source_block_ids == unit.source_block_ids for record in records)
+    assert all(record.block_id == unit.source_block_ids[0] for record in records)
+    assert text.count("문단 전체를 번역한 검증 문장") == 1
+    assert [record.split_part for record in records] == list(range(len(records)))
+
+
+@pytest.mark.parametrize("rendered_unit_case", ["list"], indirect=True)
+def test_joined_list_draws_one_original_marker(rendered_unit_case):
+    _document, _layout, text, _pdf, _segments = rendered_unit_case()
+    assert text.count("7.") == 1
+    assert text.count("문단 전체를 번역한 검증 문장") == 1
+
+
+@pytest.mark.parametrize("rendered_unit_case", ["joined", "multiple-note"], indirect=True)
+def test_member_anchors_resolve_to_reported_unit_start(rendered_unit_case):
+    document, layout, _text, pdf, _segments = rendered_unit_case()
+    unit = document.translation_units[0]
+    first = next(record for record in layout.flowables if record.unit_id == unit.id)
+    pages = dict(layout.anchor_pages)
+    for member in unit.source_block_ids:
+        assert pages[pdf_assemble_module._anchor_name(member)] == first.page_number
+    # Actual PDF destinations for the two markers must remain distinct, not all
+    # inherit the first physical member's destination.
+    if len(document.translation_units) > 1:
+        links = [annot.get_object()["/Dest"] for page in PdfReader(pdf).pages
+                 for annot in page.get("/Annots", []) if "/Dest" in annot.get_object()]
+        assert len(links) == 2
+        assert links[0] != links[1]
+
+
+@pytest.mark.parametrize("rendered_unit_case", ["multiple-note"], indirect=True)
+def test_joined_unit_preserves_two_equal_visible_note_markers(rendered_unit_case):
+    from web_translator.pdf_units import project_protected_occurrences
+    document, layout, text, _pdf, segments = rendered_unit_case()
+    occurrences = project_protected_occurrences(document.translation_units[0],
+        {block.id: block for block in document.blocks})
+    markers = [item for item in occurrences if item.kind == "footnote-marker"]
+    assert [item.value for item in markers] == ["*", "*"]
+    assert len({item.placeholder for item in markers}) == 2
+    assert len({item.owner_block_id for item in markers}) == 2
+    assert len({item.note_id for item in markers}) == 2
+    assert layout.links == tuple(document.links)
+    assert text.count("*") == 4  # two body markers plus two leading note labels
+    assert text.count("첫째 각주 내용입니다.") == text.count("둘째 각주 내용입니다.") == 1
+    notes = [record for record in layout.flowables if record.kind == "footnote"]
+    assert {record.footnote_owner_id for record in notes} == set(document.translation_units[0].source_block_ids)
+
+
+@pytest.mark.parametrize("rendered_unit_case", ["multiple-note"], indirect=True)
+def test_split_unit_schedules_each_note_once(rendered_unit_case):
+    document, layout, _text, pdf, _segments = rendered_unit_case()
+    body = [record for record in layout.flowables if record.unit_id == document.translation_units[0].id]
+    assert len(body) >= 2
+    assert [record.split_part for record in body] == list(range(len(body)))
+    assert all(record.source_block_ids == document.translation_units[0].source_block_ids for record in body)
+    notes = [record for record in layout.flowables if record.kind == "footnote"]
+    assert len(notes) == 2 and all(record.split_part == 0 for record in notes)
+    with pdfplumber.open(pdf) as output:
+        pages = [page.extract_text() or "" for page in output.pages]
+    first_page = next(i + 1 for i, text in enumerate(pages) if "첫째표식" in text)
+    second_page = next(i + 1 for i, text in enumerate(pages) if "둘째표식" in text)
+    assert first_page < second_page
+    assert [record.page_number for record in notes] == [first_page, second_page]
+
+
+def test_joined_unit_reordered_equal_markers_keep_occurrence_owners(tmp_path):
+    from tests.pdf_unit_fixtures import make_render_unit_run
+    run, document, segments, translations = make_render_unit_run(tmp_path, case="multiple-note")
+    segment = segments[0]
+    a, b = [token.token for token in segment.protected]
+    text = translations[segment.id].text.replace(a, "TEMP").replace(b, a).replace("TEMP", b)
+    translations[segment.id] = Translation(segment.id, text)
+    pdf = assemble_pdf(run, translations, {}, tmp_path / "output")
+    layout = read_pdf_layout(run / "layout.json")
+    notes = [record for record in layout.flowables if record.kind == "footnote"]
+    assert notes[0].page_number > notes[1].page_number
+    with pdfplumber.open(pdf) as output:
+        assert "둘째 각주 내용입니다." in output.pages[0].extract_text()
+        assert "첫째 각주 내용입니다." not in output.pages[0].extract_text()
+
+
+@pytest.mark.parametrize("rendered_unit_case", ["links"], indirect=True)
+def test_joined_unit_keeps_nonfirst_link_and_resolves_member_destination(rendered_unit_case):
+    document, layout, _text, pdf, _segments = rendered_unit_case()
+    assert layout.links == tuple(document.links)
+    annotations = [annot.get_object() for page in PdfReader(pdf).pages for annot in page.get("/Annots", [])]
+    assert len(annotations) == 2
+    assert annotations[1]["/A"]["/URI"] == "https://example.org/second"
+    first = layout.flowables[0]
+    destination = annotations[0]["/Dest"]
+    assert float(destination[2]) == pytest.approx(first.bounds[0])
+    assert float(destination[3]) == pytest.approx(first.bounds[1] + first.bounds[3])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong-first", "different-split-unit", "different-split-members", "duplicate-unit"])
+def test_joined_unit_layout_rejects_invalid_provenance(tmp_path, mutation):
+    from web_translator.pdf_flowables import PdfAssemblyLayout
+    _document, layout, _text, _pdf, _segments = _render_unit_case(tmp_path, "multiple-note")
+    data = layout.to_dict()
+    if mutation == "missing":
+        del data["flowables"][0]["unit_id"]
+    elif mutation == "wrong-first":
+        data["flowables"][0]["source_block_ids"].reverse()
+    elif mutation == "different-split-unit":
+        data["flowables"][1]["unit_id"] = "pdf:unit-999999"
+    elif mutation == "different-split-members":
+        data["flowables"][1]["source_block_ids"].pop()
+    else:
+        data["flowables"][-1]["unit_id"] = data["flowables"][0]["unit_id"]
+    with pytest.raises(PdfAssemblyError, match="unit|provenance"):
+        PdfAssemblyLayout.from_dict(data)
+
+
+def test_joined_unit_singleton_adapter_retains_rich_rendering(tmp_path):
+    from tests.pdf_unit_fixtures import bind_render_unit_run
+    from web_translator.pdf_extract import build_pdf_unit_segments
+    from web_translator.pdf_models import upgrade_pdf_document_to_units
+    run, _translations, _glossary, _ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=3)
+    document = PdfDocument.from_dict(upgrade_pdf_document_to_units(json.loads((run / "document.json").read_text())))
+    blocks, units, segments = build_pdf_unit_segments(document.blocks, document.translation_units)
+    document = replace(document, blocks=blocks, translation_units=units, extracted_schema_version="1.2")
+    (run / "document.json").write_text(json.dumps(document.to_dict()), encoding="utf-8")
+    write_segments(run / "segments.jsonl", segments)
+    bind_render_unit_run(run)
+    translations = {segment.id: Translation(segment.id, segment.source_text) for segment in segments}
+    original = (run / "document.json").read_bytes()
+    assemble_pdf(run, translations, {}, tmp_path / "output")
+    assert (run / "document.json").read_bytes() == original
+    layout = read_pdf_layout(run / "layout.json")
+    records = {record.block_id: record for record in layout.flowables}
+    for unit in units:
+        assert records[unit.source_block_ids[0]].unit_id == unit.id
+        assert records[unit.source_block_ids[0]].source_block_ids == unit.source_block_ids
+    assert any(record.kind == "figure" and record.unit_id is None for record in records.values())
+    assert {record.kind for record in records.values()} >= {"table-cell", "figure", "caption", "footnote"}
+
+
 def _assembly_run(
     root: Path,
     *,

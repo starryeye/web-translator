@@ -188,7 +188,7 @@ def test_direct_assembly_rejects_missing_native_binding_before_staging(bound_uni
 def test_direct_assembly_keeps_public_error_on_consumer_failure(bound_unit_run):
     from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
     run = bound_unit_run
-    with pytest.raises(PdfAssemblyError, match="locator"):
+    with pytest.raises(PdfAssemblyError, match="cover"):
         assemble_pdf(run, {}, {}, run.parents[2] / "translated-pdfs" / run.name)
     assert not (run / "staged-output").exists()
 

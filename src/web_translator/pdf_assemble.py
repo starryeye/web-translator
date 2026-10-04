@@ -70,6 +70,7 @@ from web_translator.pdf_models import (
     PdfDocument,
     PdfLinkEvidence,
     PdfSourceRecord,
+    PdfTranslationUnit,
     font_size_bucket,
 )
 from web_translator.protection import ProtectionError, restore_tokens
@@ -114,6 +115,22 @@ _HTTP_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
 _OPENER_ROLES = {"part-label", "part-title", "chapter-label", "chapter-title"}
 _EPIGRAPH_ROLES = {"dedication", "epigraph", "epigraph-attribution"}
 _CALLOUT_ROLES = {"callout-title", "callout-body"}
+
+
+@dataclass(frozen=True, slots=True)
+class PdfRenderUnit:
+    unit: PdfTranslationUnit
+    source_blocks: tuple[PdfBlock, ...]
+    segment: Segment
+    text: str
+
+
+def _unit_tracking(block_id: str, units: Mapping[str, PdfRenderUnit]) -> dict[str, Any]:
+    render = units.get(block_id)
+    if render is None:
+        return {}
+    return {"unit_id": render.unit.id, "source_block_ids": render.unit.source_block_ids,
+            "anchor_aliases": tuple(_anchor_name(member) for member in render.unit.source_block_ids[1:])}
 
 
 @dataclass(slots=True)
@@ -287,17 +304,21 @@ def assemble_pdf(
                 raise PdfAssemblyError(
                     "held PDF glossary disagrees with assembly arguments"
                 )
-        ordered = _normalize_pdf_translations(
-            document,
-            segments,
-            consumed_translations,
-            consumed_glossary,
-        )
+        render_units = (normalize_pdf_units(document, segments, consumed_translations, consumed_glossary)
+                        if document.schema_version == "1.2" else [])
+        ordered = ([(item.source_blocks[0], item.segment, item.text) for item in render_units]
+                   if document.schema_version == "1.2" else
+                   _normalize_pdf_translations(document, segments, consumed_translations, consumed_glossary))
         toc_resolutions = _resolve_toc_targets(document)
+        identity_links = _protected_note_links(document, render_units)
         document = replace(
             document,
-            links=list(_translated_link_evidence(document, ordered)),
+            links=[original if original.id in identity_links else effective
+                   for original, effective in zip(document.links, _translated_link_evidence(document,
+                {member.id: item.text for item in render_units for member in item.source_blocks}
+                if render_units else ordered), strict=True)],
         )
+        unit_markup = _unit_markups(document, render_units, consumed_translations, consumed_glossary)
         _validate_rich_relationships(document)
         media_payloads: dict[str, bytes] = {}
         figure_blocks = [block for block in document.blocks if block.kind == "figure"]
@@ -338,7 +359,7 @@ def assemble_pdf(
             temporary_staging_anchor,
             "translated.pdf",
         )
-        uses_rich_layout = bool(document.links) or any(
+        uses_rich_layout = document.schema_version == "1.2" or bool(document.links) or any(
             block.kind in _RICH_KINDS
             or block.kind in _IGNORED_KINDS
             or block.semantic_role != "body"
@@ -355,6 +376,8 @@ def assemble_pdf(
                 media_payloads,
                 toc_resolutions=toc_resolutions,
                 publication_evidence=publication_evidence,
+                render_units=render_units,
+                unit_markup=unit_markup,
             )
         else:
             records = _build_basic_document(
@@ -371,7 +394,7 @@ def assemble_pdf(
         temporary_pdf.stream.close()
         temporary_staging_anchor.verify_visible()
         layout = PdfAssemblyLayout(
-            schema_version="1.1",
+            schema_version="1.2" if document.schema_version == "1.2" else "1.1",
             reserved_output_dir=str(output_dir),
             staged_pdf_sha256=digest,
             page_size=page_size,
@@ -754,6 +777,135 @@ def _normalize_pdf_translations(
     return restored
 
 
+def _normalized_unit_records(
+    segments: Sequence[Segment], translations: Mapping[str, Translation], glossary: Mapping[str, str],
+) -> list[Translation]:
+    if not isinstance(translations, Mapping):
+        raise PdfAssemblyError("translations must be a mapping")
+    if any(not isinstance(record, Translation) or key != record.segment_id
+           for key, record in translations.items()):
+        raise PdfAssemblyError("translation keys must match Translation record IDs")
+    if set(translations) != {segment.id for segment in segments}:
+        raise PdfAssemblyError("translations must exactly cover PDF targets")
+    try:
+        return normalize_terminology([translations[segment.id] for segment in segments], glossary,
+            policy="korean-first", protected_by_segment={s.id: s.protected for s in segments})
+    except TerminologyError as error:
+        raise PdfAssemblyError(f"terminology normalization failed: {error}") from error
+
+
+def normalize_pdf_units(
+    document: PdfDocument, segments: Sequence[Segment],
+    translations: Mapping[str, Translation], glossary: Mapping[str, str],
+) -> list[PdfRenderUnit]:
+    """Normalize one target per declared unit, keeping physical provenance immutable."""
+    from web_translator.pdf_units import validate_unit_membership
+    try:
+        validate_unit_membership(document)
+    except PdfContractError as error:
+        raise PdfAssemblyError(str(error)) from error
+    if any(not isinstance(segment, Segment) for segment in segments):
+        raise PdfAssemblyError("segments must contain Segment values")
+    if len({segment.id for segment in segments}) != len(segments):
+        raise PdfAssemblyError("duplicate PDF segment ID")
+    targets = [segment for segment in segments if segment.target]
+    if [unit.segment_id for unit in document.translation_units] != [s.id for s in targets]:
+        raise PdfAssemblyError("PDF units and target segments must match exactly in document order")
+    blocks = {block.id: block for block in document.blocks}
+    normalized = _normalized_unit_records(targets, translations, glossary)
+    result = []
+    for unit, segment, record in zip(document.translation_units, targets, normalized, strict=True):
+        if segment.locator != unit.source_block_ids[0] or segment.semantic_type != unit.kind:
+            raise PdfAssemblyError(f"PDF unit locator or semantic type mismatch: {segment.id}")
+        try:
+            text = restore_tokens(record.text, segment.protected)
+        except ProtectionError as error:
+            raise PdfAssemblyError(f"cannot restore {segment.id}: {error}") from error
+        if not text.strip():
+            raise PdfAssemblyError(f"translated PDF unit is empty: {segment.id}")
+        result.append(PdfRenderUnit(unit, tuple(blocks[member] for member in unit.source_block_ids), segment, text))
+    return result
+
+
+def _occurrence_anchor(unit_id: str, placeholder: str) -> str:
+    return _anchor_name(unit_id + "-" + placeholder)
+
+
+def _protected_note_links(document: PdfDocument, units: Sequence[PdfRenderUnit]) -> set[str]:
+    """Link identity is the physical marker span and destination, never its value."""
+    from web_translator.pdf_units import project_protected_occurrences
+    blocks = {block.id: block for block in document.blocks}
+    spans = {(span.block_id, (span.source_start, span.source_end), occurrence.note_id)
+             for render in units for occurrence in project_protected_occurrences(render.unit, blocks)
+             if occurrence.note_id is not None and occurrence.note_id != occurrence.owner_block_id
+             for span in occurrence.source_spans}
+    return {link.id for link in document.links if link.reconstructed
+            and (link.source_block_id, link.source_span, link.destination) in spans}
+
+
+def _unit_markups(
+    document: PdfDocument, units: Sequence[PdfRenderUnit],
+    translations: Mapping[str, Translation], glossary: Mapping[str, str],
+) -> dict[str, str]:
+    """Restore protected occurrences into markup without searching equal visible values."""
+    from web_translator.pdf_units import project_protected_occurrences
+    if not units:
+        return {}
+    records = _normalized_unit_records([item.segment for item in units], translations, glossary)
+    blocks = {block.id: block for block in document.blocks}
+    identity_links = _protected_note_links(document, units)
+    result = {}
+    for render, record in zip(units, records, strict=True):
+        # Track restored offsets while the unique placeholder identity is still available.
+        occurrences = {item.placeholder: item for item in project_protected_occurrences(render.unit, blocks)
+                       if item.note_id is not None and item.owner_block_id != item.note_id}
+        cursor = 0
+        visible = ""
+        spans: list[tuple[int, int, str]] = []
+        token_map = {token.token: token for token in render.segment.protected}
+        pattern = re.compile("|".join(re.escape(token) for token in token_map)) if token_map else None
+        for match in pattern.finditer(record.text) if pattern else ():
+            visible += record.text[cursor:match.start()]
+            token = token_map[match[0]]
+            start = len(visible)
+            visible += token.value
+            occurrence = occurrences.get(match[0])
+            if occurrence is not None:
+                anchor = _occurrence_anchor(render.unit.id, occurrence.placeholder)
+                spans.append((start, len(visible),
+                    f'<a name={quoteattr(anchor)}/><link href={quoteattr("#" + _anchor_name(occurrence.note_id))}>{escape(token.value)}</link>'))
+            cursor = match.end()
+        visible += record.text[cursor:]
+        if render.unit.kind == "list-item":
+            _marker, body = _normalized_list_parts(render.source_blocks[0], visible)
+            prefix_length = len(visible) - len(body)
+            spans = [(start - prefix_length, end - prefix_length, markup)
+                     for start, end, markup in spans if start >= prefix_length]
+            visible = body
+        for link in document.links:
+            if not link.reconstructed or link.source_block_id not in render.unit.source_block_ids:
+                continue
+            if link.id in identity_links:
+                continue  # Already emitted from the corresponding placeholder occurrence.
+            for start, end, _ in _translated_link_spans(render.source_blocks[0], visible, [link]):
+                if any(start < right and left < end for left, right, _markup in spans):
+                    continue
+                href = _safe_uri(link.uri, link.id) if link.uri else "#" + _anchor_name(link.destination)
+                spans.append((start, end, f'<link href={quoteattr(href)}>{escape(visible[start:end])}</link>'))
+        cursor = 0
+        chunks = []
+        for start, end, markup in sorted(spans):
+            if start < cursor:
+                raise PdfAssemblyError(f"overlapping unit link spans: {render.unit.id}")
+            chunks.extend((escape(visible[cursor:start]), markup))
+            cursor = end
+        chunks.append(escape(visible[cursor:]))
+        # Plain singleton block destinations retain their existing fallback semantics.
+        result[render.source_blocks[0].id] = ("".join(chunks) if spans else
+            _linked_markup(render.source_blocks[0], visible))
+    return result
+
+
 def _validate_rich_relationships(document: PdfDocument) -> None:
     by_id = {block.id: block for block in document.blocks}
     table_blocks = {
@@ -958,13 +1110,16 @@ def _role_paragraph(
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     counters: dict[str, int], style: ParagraphStyle,
     callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
+    render_units: Mapping[str, PdfRenderUnit],
+    unit_markup: Mapping[str, str],
 ) -> TrackedFlowable:
     return TrackedFlowable(
-        Paragraph(_linked_markup(block, translated[block.id], links.get(block.id, ())), style),
+        Paragraph(unit_markup.get(block.id) or _linked_markup(block, translated[block.id], links.get(block.id, ())), style),
         block_id=block.id, kind=block.kind, source_order=block.order, split_part=0,
         font_size=style.fontSize, frame=frame, records=records, part_counters=counters,
         anchor_name=_anchor_name(block.id), semantic_role=block.semantic_role,
         on_draw=callbacks.get(block.id),
+        **_unit_tracking(block.id, render_units),
     )
 
 
@@ -973,6 +1128,7 @@ def _append_opener_group(
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
+    render_units: Mapping[str, PdfRenderUnit], unit_markup: Mapping[str, str],
 ) -> None:
     contents: list[Any] = [Spacer(1, frame[3] * 0.16)]
     for block in blocks:
@@ -983,7 +1139,7 @@ def _append_opener_group(
             alignment=_ALIGNMENTS[block.style.alignment], spaceAfter=14 if label else 24,
         )
         contents.append(_role_paragraph(
-            block, translated, links, frame, records, part_counters, style, callbacks,
+            block, translated, links, frame, records, part_counters, style, callbacks, render_units, unit_markup,
         ))
     if story and not isinstance(story[-1], PageBreak):
         story.append(PageBreak())
@@ -995,6 +1151,7 @@ def _append_epigraph_group(
     links: Mapping[str, Sequence[PdfLinkEvidence]],
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     part_counters: dict[str, int], *, callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
+    render_units: Mapping[str, PdfRenderUnit], unit_markup: Mapping[str, str],
 ) -> None:
     contents: list[Any] = [Spacer(1, frame[3] * 0.25)]
     for block in blocks:
@@ -1008,7 +1165,7 @@ def _append_epigraph_group(
             spaceAfter=8,
         )
         contents.append(_role_paragraph(
-            block, translated, links, frame, records, part_counters, style, callbacks,
+            block, translated, links, frame, records, part_counters, style, callbacks, render_units, unit_markup,
         ))
     if story and not isinstance(story[-1], PageBreak):
         story.append(PageBreak())
@@ -1021,6 +1178,7 @@ def _append_callout_group(
     frame: tuple[float, float, float, float], records: list[PdfFlowableLayout],
     part_counters: dict[str, int], *, media_payloads: Mapping[str, bytes],
     callbacks: Mapping[str, Callable[[Any, int, Flowable], None]],
+    render_units: Mapping[str, PdfRenderUnit], unit_markup: Mapping[str, str],
 ) -> None:
     icon = blocks[0] if blocks[0].kind == "figure" else None
     paragraphs: list[TrackedFlowable] = []
@@ -1034,7 +1192,7 @@ def _append_callout_group(
             spaceAfter=6, keepWithNext=title,
         )
         paragraphs.append(_role_paragraph(
-            block, translated, links, frame, records, part_counters, style, callbacks,
+            block, translated, links, frame, records, part_counters, style, callbacks, render_units, unit_markup,
         ))
     if icon is None:
         data, widths = [[paragraphs]], [frame[2]]
@@ -1361,22 +1519,40 @@ class _PageNoteCallback:
     """Schedule on the evidenced marker fragment, or explicitly block-only legacy evidence."""
 
     def __init__(self, owner_id: str, marker: re.Pattern[str] | None,
-                 schedule: Callable[[int], None], floors: dict[str, int], ownership: str) -> None:
+                 schedule: Callable[[int], None], floors: dict[str, int], ownership: str,
+                 occurrence_anchor: str | None = None) -> None:
         self.owner_id = owner_id
         self.marker = marker
         self.schedule = schedule
         self.floors = floors
         self.ownership = ownership
+        self.occurrence_anchor = occurrence_anchor
 
     def matches(self, content: Flowable) -> bool:
+        if self.occurrence_anchor is not None:
+            return any(getattr(getattr(word, "cbDefn", None), "name", None) == self.occurrence_anchor
+                       for line in getattr(getattr(content, "blPara", None), "lines", [])
+                       for word in getattr(line, "words", ()))
         return self.marker is None or self.marker.search(_paragraph_fragment_text(content)) is not None
 
     def minimum_page_for(self, content: Flowable) -> int:
-        return self.floors.get(self.owner_id, 0) if self.marker is not None and self.matches(content) else 0
+        return self.floors.get(self.owner_id, 0) if (self.marker is not None or self.occurrence_anchor is not None) and self.matches(content) else 0
 
     def __call__(self, _canvas: Any, page_number: int, content: Flowable) -> None:
         if self.matches(content):
             self.schedule(page_number)
+
+
+class _UnitNoteCallbacks:
+    def __init__(self, callbacks: Sequence[_PageNoteCallback]) -> None:
+        self.callbacks = callbacks
+
+    def minimum_page_for(self, content: Flowable) -> int:
+        return max((callback.minimum_page_for(content) for callback in self.callbacks), default=0)
+
+    def __call__(self, canvas: Any, page_number: int, content: Flowable) -> None:
+        for callback in self.callbacks:
+            callback(canvas, page_number, content)
 
 
 def _build_rich_document(
@@ -1389,11 +1565,17 @@ def _build_rich_document(
     *,
     toc_resolutions: Mapping[str, PdfTocResolution] | None = None,
     publication_evidence: dict[str, Any] | None = None,
+    render_units: Sequence[PdfRenderUnit] = (),
+    unit_markup: Mapping[str, str] | None = None,
 ) -> list[PdfFlowableLayout]:
     records: list[PdfFlowableLayout] = []
     part_counters: dict[str, int] = {}
+    units_by_block = {item.source_blocks[0].id: item for item in render_units}
+    member_units = {member.id: item for item in render_units for member in item.source_blocks}
+    unit_markup = unit_markup or {}
     translated = {block.id: text for block, _segment, text in ordered}
     segments_by_block = {block.id: segment for block, segment, _text in ordered}
+    segments_by_block.update({member: render.segment for member, render in member_units.items()})
     block_by_id = {block.id: block for block in document.blocks}
     links_by_block = _links_by_block(document)
     left_margin = right_margin = 54.0
@@ -1450,7 +1632,7 @@ def _build_rich_document(
             if note_id not in scheduled_note_pages:
                 raise PdfAssemblyError(f"footnote owner was not emitted: {note_id}")
             block = block_by_id[note_id]
-            paragraph = Paragraph(_linked_markup(block, translated[note_id], links_by_block.get(note_id, ())), footnote_style)
+            paragraph = Paragraph(unit_markup.get(note_id) or _linked_markup(block, translated[note_id], links_by_block.get(note_id, ())), footnote_style)
             page = scheduled_note_pages[note_id]
             previous = previous_owner_pages.get(note_id, page)
             owner = note_owners[note_id]
@@ -1531,6 +1713,19 @@ def _build_rich_document(
 
     def schedule_page_note(note_id: str) -> Any:
         owner_id = note_owners[note_id]
+        def schedule(page_number: int) -> None:
+            scheduled_note_pages.setdefault(note_id, page_number)
+
+        if owner_id in member_units:
+            from web_translator.pdf_units import project_protected_occurrences
+            render = member_units[owner_id]
+            occurrences = [item for item in project_protected_occurrences(render.unit, block_by_id)
+                           if item.owner_block_id == owner_id and item.note_id == note_id
+                           and item.owner_block_id != item.note_id]
+            if len(occurrences) != 1:
+                raise PdfAssemblyError(f"footnote requires one protected occurrence: {owner_id}")
+            return _PageNoteCallback(owner_id, None, schedule, owner_page_floors,
+                "protected-footnote-marker", _occurrence_anchor(render.unit.id, occurrences[0].placeholder))
         protected = [token.value for token in segments_by_block[owner_id].protected if token.kind == "footnote-marker"]
         source_links = [link for link in document.links if link.source_block_id == owner_id
             and link.destination == note_id and link.source_span is not None
@@ -1564,21 +1759,24 @@ def _build_rich_document(
         if marker is None:
             ownership = "block-only-legacy"
 
-        def schedule(page_number: int) -> None:
-            if note_id in scheduled_note_pages:
-                return
-            scheduled_note_pages[note_id] = page_number
-
         return _PageNoteCallback(owner_id, marker, schedule, owner_page_floors, ownership)
 
-    page_note_callbacks: dict[str, _PageNoteCallback] = {
+    physical_note_callbacks = {
         owner_id: schedule_page_note(note_id)
         for owner_id, note_id in owner_to_note.items()
         if note_id in page_local_notes
     }
+    page_note_callbacks: dict[str, Any] = dict(physical_note_callbacks)
+    for render in render_units:
+        callbacks = [physical_note_callbacks[member] for member in render.unit.source_block_ids
+                     if member in physical_note_callbacks]
+        if callbacks:
+            page_note_callbacks[render.source_blocks[0].id] = _UnitNoteCallbacks(callbacks)
 
     def block_first_owners(blocks: Sequence[PdfBlock]) -> list[str]:
-        return [b.id for b in blocks if b.id in page_note_callbacks and page_note_callbacks[b.id].marker is None]
+        return [b.id for b in blocks if b.id in physical_note_callbacks
+                and physical_note_callbacks[b.id].marker is None
+                and physical_note_callbacks[b.id].occurrence_anchor is None]
 
     def draw_running(canvas: Any, _doc: BaseDocTemplate, *, orientation: str) -> None:
         _embed_font_faces(canvas, _doc)
@@ -1704,7 +1902,8 @@ def _build_rich_document(
                 part_counters=part_counters,
                 anchor_name=_anchor_name(block.id),
                 footnote_owner_id=note_owners[note_id],
-                footnote_ownership=page_note_callbacks[note_owners[note_id]].ownership,
+                footnote_ownership=physical_note_callbacks[note_owners[note_id]].ownership,
+                **_unit_tracking(block.id, units_by_block),
             )
             _width, height = flowable.wrapOn(canvas, frame[2], cursor - frame[1])
             cursor -= height
@@ -1846,12 +2045,13 @@ def _build_rich_document(
                 source_order=block.order, split_part=0, font_size=font_size,
                 frame=frame, records=records, part_counters=part_counters,
                 anchor_name=_anchor_name(block.id), semantic_role=block.semantic_role,
+                **_unit_tracking(block.id, units_by_block),
             ))
             return
         story.append(
             TrackedFlowable(
                 Paragraph(
-                    _linked_markup(block, rendered_text, links_by_block.get(block.id, ())),
+                    unit_markup.get(block.id) or _linked_markup(block, rendered_text, links_by_block.get(block.id, ())),
                     style,
                     bulletText=(
                         escape(bullet_text) if bullet_text is not None else None
@@ -1868,6 +2068,7 @@ def _build_rich_document(
                 anchor_name=_anchor_name(block.id),
                 on_draw=page_note_callbacks.get(block.id),
                 semantic_role=block.semantic_role,
+                **_unit_tracking(block.id, units_by_block),
             )
         )
 
@@ -1909,7 +2110,7 @@ def _build_rich_document(
         )
         caption_flowable = TrackedFlowable(
             Paragraph(
-                _linked_markup(
+                unit_markup.get(caption.id) or _linked_markup(
                     caption,
                     translated[caption.id],
                     links_by_block.get(caption.id, ()),
@@ -1925,6 +2126,7 @@ def _build_rich_document(
             records=records,
             part_counters=part_counters,
             anchor_name=_anchor_name(caption.id),
+            **_unit_tracking(caption.id, units_by_block),
         )
         contents = (
             [caption_flowable, image]
@@ -1938,6 +2140,8 @@ def _build_rich_document(
         with ExitStack() as stack:
             _register_fonts(stack)
             for index, block in enumerate(document.blocks):
+                if block.id in member_units and block.id not in units_by_block:
+                    continue
                 if block.kind in _IGNORED_KINDS or block.id in page_local_notes:
                     continue
                 if block.id in emitted_block_ids:
@@ -1957,6 +2161,7 @@ def _build_rich_document(
                     append_group(
                         story, group, translated, links_by_block, portrait_frame,
                         records, part_counters, callbacks=page_note_callbacks,
+                        render_units=units_by_block, unit_markup=unit_markup,
                     )
                     if owners := block_first_owners(group):
                         story.insert(len(story) - 1, ActionFlowable(("ownerFloor", owners)))
@@ -1985,6 +2190,7 @@ def _build_rich_document(
                         story, group, translated, links_by_block, portrait_frame,
                         records, part_counters, media_payloads=media_payloads,
                         callbacks=page_note_callbacks,
+                        render_units=units_by_block, unit_markup=unit_markup,
                     )
                     emitted_block_ids.update(item.id for item in group)
                     continue
@@ -2014,6 +2220,7 @@ def _build_rich_document(
                             table_header_rows[block.table_id],
                             page_note_callbacks,
                             links_by_block,
+                            units_by_block, unit_markup,
                         )
                     )
                     emitted_tables.add(block.table_id)
@@ -2411,6 +2618,7 @@ def _native_table(
     header_rows: set[int],
     on_draw_by_block: Mapping[str, Callable[[Any, int, Flowable], None]],
     links_by_block: Mapping[str, Sequence[PdfLinkEvidence]],
+    render_units: Mapping[str, PdfRenderUnit], unit_markup: Mapping[str, str],
 ) -> Table:
     row_count = max((block.row or 0) + block.row_span for block in blocks)
     column_count = len(widths)
@@ -2434,7 +2642,7 @@ def _native_table(
         style = header_style if block.row in header_rows else cell_style
         if block.source_text.strip():
             paragraph = Paragraph(
-                _linked_markup(
+                unit_markup.get(block.id) or _linked_markup(
                     block,
                     translated[block.id],
                     links_by_block.get(block.id, ()),
@@ -2455,6 +2663,7 @@ def _native_table(
             part_counters=part_counters,
             anchor_name=_anchor_name(block.id),
             on_draw=on_draw_by_block.get(block.id),
+            **_unit_tracking(block.id, render_units),
         )
         if block.row_span > 1 or block.column_span > 1:
             commands.append(
