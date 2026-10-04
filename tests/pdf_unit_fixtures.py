@@ -171,18 +171,40 @@ def make_render_unit_run(root, *, case="joined"):
 
     run = root / "run"
     run.mkdir(parents=True)
-    notes = case == "multiple-note"
+    notes = case in {"multiple-note", "note-link-overlap"}
+    colliding_labels = {
+        "equal-links": ("Alpha", "Alpha"),
+        "equal-links-fallback": ("Alpha", "Alpha"),
+        "intersecting-links": ("Alpha Beta", "Beta Gamma"),
+        "intersecting-links-reversed": ("Beta Gamma", "Alpha Beta"),
+    }.get(case)
     texts = (("First member * continues", "second member * ends.") if notes
              else ("7. A paragraph" if case == "list" else "A paragraph", "continues."))
     if case == "links":
         texts = ("First Alpha continues", "second Beta ends.")
+    if colliding_labels:
+        texts = (f"First {colliding_labels[0]} and Delta continue", f"second {colliding_labels[1]} ends.")
     document = make_unit_document(texts, operation="space")
     blocks = document.blocks
+    if case == "equal-links-fallback":
+        blocks = [replace(blocks[0], uri="https://example.org/1"), blocks[1]]
     unit = document.translation_units[0]
     if case == "list":
         blocks = [replace(blocks[0], kind="list-item"), blocks[1]]
         unit = replace(unit, kind="list-item")
     units = [unit]
+    if colliding_labels:
+        document = replace(document, links=sorted([PdfLinkEvidence(
+            id=f"pdf:page-{block.page_number:04d}:link-{2 if index == 2 else 1:04d}",
+            page_number=block.page_number, source_block_id=block.id,
+            source_span=(block.source_text.index(label), block.source_text.index(label) + len(label)),
+            bounds=block.bbox, visible_label=label, uri=f"https://example.org/{index + 1}",
+            destination=None, reconstructed=True, reason=None)
+            for index, (block, label) in enumerate(zip(
+                [blocks[0], blocks[1], blocks[0]], [*colliding_labels, "Delta"], strict=True))],
+            key=lambda link: (link.page_number, link.id)))
+        if case == "equal-links-fallback":
+            document = replace(document, links=[link for link in document.links if link.uri != "https://example.org/3"])
     if case == "links":
         document = replace(document, links=[PdfLinkEvidence(
             id=f"pdf:page-{index + 1:04d}:link-0001", page_number=index + 1,
@@ -212,6 +234,10 @@ def make_render_unit_run(root, *, case="joined"):
             bounds=block.bbox, visible_label="*", uri=None,
             destination=block.destination, reconstructed=True, reason=None)
             for block in body])
+        if case == "note-link-overlap":
+            document.links.insert(1, replace(document.links[0],
+                id="pdf:page-0001:link-0002", source_span=(0, 14), visible_label="First member *",
+                destination=None, uri="https://example.org/ordinary"))
     source_path = run / "source.pdf"
     canvas = Canvas(str(source_path), pagesize=(612, 792))
     for page in (1, 2):
@@ -237,11 +263,14 @@ def make_render_unit_run(root, *, case="joined"):
     body_text = "문단 전체를 번역한 검증 문장"
     if case == "links":
         body_text += " Alpha 내부 참조와 Beta 외부 참조입니다."
+    if colliding_labels:
+        body_text += (" Alpha와 Delta 참조입니다." if case.startswith("equal-links")
+                      else " Alpha Beta Gamma와 Delta 참조입니다.")
     if case == "list":
         body_text = segments[0].protected[0].token + ". " + body_text
     if notes:
         markers = [token.token for token in segments[0].protected if token.kind == "footnote-marker"]
-        body_text += " 첫째표식 " + markers[0] + " " + ("분할 확인을 위한 긴 본문입니다. " * 150)
+        body_text += (" First member " if case == "note-link-overlap" else " 첫째표식 ") + markers[0] + " " + ("분할 확인을 위한 긴 본문입니다. " * 150)
         body_text += " 둘째표식 " + markers[1] + " 마지막 문장입니다."
     translations = {segments[0].id: Translation(segments[0].id, body_text)}
     for index, segment in enumerate(segments[1:]):

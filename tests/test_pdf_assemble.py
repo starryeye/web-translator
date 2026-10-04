@@ -188,6 +188,36 @@ def test_joined_unit_keeps_nonfirst_link_and_resolves_member_destination(rendere
     assert float(destination[3]) == pytest.approx(first.bounds[1] + first.bounds[3])
 
 
+@pytest.mark.parametrize("case", ["equal-links", "equal-links-fallback", "intersecting-links", "intersecting-links-reversed"])
+def test_joined_unit_link_collisions_are_explicit_and_order_independent(tmp_path, case):
+    document, layout, text, pdf, _segments = _render_unit_case(tmp_path, case)
+    source_uris = {link.id: link.uri for link in document.links}
+    assert {link.id: link.uri for link in layout.links} == source_uris
+    ambiguous = [link for link in layout.links if link.uri in {"https://example.org/1", "https://example.org/2"}]
+    assert len(ambiguous) == 2
+    assert all(not link.reconstructed and link.reason == "translated-visible-label-not-unambiguous"
+               for link in ambiguous)
+    retained = [link for link in layout.links if link.reconstructed]
+    assert [link.uri for link in retained] == ([] if case == "equal-links-fallback" else ["https://example.org/3"])
+    emitted = [annot.get_object()["/A"]["/URI"] for page in PdfReader(pdf).pages
+               for annot in page.get("/Annots", [])]
+    assert emitted == [link.uri for link in retained]
+    assert "Alpha" in text and "Delta" in text
+
+
+def test_joined_unit_link_collision_preserves_protected_note_identity(tmp_path):
+    document, layout, _text, pdf, _segments = _render_unit_case(tmp_path, "note-link-overlap")
+    ordinary = next(link for link in layout.links if link.uri is not None)
+    assert not ordinary.reconstructed
+    assert ordinary.reason == "translated-visible-label-not-unambiguous"
+    notes = [link for link in layout.links if link.destination is not None]
+    assert len(notes) == 2 and all(link.reconstructed for link in notes)
+    assert [link.destination for link in notes] == [link.destination for link in document.links if link.destination]
+    annotations = [annot.get_object() for page in PdfReader(pdf).pages for annot in page.get("/Annots", [])]
+    assert len(annotations) == 2 and all("/Dest" in annotation for annotation in annotations)
+    assert annotations[0]["/Dest"] != annotations[1]["/Dest"]
+
+
 @pytest.mark.parametrize("mutation", ["missing", "wrong-first", "different-split-unit", "different-split-members", "duplicate-unit"])
 def test_joined_unit_layout_rejects_invalid_provenance(tmp_path, mutation):
     from web_translator.pdf_flowables import PdfAssemblyLayout

@@ -318,7 +318,8 @@ def assemble_pdf(
                 {member.id: item.text for item in render_units for member in item.source_blocks}
                 if render_units else ordered), strict=True)],
         )
-        unit_markup = _unit_markups(document, render_units, consumed_translations, consumed_glossary)
+        unit_markup, unit_links = _unit_markups(document, render_units, consumed_translations, consumed_glossary)
+        document = replace(document, links=list(unit_links))
         _validate_rich_relationships(document)
         media_payloads: dict[str, bytes] = {}
         figure_blocks = [block for block in document.blocks if block.kind == "figure"]
@@ -846,15 +847,16 @@ def _protected_note_links(document: PdfDocument, units: Sequence[PdfRenderUnit])
 def _unit_markups(
     document: PdfDocument, units: Sequence[PdfRenderUnit],
     translations: Mapping[str, Translation], glossary: Mapping[str, str],
-) -> dict[str, str]:
-    """Restore protected occurrences into markup without searching equal visible values."""
+) -> tuple[dict[str, str], tuple[PdfLinkEvidence, ...]]:
+    """Resolve unit-wide link evidence before emitting identity-preserving markup."""
     from web_translator.pdf_units import project_protected_occurrences
     if not units:
-        return {}
+        return {}, tuple(document.links)
     records = _normalized_unit_records([item.segment for item in units], translations, glossary)
     blocks = {block.id: block for block in document.blocks}
     identity_links = _protected_note_links(document, units)
     result = {}
+    ambiguous_links: set[str] = set()
     for render, record in zip(units, records, strict=True):
         # Track restored offsets while the unique placeholder identity is still available.
         occurrences = {item.placeholder: item for item in project_protected_occurrences(render.unit, blocks)
@@ -882,16 +884,27 @@ def _unit_markups(
             spans = [(start - prefix_length, end - prefix_length, markup)
                      for start, end, markup in spans if start >= prefix_length]
             visible = body
+        ordinary_spans = []
         for link in document.links:
             if not link.reconstructed or link.source_block_id not in render.unit.source_block_ids:
                 continue
             if link.id in identity_links:
                 continue  # Already emitted from the corresponding placeholder occurrence.
-            for start, end, _ in _translated_link_spans(render.source_blocks[0], visible, [link]):
-                if any(start < right and left < end for left, right, _markup in spans):
-                    continue
-                href = _safe_uri(link.uri, link.id) if link.uri else "#" + _anchor_name(link.destination)
-                spans.append((start, end, f'<link href={quoteattr(href)}>{escape(visible[start:end])}</link>'))
+            ordinary_spans.extend(_translated_link_spans(render.source_blocks[0], visible, [link]))
+        # Decide every collision before emission: no source-order first winner.
+        # Protected note spans retain their evidenced identity; ordinary overlaps
+        # cannot claim that same translated text or silently hide one another.
+        for index, (start, end, link) in enumerate(ordinary_spans):
+            if any(start < right and left < end for left, right, _markup in spans):
+                ambiguous_links.add(link.id)
+            for left, right, other in ordinary_spans[index + 1:]:
+                if start < right and left < end:
+                    ambiguous_links.update((link.id, other.id))
+        for start, end, link in ordinary_spans:
+            if link.id in ambiguous_links:
+                continue
+            href = _safe_uri(link.uri, link.id) if link.uri else "#" + _anchor_name(link.destination)
+            spans.append((start, end, f'<link href={quoteattr(href)}>{escape(visible[start:end])}</link>'))
         cursor = 0
         chunks = []
         for start, end, markup in sorted(spans):
@@ -901,9 +914,15 @@ def _unit_markups(
             cursor = end
         chunks.append(escape(visible[cursor:]))
         # Plain singleton block destinations retain their existing fallback semantics.
-        result[render.source_blocks[0].id] = ("".join(chunks) if spans else
-            _linked_markup(render.source_blocks[0], visible))
-    return result
+        result[render.source_blocks[0].id] = (
+            _linked_markup(render.source_blocks[0], visible)
+            if not spans and len(render.source_blocks) == 1
+            and not any(link.id in ambiguous_links for _start, _end, link in ordinary_spans)
+            else "".join(chunks)
+        )
+    links = tuple(replace(link, reconstructed=False, reason="translated-visible-label-not-unambiguous")
+                  if link.id in ambiguous_links else link for link in document.links)
+    return result, links
 
 
 def _validate_rich_relationships(document: PdfDocument) -> None:
