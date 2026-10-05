@@ -35,6 +35,14 @@ def test_native_review_rejects_stale_binding(bound_unit_run):
         build_pdf_semantic_review_input(bound_unit_run)
 
 
+def test_unit_semantic_input_rejects_duplicate_file_evidence(bound_unit_run):
+    from web_translator.pdf_review import PdfSemanticReviewInput
+    value = build_pdf_semantic_review_input(bound_unit_run).to_dict()
+    value["files"].insert(0, value["files"][0])
+    with pytest.raises(PdfSemanticReviewError, match="unique"):
+        PdfSemanticReviewInput.from_dict(value)
+
+
 def test_native_review_rejects_foreign_assignment_file(bound_unit_run):
     (bound_unit_run / "assignments" / ".unknown.json").write_text("{}")
     with pytest.raises(PdfSemanticReviewError):

@@ -47,6 +47,144 @@ import web_translator.pdf_qa as pdf_qa_module
 from tests.pdf_fixtures import make_text_pdf
 
 
+def make_native_unit_qa_run(tmp_path, *, case="joined"):
+    """Generated test-only evidence through the native unit and assembly paths."""
+    from tests.pdf_unit_fixtures import make_render_unit_run
+    from web_translator.cli import _zone_payload
+    from web_translator.pdf_unit_bindings import build_pdf_unit_binding
+    from web_translator.zones import build_zones
+
+    run, document, segments, translations = make_render_unit_run(tmp_path, case=case)
+    for zone in build_zones(segments):
+        _write_json(run / "zones" / f"{zone.id}.json", _zone_payload(zone))
+    binding = build_pdf_unit_binding(
+        (run / "document.json").read_bytes(), (run / "segments.jsonl").read_bytes(),
+        {p.name: p.read_bytes() for p in (run / "zones").iterdir()},
+        {"zone-001.json": (run / "assignments/zone-001.json").read_bytes()},
+    )
+    _write_json(run / "assignments/.pdf-unit-binding.json", binding.to_dict())
+    glossary = {"Alpha": "알파", "Delta": "델타"} if case.startswith("equal-links") else {}
+    _write_json(run / "glossary.json", glossary)
+    (run / "translations").mkdir()
+    (run / "translations/zone-001.jsonl").write_text(
+        "".join(json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+                for record in translations.values()), encoding="utf-8")
+    _write_review(run)
+    output = tmp_path / "output"
+    assemble_pdf(run, translations, glossary, output)
+    from web_translator.pdf_flowables import PdfAssemblyLayout
+    layout = PdfAssemblyLayout.from_dict(json.loads((run / "layout.json").read_bytes()))
+    return PdfQARun(run, output), document, layout
+
+
+@pytest.mark.parametrize("damage", ["missing-member", "foreign-member", "duplicate", "missing-part", "reordered-parts", "wrong-owner", "orphan-note", "anchor"])
+def test_unit_layout_rejects_lost_members_and_logical_ownership(tmp_path, damage):
+    from dataclasses import replace
+    run, document, layout = make_native_unit_qa_run(tmp_path, case="multiple-note")
+    validate = getattr(pdf_qa_module, "validate_pdf_unit_layout", None)
+    assert callable(validate), "unit layout coverage validation is missing"
+    validate(document, layout)
+    records = list(layout.flowables)
+    first = records[0]
+    if damage == "missing-member":
+        records[0] = replace(first, source_block_ids=first.source_block_ids[:1])
+    elif damage == "foreign-member":
+        records[0] = replace(first, source_block_ids=(*first.source_block_ids, "pdf:page-9999:block-0001"))
+    elif damage == "duplicate":
+        records.insert(1, first)
+    elif damage == "missing-part":
+        records.pop(0)
+    elif damage == "reordered-parts":
+        records[0], records[1] = records[1], records[0]
+    elif damage == "wrong-owner":
+        # Select the second note, whose marker belongs to the second physical member.
+        index = max(i for i, item in enumerate(records) if item.kind == "footnote")
+        records[index] = replace(records[index], footnote_owner_id=document.blocks[0].id)
+    elif damage == "orphan-note":
+        records = [item for item in records if item.kind != "footnote"]
+    elif damage == "anchor":
+        layout = replace(layout, anchor_pages=())
+    with pytest.raises(PdfQAFailure):
+        validate(document, replace(layout, flowables=tuple(records)))
+
+
+@pytest.mark.parametrize("case", ["joined", "multiple-note", "links", "equal-links", "equal-links-fallback", "note-link-overlap"])
+def test_unit_qa_counts_physical_blocks_separately(tmp_path, case):
+    run, document, _layout = make_native_unit_qa_run(tmp_path, case=case)
+    result = prepare_pdf_qa(run.run_dir, run.output_dir)
+    assert result.schema_version == "1.1"
+    assert result.metrics["translated_block_count"] == len(document.blocks)
+    assert result.metrics["translation_unit_count"] == len(document.translation_units)
+    finding = next(item for item in result.findings if item.code == "structure.text")
+    assert f"{len(document.translation_units)} logical translation units" in finding.evidence
+    assert PdfQAResult.from_dict(result.to_dict(), run.run_dir / "qa-pages") == result
+
+
+def test_unit_legacy_origin_cannot_claim_native_acceptance(tmp_path):
+    from dataclasses import replace
+    _run, document, layout = make_native_unit_qa_run(tmp_path)
+    validate = getattr(pdf_qa_module, "validate_pdf_unit_layout", None)
+    assert callable(validate), "unit layout coverage validation is missing"
+    with pytest.raises(PdfQAFailure, match="origin|native"):
+        validate(replace(document, extracted_schema_version="1.1"), layout)
+
+
+def test_unit_singleton_note_anchor_records_actual_final_page_draw(tmp_path):
+    _run, document, layout = make_native_unit_qa_run(tmp_path, case="multiple-note")
+    anchors = dict(layout.anchor_pages)
+    for unit in document.translation_units:
+        parts = [part for part in layout.flowables if part.unit_id == unit.id]
+        for member in unit.source_block_ids:
+            assert anchors.get(pdf_qa_module.assembly._anchor_name(member)) == parts[0].page_number
+
+
+def test_unit_note_cannot_drop_physical_callout_ownership(tmp_path):
+    from dataclasses import replace
+    _run, document, layout = make_native_unit_qa_run(tmp_path, case="multiple-note")
+    broken = replace(layout, flowables=tuple(
+        replace(item, footnote_owner_id=None, footnote_ownership=None)
+        if item.kind == "footnote" else item for item in layout.flowables))
+    with pytest.raises(PdfQAFailure, match="owner"):
+        pdf_qa_module.validate_pdf_unit_layout(document, broken)
+
+
+def test_unit_qa_reader_rejects_logical_count_larger_than_physical(tmp_path):
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    value = prepare_pdf_qa(run.run_dir, run.output_dir).to_dict()
+    value["metrics"]["translation_unit_count"] = 3
+    with pytest.raises(PdfQAFailure, match="physical|logical"):
+        PdfQAResult.from_dict(value, run.run_dir / "qa-pages")
+
+
+def test_unit_layout_rejects_unresolved_required_flow_findings(tmp_path):
+    from dataclasses import replace
+    from web_translator.pdf_models import PdfFlowFinding
+    _run, document, layout = make_native_unit_qa_run(tmp_path)
+    finding = PdfFlowFinding("ambiguous-page-continuation", document.blocks[0].id,
+                             document.blocks[1].id, "required", "Unresolved boundary")
+    with pytest.raises(PdfQAFailure, match="unresolved required"):
+        pdf_qa_module.validate_pdf_unit_layout(replace(document, flow_findings=[finding]), layout)
+
+
+def test_unit_metric_schema_cannot_be_read_as_legacy(tmp_path):
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    value = prepare_pdf_qa(run.run_dir, run.output_dir).to_dict()
+    value["schema_version"] = "1.0"
+    with pytest.raises(PdfQAFailure, match="metrics fields"):
+        PdfQAResult.from_dict(value, run.run_dir / "qa-pages")
+
+
+def test_unit_qa_rejects_omitted_final_split_text(tmp_path):
+    run, _document, layout = make_native_unit_qa_run(tmp_path, case="multiple-note")
+    value = layout.to_dict()
+    last = max(index for index, item in enumerate(value["flowables"])
+               if item.get("unit_id") == "pdf:unit-000001")
+    value["flowables"].pop(last)
+    _write_json(run.run_dir / "layout.json", value)
+    with pytest.raises(PdfQAFailure, match="selectable|annotation"):
+        prepare_pdf_qa(run.run_dir, run.output_dir)
+
+
 REVIEW_DIMENSIONS = (
     "semantic_fidelity",
     "qualification_preservation",
@@ -661,7 +799,7 @@ def test_text_image_separation_rejects_single_clear_prose_sentence() -> None:
         bbox=(60.0, 190.0, 550.0, 290.0),
     )
     document = SimpleNamespace(blocks=[figure], page_count=1)
-    layout = SimpleNamespace(flowables=[SimpleNamespace(block_id="figure-1")])
+    layout = SimpleNamespace(flowables=[SimpleNamespace(block_id="figure-1", source_block_ids=())])
 
     with pytest.raises(PdfQAFailure, match="figure contains translatable selectable text"):
         pdf_qa_module._validate_text_image_separation(
@@ -813,11 +951,13 @@ def _in_memory_toc_gate(
         flowables=[
             SimpleNamespace(
                 block_id=entry_id,
+                source_block_ids=(),
                 page_number=1,
                 bounds=(72.0, 716.0, 228.0, 20.0),
             ),
             SimpleNamespace(
                 block_id=target_id,
+                source_block_ids=(),
                 page_number=2,
                 bounds=(72.0, 716.0, 160.0, 20.0),
             ),

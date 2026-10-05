@@ -1931,6 +1931,10 @@ def _build_rich_document(
                     f"page-local footnotes exceed their frame on page {page_number}"
                 )
             flowable.drawOn(canvas, frame[0], cursor)
+            # ReportLab removes canvas._doctemplate before _endBuild draws the
+            # final page's notes. Record the actual first draw through this
+            # callback's owned registry as well as the flowable's PDF bookmark.
+            anchor_pages.setdefault(_anchor_name(block.id), page_number)
             cursor -= 2
             drawn_page_notes.add((page_number, note_id))
 

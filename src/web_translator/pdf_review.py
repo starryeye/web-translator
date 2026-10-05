@@ -99,8 +99,8 @@ class PdfSemanticReviewInput:
             PdfSemanticInputFile.from_dict(_mapping(item, "semantic input file"))
             for item in files
         )
-        if [item.path for item in parsed] != sorted(item.path for item in parsed):
-            raise PdfSemanticReviewError("semantic review input files must be sorted")
+        if [item.path for item in parsed] != sorted({item.path for item in parsed}):
+            raise PdfSemanticReviewError("semantic review input files must be sorted and unique")
         return cls("1.0", digest, expected_policy, parsed)
 
 

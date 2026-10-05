@@ -34,6 +34,123 @@ from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_
 
 
 PDF_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "pdf"
+
+
+def test_unit_manifest_maps_every_physical_member_without_invented_rectangles(tmp_path):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    run, document, _layout = make_native_unit_qa_run(tmp_path)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    finalize_pdf_output(run.run_dir, run.output_dir)
+    manifest = json.loads((run.output_dir / "manifest.json").read_bytes())
+    assert manifest["schema_version"] == "1.1"
+    assert manifest["qa"]["automated"]["metrics"]["translated_block_count"] == 2
+    assert manifest["qa"]["automated"]["metrics"]["translation_unit_count"] == 1
+    assert manifest["translation_units"] == [{
+        "unit_id": "pdf:unit-000001", "segment_id": "seg-000001",
+        "source_block_ids": [block.id for block in document.blocks],
+        "source_pages": [1, 2],
+        "source_bboxes": [[72.0, 72.0, 540.0, 96.0], [72.0, 72.0, 540.0, 96.0]],
+        "output_pages": [1], "anchor_granularity": "paragraph-start",
+    }]
+    inputs = {item["path"]: item for item in manifest["semantic_input"]["files"]}
+    for name in ("document.json", "source.json", "assignments/.pdf-unit-binding.json"):
+        assert inputs[name]["sha256"] == hashlib.sha256((run.run_dir / name).read_bytes()).hexdigest()
+    assert sorted(p.name for p in run.output_dir.iterdir()) == ["manifest.json", "review-report.md", "translated.pdf"]
+    report = (run.output_dir / "review-report.md").read_text()
+    assert "Physical translated blocks: 2" in report
+    assert "Logical translation units: 1" in report
+    assert "paragraph-start" in report
+
+
+def test_unit_finalization_rejects_rebound_map_after_semantic_approval(tmp_path):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    from tests.test_pdf_unit_bindings import manual_binding, write_json
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    path = run.run_dir / "document.json"
+    value = json.loads(path.read_bytes())
+    value["translation_units"][0]["joins"][0]["evidence"]["left"]["text_indent"] = 2.0
+    write_json(path, value)
+    write_json(run.run_dir / "assignments/.pdf-unit-binding.json", manual_binding(run.run_dir))
+    with pytest.raises(PdfQAFailure, match="digest does not match"):
+        finalize_pdf_output(run.run_dir, run.output_dir)
+    assert not run.output_dir.exists()
+
+
+@pytest.fixture
+def verified_unit_manifest(tmp_path):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    return build_pdf_manifest(run.run_dir)
+
+
+@pytest.mark.parametrize("damage", ["duplicate-member", "source-page", "bbox-count", "bbox-bounds", "output-page", "anchor", "metric", "legacy-schema", "legacy-qa", "digest", "missing-binding"])
+def test_unit_manifest_reader_rejects_inconsistent_mapping(verified_unit_manifest, damage):
+    value = verified_unit_manifest
+    unit = value["translation_units"][0]
+    if damage == "duplicate-member":
+        unit["source_block_ids"][1] = unit["source_block_ids"][0]
+    elif damage == "source-page":
+        unit["source_pages"] = [1]
+    elif damage == "bbox-count":
+        unit["source_bboxes"].pop()
+    elif damage == "bbox-bounds":
+        unit["source_bboxes"][1][2] = 10000
+    elif damage == "output-page":
+        unit["output_pages"] = [2]
+    elif damage == "anchor":
+        unit["anchor_granularity"] = "member-rectangle"
+    elif damage == "metric":
+        value["qa"]["automated"]["metrics"]["translated_block_count"] = 1
+    elif damage == "legacy-schema":
+        value["schema_version"] = "1.0"
+    elif damage == "legacy-qa":
+        value["qa"]["automated"]["schema_version"] = "1.0"
+        del value["qa"]["automated"]["metrics"]["translation_unit_count"]
+    elif damage == "digest":
+        value["semantic_input"]["semantic_input_sha256"] = "a" * 64
+    elif damage == "missing-binding":
+        value["semantic_input"]["files"] = [item for item in value["semantic_input"]["files"]
+                                             if item["path"] != "assignments/.pdf-unit-binding.json"]
+    with pytest.raises(PdfQAFailure):
+        PdfFinalManifest.from_dict(value)
+
+
+def test_unit_final_report_retains_ambiguous_link_destinations(tmp_path):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    run, _document, _layout = make_native_unit_qa_run(tmp_path, case="equal-links")
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    finalize_pdf_output(run.run_dir, run.output_dir)
+    manifest = json.loads((run.output_dir / "manifest.json").read_bytes())
+    warnings = manifest["qa"]["warnings"]
+    for destination in ("https://example.org/1", "https://example.org/2"):
+        assert any(destination in warning and "translated-visible-label-not-unambiguous" in warning for warning in warnings)
+        assert destination in (run.output_dir / "review-report.md").read_text()
+
+
+@pytest.mark.parametrize("artifact", ["document.json", "source.json", "assignments/.pdf-unit-binding.json"])
+def test_unit_finalization_rejects_held_native_evidence_change(tmp_path, monkeypatch, artifact):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    original = pdf_report_module.write_pdf_review_report
+    def mutate_after_report(*args, **kwargs):
+        original(*args, **kwargs)
+        path = run.run_dir / artifact
+        path.write_bytes(path.read_bytes() + b" ")
+    monkeypatch.setattr(pdf_report_module, "write_pdf_review_report", mutate_after_report)
+    with pytest.raises(PdfQAFailure, match="changed|content"):
+        finalize_pdf_output(run.run_dir, run.output_dir)
+    assert not run.output_dir.exists()
+    assert sorted(p.name for p in (run.run_dir / "staged-output").iterdir()) == ["translated.pdf"]
+
+
 _KOREAN_SYLLABLE = re.compile(r"[가-힣]")
 _PROTECTED_TOKEN = re.compile(r"⟦WT:\d{6}⟧")
 _PRESERVED_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)

@@ -177,8 +177,8 @@ class PdfQAResult:
         }
         if not isinstance(value, Mapping) or set(value) != fields:
             raise PdfQAFailure("pdf-qa fields must be exactly " + ", ".join(sorted(fields)))
-        if value["schema_version"] != "1.0":
-            raise PdfQAFailure("pdf-qa schema_version must be '1.0'")
+        if value["schema_version"] not in ("1.0", "1.1"):
+            raise PdfQAFailure("pdf-qa schema_version must be '1.0' or '1.1'")
         staged_hash = _qa_hash(value["staged_pdf_sha256"], "staged_pdf_sha256")
         if type(value["passed"]) is not bool:
             raise PdfQAFailure("pdf-qa passed must be a boolean")
@@ -239,12 +239,18 @@ class PdfQAResult:
             "rendered_page_count",
             "translated_block_count",
         }
+        if value["schema_version"] == "1.1":
+            metric_fields.add("translation_unit_count")
         raw_metrics = value["metrics"]
         if not isinstance(raw_metrics, Mapping) or set(raw_metrics) != metric_fields:
             raise PdfQAFailure("pdf-qa metrics fields are not exact")
         if any(type(item) is not int or item < 0 for item in raw_metrics.values()):
             raise PdfQAFailure("pdf-qa metrics must be nonnegative integers")
         metrics = dict(raw_metrics)  # type: ignore[arg-type]
+        if value["schema_version"] == "1.1" and not (
+            0 < metrics["translation_unit_count"] <= metrics["translated_block_count"]
+        ):
+            raise PdfQAFailure("pdf-qa logical units must be positive and not exceed physical blocks")
         if (
             metrics["rendered_page_count"] != len(page_hashes)
             or metrics["output_page_count"] != len(page_hashes)
@@ -253,7 +259,7 @@ class PdfQAResult:
             raise PdfQAFailure("pdf-qa metrics disagree with page/contact coverage")
         qa_pages_dir = Path(qa_pages_dir)
         return cls(
-            schema_version="1.0",
+            schema_version=value["schema_version"],
             staged_pdf_sha256=staged_hash,
             findings=tuple(findings),
             rendered_pages=tuple(qa_pages_dir / name for name in page_hashes),
@@ -398,6 +404,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             layout=layout,
             qa=qa,
             visual_review=review,
+            semantic_snapshot=semantic_snapshot,
         )
         if layout.reserved_output_dir != str(output_dir):
             raise PdfQAFailure(
@@ -1298,6 +1305,8 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         )
         source_pdf_bytes = _validate_source(document, source, opened["source.pdf"])
         _validate_publication_evidence(document_value, layout_value, layout)
+        if document.schema_version == "1.2":
+            validate_pdf_unit_layout(document, layout)
         pdf_bytes = assembly._read_opened_bytes(
             staged_pdf,
             run_dir / "staged-output" / "translated.pdf",
@@ -1431,11 +1440,16 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             PdfQAFinding(code, evidence)
             for code, evidence in sorted(
                 {
-                    "contract.coverage": f"Validated {len(normalized)} translated blocks.",
+                    "contract.coverage": (
+                        f"Validated {sum(block.segment_id is not None for block in document.blocks)} physical translated blocks "
+                        f"in {len(normalized)} logical translation units."
+                        if document.schema_version == "1.2" else
+                        f"Validated {len(normalized)} translated blocks."
+                    ),
                     "contract.review": "Semantic review has no unresolved required finding.",
                     "layout.evidence": f"Validated {len(layout.flowables)} tracked flowables.",
                     "publication.callouts": callout_evidence,
-                    "publication.evidence": "Validated schema 1.1 document and layout provenance.",
+                    "publication.evidence": f"Validated schema {document.schema_version} document and layout provenance.",
                     "publication.latin_density": latin_evidence,
                     "publication.openers": opener_evidence,
                     "publication.provenance": provenance_evidence,
@@ -1448,12 +1462,16 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                     "structure.fonts": "Embedded Regular and Bold Korean fonts have Unicode maps.",
                     "structure.links": f"Validated {structure['link_count']} PDF link annotations.",
                     "structure.pages": f"Reopened {structure['page_count']} unencrypted pages.",
-                    "structure.text": f"Validated selectable text for {len(normalized)} translated blocks.",
+                    "structure.text": (
+                        f"Validated selectable text for {len(normalized)} logical translation units."
+                        if document.schema_version == "1.2" else
+                        f"Validated selectable text for {len(normalized)} translated blocks."
+                    ),
                 }.items()
             )
         )
         result = PdfQAResult(
-            schema_version="1.0",
+            schema_version="1.1" if document.schema_version == "1.2" else "1.0",
             staged_pdf_sha256=staged_hash,
             findings=findings,
             rendered_pages=tuple(run_dir / "qa-pages" / path.name for path in raw_pages),
@@ -1468,6 +1486,10 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                 "output_page_count": structure["page_count"],
                 "rendered_page_count": len(raw_pages),
                 "translated_block_count": len(normalized),
+                **({
+                    "translated_block_count": sum(len(unit.source_block_ids) for unit in document.translation_units),
+                    "translation_unit_count": len(normalized),
+                } if document.schema_version == "1.2" else {}),
             },
             passed=True,
         )
@@ -1923,6 +1945,10 @@ def _validate_publication_evidence(
     layout: PdfAssemblyLayout,
 ) -> None:
     """Require native semantic evidence for publication, not compatibility upgrades."""
+    if document_value.get("schema_version") == "1.2":
+        if document_value.get("extracted_schema_version") != "1.2" or layout.schema_version != "1.2":
+            raise PdfQAFailure("native unit publication requires native 1.2 origin and layout")
+        return
     if document_value.get("schema_version") != "1.1":
         raise PdfQAFailure(
             "legacy PDF document is diagnostic only and cannot prove publication quality"
@@ -1972,7 +1998,8 @@ def _open_staged_reader(pdf_bytes: bytes) -> PdfReader:
 def _flowables_by_block(layout: PdfAssemblyLayout) -> dict[str, list[Any]]:
     result: dict[str, list[Any]] = {}
     for item in layout.flowables:
-        result.setdefault(item.block_id, []).append(item)
+        for member in item.source_block_ids or (item.block_id,):
+            result.setdefault(member, []).append(item)
     return result
 
 
@@ -2529,6 +2556,89 @@ def _validate_source(
     return payload
 
 
+def validate_pdf_unit_layout(document: PdfDocument, layout: PdfAssemblyLayout) -> None:
+    """Require exact logical coverage without discarding any physical member."""
+    from web_translator.pdf_units import project_protected_occurrences, validate_unit_membership
+
+    if (document.schema_version != "1.2" or document.extracted_schema_version != "1.2"
+            or layout.schema_version != "1.2"):
+        raise PdfQAFailure("unit coverage requires native 1.2 document origin and layout")
+    try:
+        validate_unit_membership(document)
+        assembly._validate_rich_relationships(document)
+        PdfAssemblyLayout.from_dict(layout.to_dict())
+    except (PdfContractError, PdfAssemblyError) as error:
+        raise PdfQAFailure(f"invalid unit/member layout: {error}") from error
+    if document.flow_findings:
+        raise PdfQAFailure("unit layout has unresolved required flow findings")
+    blocks = {block.id: block for block in document.blocks}
+    units = {unit.id: unit for unit in document.translation_units}
+    members = {member for unit in units.values() for member in unit.source_block_ids}
+    by_unit: dict[str, list[Any]] = {}
+    covered: set[str] = set()
+    for item in layout.flowables:
+        block = blocks.get(item.block_id)
+        if block is None:
+            raise PdfQAFailure("layout contains a foreign physical member")
+        if item.unit_id is None:
+            if item.block_id in members or item.source_block_ids:
+                raise PdfQAFailure("layout member has no logical unit ownership")
+        else:
+            unit = units.get(item.unit_id)
+            if unit is None or item.source_block_ids != unit.source_block_ids:
+                raise PdfQAFailure("layout unit member coverage does not match document")
+            if (item.block_id != unit.source_block_ids[0] or item.kind != unit.kind
+                    or item.semantic_role != unit.semantic_role):
+                raise PdfQAFailure("layout unit representative kind or role disagrees")
+            by_unit.setdefault(unit.id, []).append(item)
+        if item.source_order != block.order:
+            raise PdfQAFailure("layout member source order disagrees with document")
+        covered.update(item.source_block_ids or (item.block_id,))
+    required = {b.id for b in document.blocks if b.kind not in _RUNNING_FURNITURE_KINDS}
+    if not required.issubset(covered) or set(by_unit) != set(units):
+        raise PdfQAFailure("layout is missing required physical member or logical unit coverage")
+    anchors = dict(layout.anchor_pages)
+    for unit_id, parts in by_unit.items():
+        if [item.split_part for item in parts] != list(range(len(parts))):
+            raise PdfQAFailure("unit split parts must be contiguous from zero")
+        if [item.page_number for item in parts] != sorted(item.page_number for item in parts):
+            raise PdfQAFailure("unit split parts must follow output page order")
+        for member in units[unit_id].source_block_ids:
+            anchor = assembly._anchor_name(member)
+            if anchors.get(anchor) != parts[0].page_number:
+                raise PdfQAFailure("unit member anchor must resolve to paragraph start")
+    note_owners: dict[str, str] = {}
+    try:
+        for unit in units.values():
+            for occurrence in project_protected_occurrences(unit, blocks):
+                if occurrence.note_id is None or occurrence.note_id == occurrence.owner_block_id:
+                    continue
+                if occurrence.note_id in note_owners:
+                    raise PdfQAFailure("note has duplicate protected callout ownership")
+                note_owners[occurrence.note_id] = occurrence.owner_block_id
+    except PdfContractError as error:
+        raise PdfQAFailure(f"invalid unit note relationship: {error}") from error
+    by_block = _flowables_by_block(layout)
+    page_local_notes, _section_notes, _owner_to_note = assembly._classify_footnotes(document)
+    for block in document.blocks:
+        if block.kind != "footnote":
+            continue
+        owner = note_owners.get(block.id)
+        if owner is None or blocks[owner].destination != block.id:
+            raise PdfQAFailure("orphan note is missing its physical member callout")
+        for part in by_block[block.id]:
+            if (block.id in page_local_notes or part.footnote_owner_id is not None) and (
+                part.footnote_owner_id != owner or part.footnote_ownership != "protected-footnote-marker"
+            ):
+                raise PdfQAFailure("note layout owner does not match physical member callout")
+    for continuation in layout.footnote_continuations:
+        if continuation.owner_block_id != note_owners.get(continuation.block_id) or not any(
+            part.split_part == continuation.split_part and part.page_number == continuation.page_number
+            for part in by_block.get(continuation.block_id, ())
+        ):
+            raise PdfQAFailure("note continuation does not match member ownership and split part")
+
+
 def _validate_contracts(
     document: PdfDocument,
     segments: Sequence[Segment],
@@ -2540,9 +2650,12 @@ def _validate_contracts(
 ) -> list[tuple[Any, Segment, str]]:
     del review
     try:
-        normalized = assembly._normalize_pdf_translations(
-            document, segments, translations, glossary
-        )
+        if document.schema_version == "1.2":
+            validate_pdf_unit_layout(document, layout)
+            normalized = [(item.source_blocks[0], item.segment, item.text)
+                          for item in assembly.normalize_pdf_units(document, segments, translations, glossary)]
+        else:
+            normalized = assembly._normalize_pdf_translations(document, segments, translations, glossary)
         assembly._validate_rich_relationships(document)
     except PdfAssemblyError as error:
         raise PdfQAFailure(f"PDF contract QA failed: {error}") from error
@@ -2558,7 +2671,7 @@ def _validate_contracts(
         for block in document.blocks
         if block.kind not in {"header", "footer", "page-number"}
     }
-    emitted_ids = {item.block_id for item in layout.flowables}
+    emitted_ids = set(_flowables_by_block(layout))
     if not visible_ids.issubset(emitted_ids):
         raise PdfQAFailure("layout does not cover every required PDF block")
     return normalized
@@ -2737,13 +2850,11 @@ def _validate_pdf_structure(
                 raise PdfQAFailure(
                     f"layout {name} falls outside PDF page bounds for {item.block_id}"
                 )
-    layout_by_block: dict[str, list[Any]] = {}
-    for item in layout.flowables:
-        layout_by_block.setdefault(item.block_id, []).append(item)
+    layout_by_block = _flowables_by_block(layout)
     structured_blocks = {
         link.source_block_id
         for link in layout.links
-        if link.reconstructed and link.source_block_id is not None
+        if link.source_block_id is not None and (link.reconstructed or document.schema_version == "1.2")
     }
     expected_links = [
         (link.source_block_id, link.uri, link.destination)
@@ -3829,4 +3940,4 @@ def _qa_hash_mapping(
     return result
 
 
-__all__ = ["PdfQAFailure", "PdfQAFinding", "PdfQAResult", "prepare_pdf_qa"]
+__all__ = ["PdfQAFailure", "PdfQAFinding", "PdfQAResult", "prepare_pdf_qa", "validate_pdf_unit_layout"]
