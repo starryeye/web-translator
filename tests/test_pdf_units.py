@@ -212,6 +212,116 @@ def test_collected_owned_lines_supply_real_column_and_pitch_evidence(columns, sc
     assert len(units) == len(blocks) - 1
 
 
+@pytest.mark.parametrize("page_scales", [(0.65, 0.65), (1.0, 1.0), (1.55, 1.55), (0.98, 1.02)])
+@pytest.mark.parametrize("list_item", [False, True], ids=["paragraph", "hanging-list"])
+@pytest.mark.parametrize("tops_by_page", [
+    ((330, 348, 366, 672, 690, 708), (72, 90, 108, 672, 690, 708)),
+    ((72, 90, 108, 672, 690, 708), (72, 90, 108, 126, 144, 162)),
+    ((330, 348, 366, 672, 690, 708), (54, 72, 90, 108, 126, 144)),
+], ids=["opener-left", "sparse-right", "independent-top-and-bottom"])
+def test_observed_page_local_frames_join_complete_unit(tops_by_page, list_item, page_scales):
+    # Reinstating cross-page vertical comparisons must break these real producer cases.
+    blocks, pages, lines = make_observed_flow(
+        tops_by_page=tops_by_page, list_item=list_item, page_scales=page_scales,
+        space_continuation=True,
+    )
+    before = [block.to_dict() for block in blocks]
+    page_before = [page.to_dict() for page in pages]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    tail = next(block for block in blocks if block.source_text.endswith("A paragraph"))
+    head = next(block for block in blocks if block.source_text.startswith("continues."))
+    left, right = boundaries[tail.id], boundaries[head.id]
+    for boundary, tops, factor in zip((left, right), tops_by_page, page_scales):
+        assert boundary.column_bbox == pytest.approx((72 * factor, tops[0] * factor,
+                                                       540 * factor, (tops[-1] + 12) * factor))
+        assert boundary.line_pitch == pytest.approx(18 * factor)
+        assert boundary.column_index == 0 and boundary.column_count == 1
+    assert left.last_line.bbox[3] == left.column_bbox[3]
+    assert right.first_line.bbox[1] == right.column_bbox[1]
+    assert left.last_line.bbox[2] == left.column_bbox[2]
+    assert left.text_indent / page_scales[0] == pytest.approx(18 if list_item else 0)
+    assert left.column_bbox[1] / pages[0].height != right.column_bbox[1] / pages[1].height or (
+        left.column_bbox[3] / pages[0].height != right.column_bbox[3] / pages[1].height)
+
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert not findings
+    joined = [unit for unit in units if len(unit.source_block_ids) > 1]
+    assert len(joined) == 1
+    unit = joined[0]
+    assert unit.source_block_ids == (tail.id, head.id)
+    assert unit.kind == ("list-item" if list_item else "paragraph")
+    assert len(units) == len(blocks) - 1
+    assert len(unit.joins) == 1 and unit.joins[0].operation == "space"
+    assert unit.joins[0].evidence.left == left
+    assert unit.joins[0].evidence.right == right
+    assert unit.joins[0].evidence.left_page_size == (pages[0].width, pages[0].height)
+    assert unit.joins[0].evidence.right_page_size == (pages[1].width, pages[1].height)
+    expected = ("• " if list_item else "") + (
+        "Observed prose 1 0 3. Observed prose 1 0 4. "
+        "A paragraph continues. Observed prose 2 0 1. Observed prose 2 0 2."
+    )
+    if tops_by_page[1][-1] < 200:
+        expected += " Observed prose 2 0 3. Observed prose 2 0 4. Observed prose 2 0 5."
+    assert project_unit_text(unit, {block.id: block for block in blocks}).text == expected
+    assert [block.to_dict() for block in blocks] == before
+    assert [page.to_dict() for page in pages] == page_before
+
+
+@pytest.mark.parametrize("problem,reason", [
+    ("own-tail", "tail/head placement"), ("own-head", "tail/head placement"),
+    ("short-frame", "too short"), ("missing-pitch", "missing observed"),
+    ("missing-column", "missing observed"), ("font", "incompatible boundary font"),
+    ("bold", "incompatible boundary font"), ("wrong-tail", "text does not match"),
+    ("wrong-head", "text does not match"), ("unfilled-tail", "not filled"),
+    ("sentence-end", "sentence end"), ("uppercase-head", "positive continuation"),
+])
+def test_page_local_frames_retain_required_conflicting_evidence(problem, reason):
+    # Removing any surviving guard must break the corresponding negative,
+    # even when the neighboring page has different vertical content extents.
+    blocks, pages, boundaries = make_flow_case("space")
+    left, right = [boundaries[block.id] for block in blocks]
+    left = replace(left, column_bbox=(72, 330, 540, 720))
+    head_line = replace(right.first_line, bbox=(72, 54, 540, 66))
+    blocks[1] = replace(blocks[1], bbox=head_line.bbox)
+    right = replace(right, column_bbox=(72, 54, 540, 180),
+                    first_line=head_line, last_line=head_line)
+    if problem == "own-tail":
+        left = replace(left, last_line=replace(left.last_line, bbox=(72, 698, 540, 710)))
+    elif problem == "own-head":
+        right = replace(right, first_line=replace(right.first_line, bbox=(72, 64, 540, 76)))
+    elif problem == "short-frame":
+        right = replace(right, column_bbox=(72, 54, 540, 108))
+    elif problem == "missing-pitch":
+        left = replace(left, line_pitch=None)
+    elif problem == "missing-column":
+        right = replace(right, column_index=None, column_count=None)
+    elif problem == "font":
+        right = replace(right, first_line=replace(right.first_line, font_family="AlternateFace"))
+    elif problem == "bold":
+        blocks[1] = replace(blocks[1], style=replace(blocks[1].style, bold=True))
+    elif problem == "wrong-tail":
+        left = replace(left, last_line=replace(left.last_line, text="Unowned tail"))
+    elif problem == "wrong-head":
+        right = replace(right, first_line=replace(right.first_line, text="unowned head"))
+    elif problem == "unfilled-tail":
+        left = replace(left, last_line=replace(left.last_line, bbox=(72, 708, 480, 720)))
+    elif problem == "sentence-end":
+        blocks[0] = replace(blocks[0], source_text="A paragraph.")
+        left = replace(left, last_line=replace(left.last_line, text="A paragraph."))
+    else:
+        blocks[1] = replace(blocks[1], source_text="Continues.")
+        right = replace(right, first_line=replace(right.first_line, text="Continues."))
+    boundaries.update({blocks[0].id: left, blocks[1].id: right})
+    before = [block.to_dict() for block in blocks]
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert [unit.source_block_ids for unit in units] == [(block.id,) for block in blocks]
+    assert len(findings) == 1 and findings[0].severity == "required"
+    assert (findings[0].left_block_id, findings[0].right_block_id) == tuple(block.id for block in blocks)
+    assert reason in findings[0].message
+    assert [block.to_dict() for block in blocks] == before
+
+
 @pytest.mark.parametrize("problem", ["duplicate-owner", "wrong-text", "missing-lines", "sparse-frame"])
 def test_collector_does_not_invent_unproven_boundaries(problem):
     from web_translator import pdf_extract

@@ -99,9 +99,9 @@ def decide_page_join(
     if (tail.bbox[2] > lc[2] + 1e-9 or tail.bbox[0] < lc[0] - 1e-9
             or head.bbox[0] < rc[0] - 1e-9):
         return _ambiguous(left, right, "boundary line exceeds observed column frame")
-    if (abs(tail.bbox[3] / lp.height - rc[3] / rp.height) > pitch_left * 0.5 + 1e-9
-            or abs(head.bbox[1] / rp.height - lc[1] / lp.height) > pitch_right * 0.5 + 1e-9
-            or abs(tail.bbox[3] / lp.height - lc[3] / lp.height) > pitch_left * 0.5 + 1e-9
+    # Frames are observed page-local content extents, not a shared template.
+    # An opener or sparse page may have different vertical extents from its peer.
+    if (abs(tail.bbox[3] / lp.height - lc[3] / lp.height) > pitch_left * 0.5 + 1e-9
             or abs(head.bbox[1] / rp.height - rc[1] / rp.height) > pitch_right * 0.5 + 1e-9):
         return _ambiguous(left, right, "tail/head placement conflicts with observed column frame")
     font_left = tail.font_family.split("+")[-1].casefold()

@@ -188,24 +188,31 @@ def make_flow_case(case: str, *, scale: float = 1.0):
 
 
 def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool = False,
-                       head_discretionary: bool = False, sentence_boundary: bool = False):
+                       head_discretionary: bool = False, sentence_boundary: bool = False,
+                       tops_by_page=None, page_scales=None, space_continuation: bool = False):
     """Synthetic words run through the real page-local extraction pipeline."""
     from web_translator.pdf_layout import (
         build_text_blocks, classify_document_lines, classify_semantic_roles,
         group_words_into_lines, order_page_lines,
     )
-    pages = [PdfPage(n, 612 * scale, 792 * scale, 0) for n in (1, 2)]
+    scales = page_scales if page_scales is not None else (scale, scale)
+    tops = tops_by_page if tops_by_page is not None else ((72, 90, 108, 672, 690, 708),) * 2
+    pages = [PdfPage(n, 612 * factor, 792 * factor, 0)
+             for n, factor in enumerate(scales, start=1)]
     raw = []
     for page in pages:
+        factor = scales[page.number - 1]
         words = []
         for column in range(columns):
             x0, x1 = (72, 540) if columns == 1 else ((72, 288) if column == 0 else (324, 540))
-            for index, top in enumerate((72, 90, 108, 672, 690, 708)):
+            for index, top in enumerate(tops[page.number - 1]):
                 text = f"Observed prose {page.number} {column} {index}."
                 if page.number == 1 and column == columns - 1 and index == 5:
-                    text = "A sentence ends." if sentence_boundary else "A para‐"
+                    text = ("A sentence ends." if sentence_boundary else
+                            "A paragraph" if space_continuation else "A para‐")
                 if page.number == 2 and column == 0 and index == 0:
-                    text = "graph contin‐" if head_discretionary else "graph continues."
+                    text = ("graph contin‐" if head_discretionary else
+                            "continues." if space_continuation else "graph continues.")
                     if sentence_boundary:
                         text = "Another sentence follows."
                 if head_discretionary and page.number == 2 and column == 0 and index == 1:
@@ -214,12 +221,12 @@ def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool 
                 if list_item and ((page.number == 1 and index >= 3) or (page.number == 2 and index <= 2)):
                     start += 18
                 if list_item and page.number == 1 and index == 3:
-                    words.append(dict(text="•", x0=x0 * scale, x1=(x0 + 8) * scale,
-                                      top=top * scale, bottom=(top + 12) * scale,
-                                      size=12 * scale, fontname="ABCDEF+Helvetica", chars=[{"text": "•"}]))
-                words.append(dict(text=text, x0=start * scale, x1=x1 * scale,
-                                  top=top * scale, bottom=(top + 12) * scale,
-                                  size=12 * scale, fontname="ABCDEF+Helvetica",
+                    words.append(dict(text="•", x0=x0 * factor, x1=(x0 + 8) * factor,
+                                      top=top * factor, bottom=(top + 12) * factor,
+                                      size=12 * factor, fontname="ABCDEF+Helvetica", chars=[{"text": "•"}]))
+                words.append(dict(text=text, x0=start * factor, x1=x1 * factor,
+                                  top=top * factor, bottom=(top + 12) * factor,
+                                  size=12 * factor, fontname="ABCDEF+Helvetica",
                                   chars=[{"text": char} for char in text if not char.isspace()]))
         raw.append((group_words_into_lines(words), page.height))
     classified = classify_semantic_roles(classify_document_lines(raw))
