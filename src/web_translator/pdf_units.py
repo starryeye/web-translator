@@ -129,16 +129,16 @@ def decide_page_join(
     ))
 
 
-def _isolated_repeated_edge_item(
-    left: PdfBlock, right: PdfBlock, blocks: Sequence[PdfBlock],
+def _matching_isolated_edge_item(
+    left: PdfBlock, next_page: int, blocks: Sequence[PdfBlock],
     pages: Mapping[int, PdfPage], owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]],
-) -> bool:
-    """Prove separation, not furniture reclassification or a guessed frame.
+) -> str | None:
+    """Identify an edge peer, not separation of the surrounding body flow.
 
     A narrow, smaller, genuinely single-line item in the bottom tenth repeats
     at the same normalized geometry/style on the next page. Four font heights
-    of whitespace from ALL other non-furniture content on BOTH pages rule out
-    nearby body overflow. Each threshold is conjunctive; absent proof refuses.
+    of whitespace from ALL other non-furniture content on BOTH pages distinguish
+    the edge item itself. Body overflow must still be evaluated independently.
     """
     def evidence(block: PdfBlock) -> PdfBoundaryLine | None:
         lines = owned_lines.get(block.id, ())
@@ -167,11 +167,11 @@ def _isolated_repeated_edge_item(
         return line
 
     tail = evidence(left)
-    if tail is None or right.page_number not in pages:
-        return False
-    lp, rp = pages[left.page_number], pages[right.page_number]
+    if tail is None or next_page not in pages:
+        return None
+    lp, rp = pages[left.page_number], pages[next_page]
     for peer in blocks:
-        if peer.page_number != right.page_number or peer.style.bold != left.style.bold:
+        if peer.page_number != next_page or peer.style.bold != left.style.bold:
             continue
         line = evidence(peer)
         if line is None or line.font_family.casefold() != tail.font_family.casefold():
@@ -185,8 +185,22 @@ def _isolated_repeated_edge_item(
                for a, b, ld, rd in zip(tail.bbox, line.bbox,
                                       (lp.width, lp.height, lp.width, lp.height),
                                       (rp.width, rp.height, rp.width, rp.height))):
-            return True
-    return False
+            return peer.id
+    return None
+
+
+def _isolated_edge_item_ids(
+    blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
+    owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]],
+) -> frozenset[str]:
+    """Share the same observed edge proof for body order and column context."""
+    page_map = {page.number: page for page in pages}
+    edge_ids: set[str] = set()
+    for block in blocks:
+        peer = _matching_isolated_edge_item(block, block.page_number + 1, blocks, page_map, owned_lines)
+        if peer is not None:
+            edge_ids.update((block.id, peer))
+    return frozenset(edge_ids)
 
 
 def build_translation_units(
@@ -200,14 +214,14 @@ def build_translation_units(
     # Furniture and explicitly linked notes cannot hide structural barriers.
     linked = {block.destination for block in blocks if block.destination}
     notes = {block.id for block in blocks if block.kind == "footnote" and block.id in linked}
+    edge_ids = _isolated_edge_item_ids(blocks, pages, owned_lines or {})
     flow = [block for block in ordered
-            if block.kind not in {"header", "footer", "page-number"} and block.id not in notes]
+            if block.kind not in {"header", "footer", "page-number"}
+            and block.id not in notes and block.id not in edge_ids]
     joins: dict[str, PdfTextJoin] = {}
     findings: list[PdfFlowFinding] = []
     for left, right in zip(flow, flow[1:]):
         if not _flow_pair(left, right):
-            continue
-        if _isolated_repeated_edge_item(left, right, blocks, page_map, owned_lines or {}):
             continue
         if left.id not in boundaries or right.id not in boundaries:
             decision = _ambiguous(left, right, "missing provable boundary ownership or column frame")

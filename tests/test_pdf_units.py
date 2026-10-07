@@ -47,7 +47,7 @@ def _observed_edge_items(*, scale=1.0, x=530, labels=("Opaque alpha", "Unrelated
 
 @pytest.mark.parametrize("scale", [0.6, 1.0, 1.8])
 @pytest.mark.parametrize("x,labels", [(54, ("Q-7", "R-8")), (290, ("North", "South")), (530, ("Page 1", "Page 2"))])
-def test_observed_isolated_edge_items_are_separate_targets(scale, x, labels):
+def test_edge_singletons_do_not_prove_unknown_body_boundary_separate(scale, x, labels):
     blocks, pages, lines = _observed_edge_items(scale=scale, x=x, labels=labels)
     before = [block.to_dict() for block in blocks]
     assert hasattr(pdf_extract, "collect_owned_flow_lines")
@@ -55,7 +55,8 @@ def test_observed_isolated_edge_items_are_separate_targets(scale, x, labels):
     edge = [block for block in blocks if block.source_text in labels]
     assert len(edge) == 2 and all(len(owned[block.id]) == 1 for block in edge)
     units, findings = pdf_units.build_translation_units(blocks, pages, {}, owned_lines=owned)
-    assert not findings
+    assert len(findings) == 1 and findings[0].severity == "required"
+    assert (findings[0].left_block_id, findings[0].right_block_id) == (blocks[0].id, blocks[2].id)
     assert [unit.source_block_ids for unit in units] == [(block.id,) for block in blocks]
     assert [block.to_dict() for block in blocks] == before
 
@@ -86,6 +87,25 @@ def test_missing_owned_lines_default_does_not_separate_edge_items():
     blocks, pages, _ = _observed_edge_items()
     _, findings = pdf_units.build_translation_units(blocks, pages, {})
     assert len(findings) == 1 and findings[0].severity == "required"
+
+
+@pytest.mark.parametrize("kind", ["heading", "table-cell", "figure", "list-item", "footnote"])
+def test_edge_exclusion_keeps_other_structural_barriers(kind):
+    blocks, pages, lines = _observed_edge_items()
+    blocks = [replace(block, order=block.order * 2) for block in blocks]
+    barrier = replace(blocks[0], id="pdf:page-0001:block-0099", order=1,
+                      kind=kind, bbox=(54, 300, 490, 311), source_text="Separate structure")
+    blocks.append(barrier)
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    before = [block.to_dict() for block in blocks]
+    units, findings = pdf_units.build_translation_units(blocks, pages, {}, owned_lines=owned)
+    assert all(len(unit.source_block_ids) == 1 for unit in units)
+    assert not any(f.left_block_id == blocks[0].id for f in findings)
+    if kind == "list-item":
+        assert len(findings) == 1 and findings[0].left_block_id == barrier.id
+    else:
+        assert not findings
+    assert [block.to_dict() for block in blocks] == before
 
 
 @pytest.mark.parametrize("scale", [0.75, 1.0, 1.7])

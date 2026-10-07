@@ -72,7 +72,7 @@ from web_translator.pdf_models import (
     font_size_bucket,
 )
 from web_translator.protection import protect_fragment
-from web_translator.pdf_units import build_translation_units
+from web_translator.pdf_units import _isolated_edge_item_ids, build_translation_units
 
 
 _MIN_PAGE_POINTS = 36.0
@@ -157,13 +157,14 @@ def collect_flow_boundaries(
     """
     if owned_lines is None:
         owned_lines = collect_owned_flow_lines(blocks, pages, lines_by_page)
+    edge_ids = _isolated_edge_item_ids(blocks, pages, owned_lines)
     result: dict[str, PdfBlockBoundary] = {}
     for page in pages:
         page_blocks = [block for block in blocks if block.page_number == page.number]
         lines = repair_line_fragments(lines_by_page.get(page.number, ()))
         indexed = {_boundary_line(line): line for line in lines}
         proven = {block.id: [indexed[line] for line in owned_lines[block.id]]
-                  for block in page_blocks if block.id in owned_lines
+                  for block in page_blocks if block.id in owned_lines and block.id not in edge_ids
                   and all(line in indexed for line in owned_lines[block.id])}
         context = [line for members in proven.values() for line in members]
         if len(context) < 3:

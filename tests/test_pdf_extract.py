@@ -67,6 +67,55 @@ def test_native_unit_extraction_collects_real_boundary_evidence(tmp_path):
     assert "physical boundary without losing" in segments[1].source_text
 
 
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_qualifying_edge_items_do_not_hide_full_frame_body_boundary(tmp_path, ambiguous):
+    from io import BytesIO
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from pypdf import PdfReader, PdfWriter
+    from tests.pdf_unit_fixtures import make_native_flow_pdf
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_unit_bindings import require_assignable_pdf, PdfUnitBindingError
+    source = make_native_flow_pdf(tmp_path / "control.pdf", ambiguous=ambiguous)
+    control = extract_pdf(source, tmp_path / "control.json", tmp_path / "control.jsonl", tmp_path / "control-media")
+    writer = PdfWriter()
+    for page, label in zip(PdfReader(source).pages, ("Alpha", "Gamma")):
+        page = writer.add_page(page)
+        overlay = BytesIO()
+        canvas = Canvas(overlay, pagesize=(612, 792), invariant=1)
+        text = canvas.beginText(530, 20)
+        text.setFont("Helvetica", 9)
+        text.setHorizScale(28 / stringWidth(label, "Helvetica", 9) * 100)
+        text.textLine(label)
+        canvas.drawText(text)
+        canvas.save()
+        page.merge_page(PdfReader(overlay).pages[0])
+    source = tmp_path / "edge.pdf"
+    writer.write(source)
+    document = extract_pdf(source, tmp_path / "edge.json", tmp_path / "edge.jsonl", tmp_path / "edge-media")
+    def body(doc):
+        return [(b.id, b.page_number, b.kind, b.source_text, b.bbox) for b in doc.blocks
+                if b.source_text not in {"Alpha", "Gamma"}]
+    assert body(document) == body(control)
+    edges = [b for b in document.blocks if b.source_text in {"Alpha", "Gamma"}]
+    assert len(edges) == 2 and all(b.kind == "paragraph" for b in edges)
+    assert edges[0].bbox[1] - document.blocks[1].bbox[3] == pytest.approx(44.863)
+    for edge in edges:
+        assert next(u for u in document.translation_units if edge.id in u.source_block_ids).source_block_ids == (edge.id,)
+    pair = ("pdf:page-0001:block-0002", "pdf:page-0002:block-0001")
+    if ambiguous:
+        assert [(f.left_block_id, f.right_block_id) for f in document.flow_findings] == [pair]
+        with pytest.raises(PdfUnitBindingError, match="flow findings"):
+            require_assignable_pdf(document)
+    else:
+        assert not document.flow_findings
+        joined = [u for u in document.translation_units if len(u.source_block_ids) > 1]
+        assert len(joined) == 1 and joined[0].source_block_ids == pair
+        assert joined[0].joins == control.translation_units[1].joins
+        assert len(document.translation_units) == 5
+        require_assignable_pdf(document)
+
+
 @pytest.mark.parametrize("scale,x,labels", [(0.6, 54, ("Alpha", "Gamma")), (1.0, 290, ("North", "South")), (1.8, 530, ("Page 1", "Page 2"))])
 def test_native_extraction_preserves_observed_edge_items_as_physical_targets(tmp_path, scale, x, labels):
     from web_translator.pdf_extract import extract_pdf
@@ -88,10 +137,14 @@ def test_native_extraction_preserves_observed_edge_items_as_physical_targets(tmp
         canvas.showPage()
     canvas.save()
     document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
-    assert not document.flow_findings
+    # Edge ownership is proven, but sparse body lines cannot establish a frame.
+    assert len(document.flow_findings) == 1
+    assert document.flow_findings[0].severity == "required"
     edge = [block for block in document.blocks if block.source_text in labels]
     assert len(edge) == 2 and all(block.kind == "paragraph" for block in edge)
     assert [block.page_number for block in edge] == [1, 2]
+    assert document.flow_findings[0].left_block_id not in {block.id for block in edge}
+    assert document.flow_findings[0].right_block_id not in {block.id for block in edge}
     for block in edge:
         assert block.bbox[0] == pytest.approx(x * scale)
         assert block.bbox[2] - block.bbox[0] == pytest.approx(28 * scale)
