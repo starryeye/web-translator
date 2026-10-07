@@ -269,6 +269,8 @@ def assemble_pdf(
         )
         if source.sha256 != document.source_sha256:
             raise PdfAssemblyError("source.json SHA-256 does not match document.json")
+        from web_translator.pdf_unit_bindings import require_assignable_pdf
+        require_assignable_pdf(document)
         if document.schema_version == "1.2":
             from web_translator.pdf_unit_bindings import _binding_from_payloads, _hold_pdf_unit_inputs
 

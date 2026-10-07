@@ -72,6 +72,7 @@ from web_translator.pdf_models import (
     font_size_bucket,
 )
 from web_translator.protection import protect_fragment
+from web_translator.pdf_units import build_translation_units
 
 
 _MIN_PAGE_POINTS = 36.0
@@ -112,17 +113,17 @@ def _flow_font(line: PdfLine) -> str:
     return weights.most_common(1)[0][0]
 
 
-def collect_flow_boundaries(
+def _boundary_line(line: PdfLine) -> PdfBoundaryLine:
+    return PdfBoundaryLine((line.x0, line.top, line.x1, line.bottom),
+                           line.size, _flow_font(line), line.text)
+
+
+def collect_owned_flow_lines(
     blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
     lines_by_page: Mapping[int, Sequence[PdfLine]],
-) -> dict[str, PdfBlockBoundary]:
-    """Collect observed line evidence without changing the extraction writer.
-
-    A line must have one physical owner, whose complete text and bounds can be
-    reconstructed. Frames come from observed column lines, never block boxes.
-    Complex/ambiguous column layouts fail closed rather than inventing margins.
-    """
-    result: dict[str, PdfBlockBoundary] = {}
+) -> dict[str, tuple[PdfBoundaryLine, ...]]:
+    """Retain uniquely reconstructed physical lines independently of frames."""
+    result: dict[str, tuple[PdfBoundaryLine, ...]] = {}
     for page in pages:
         page_blocks = [block for block in blocks if block.page_number == page.number]
         lines = repair_line_fragments(lines_by_page.get(page.number, ()))
@@ -132,7 +133,6 @@ def collect_flow_boundaries(
             owners = [block for block in page_blocks if _bbox_inside(bbox, block.bbox)]
             if len(owners) == 1:
                 owned[owners[0].id].append(line)
-        proven: dict[str, list[PdfLine]] = {}
         for block in page_blocks:
             members = owned[block.id]
             if (block.kind not in {"paragraph", "list-item"} or block.semantic_role != "body"
@@ -141,7 +141,30 @@ def collect_flow_boundaries(
             bbox = (min(line.x0 for line in members), min(line.top for line in members),
                     max(line.x1 for line in members), max(line.bottom for line in members))
             if all(abs(a - b) <= 1e-7 for a, b in zip(bbox, block.bbox)):
-                proven[block.id] = members
+                result[block.id] = tuple(_boundary_line(line) for line in members)
+    return result
+
+
+def collect_flow_boundaries(
+    blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
+    lines_by_page: Mapping[int, Sequence[PdfLine]], *,
+    owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]] | None = None,
+) -> dict[str, PdfBlockBoundary]:
+    """Collect real column frames and pitch from uniquely owned physical lines.
+
+    The writer shares its canonical ownership result. Frames still come from
+    observed column lines, never guessed block boxes or absent line context.
+    """
+    if owned_lines is None:
+        owned_lines = collect_owned_flow_lines(blocks, pages, lines_by_page)
+    result: dict[str, PdfBlockBoundary] = {}
+    for page in pages:
+        page_blocks = [block for block in blocks if block.page_number == page.number]
+        lines = repair_line_fragments(lines_by_page.get(page.number, ()))
+        indexed = {_boundary_line(line): line for line in lines}
+        proven = {block.id: [indexed[line] for line in owned_lines[block.id]]
+                  for block in page_blocks if block.id in owned_lines
+                  and all(line in indexed for line in owned_lines[block.id])}
         context = [line for members in proven.values() for line in members]
         if len(context) < 3:
             continue
@@ -188,11 +211,8 @@ def collect_flow_boundaries(
                     margin = first.words[1].x0
                 else:
                     margin = min(line.x0 for line in members)
-                def boundary_line(line: PdfLine) -> PdfBoundaryLine:
-                    return PdfBoundaryLine((line.x0, line.top, line.x1, line.bottom),
-                                           line.size, _flow_font(line), line.text)
                 result[block.id] = PdfBlockBoundary(
-                    block.id, boundary_line(first), boundary_line(last), frame,
+                    block.id, _boundary_line(first), _boundary_line(last), frame,
                     margin - frame[0], pitch, index, len(columns),
                 )
     return result
@@ -343,6 +363,7 @@ def extract_pdf(
         figure_regions: list[FigureRegion] = []
         assigned_by_page: list[int] = []
         figure_number = 0
+        lines_by_page: dict[int, list[PdfLine]] = {}
         for evidence, lines, material in zip(
             inspection.pages, classified_pages, materials, strict=True
         ):
@@ -354,6 +375,7 @@ def extract_pdf(
                     *(region.bbox for region in material.figure_regions),
                 ],
             )
+            lines_by_page[evidence.number] = ordered
             assigned_by_page.append(
                 sum(line.character_count for line in ordered)
                 + material.table_character_count
@@ -412,25 +434,23 @@ def extract_pdf(
     )
     for message in extraction_warnings:
         warnings.warn(message, PdfExtractionWarning, stacklevel=2)
-    blocks, segments = _build_segments(blocks)
+    pages = [PdfPage(evidence.number, material.page_width, material.page_height, evidence.rotation)
+             for evidence, material in zip(inspection.pages, materials, strict=True)]
+    owned_lines = collect_owned_flow_lines(blocks, pages, lines_by_page)
+    boundaries = collect_flow_boundaries(blocks, pages, lines_by_page, owned_lines=owned_lines)
+    units, flow_findings = build_translation_units(blocks, pages, boundaries, owned_lines=owned_lines)
+    blocks, units, segments = build_pdf_unit_segments(blocks, units)
     document = PdfDocument(
-        schema_version="1.1",
+        schema_version="1.2",
+        extracted_schema_version="1.2",
         source_sha256=_sha256(source),
         page_count=inspection.page_count,
         selectable_characters=inspection.selectable_characters,
         scan_candidate_pages=list(inspection.scan_candidate_pages),
-        pages=[
-            PdfPage(
-                number=evidence.number,
-                width=material.page_width,
-                height=material.page_height,
-                rotation=evidence.rotation,
-            )
-            for evidence, material in zip(
-                inspection.pages, materials, strict=True
-            )
-        ],
+        pages=pages,
         blocks=blocks,
+        translation_units=units,
+        flow_findings=flow_findings,
         table_cells=table_cells,
         links=list(link_evidence.links),
         extraction_warnings=extraction_warnings,

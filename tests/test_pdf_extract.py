@@ -47,6 +47,59 @@ from web_translator.pdf_extract import (
 from web_translator.pdf_models import PdfBlock, PdfBlockStyle, PdfPageEvidence
 
 
+def test_native_unit_extraction_collects_real_boundary_evidence(tmp_path):
+    from tests.pdf_unit_fixtures import make_native_flow_pdf
+    from web_translator.pdf_extract import extract_pdf
+    source = make_native_flow_pdf(tmp_path / "source.pdf")
+    doc = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert doc.schema_version == doc.extracted_schema_version == "1.2"
+    assert not doc.flow_findings
+    assert len(doc.blocks) == 4 and len(doc.translation_units) == 3
+    join = doc.translation_units[1].joins[0]
+    assert join.operation == "space"
+    assert join.evidence.left.line_pitch == pytest.approx(18)
+    assert join.evidence.right.line_pitch == pytest.approx(18)
+    assert doc.blocks[1].source_text.endswith("physical boundary")
+    assert doc.blocks[2].source_text.startswith("without losing")
+    assert doc.blocks[1].page_number == 1 and doc.blocks[2].page_number == 2
+    segments = read_segments(tmp_path / "segments.jsonl")
+    assert segments[1].locator == doc.blocks[1].id
+    assert "physical boundary without losing" in segments[1].source_text
+
+
+@pytest.mark.parametrize("scale,x,labels", [(0.6, 54, ("Alpha", "Gamma")), (1.0, 290, ("North", "South")), (1.8, 530, ("Page 1", "Page 2"))])
+def test_native_extraction_preserves_observed_edge_items_as_physical_targets(tmp_path, scale, x, labels):
+    from web_translator.pdf_extract import extract_pdf
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    source = tmp_path / "source.pdf"
+    canvas = Canvas(str(source), pagesize=(612 * scale, 792 * scale), invariant=1)
+    for label in labels:
+        for top, text in ((72, "Substantive prose remains a complete account"),
+                          (90, "with observed line ownership and original geometry"),
+                          (108, "before the separate small printed edge item.")):
+            canvas.setFont("Helvetica", 11 * scale)
+            canvas.drawString(54 * scale, (792 - top) * scale, text)
+        item = canvas.beginText(x * scale, 35 * scale)
+        item.setFont("Helvetica", 9 * scale)
+        item.setHorizScale(28 / stringWidth(label, "Helvetica", 9) * 100)
+        item.textLine(label)
+        canvas.drawText(item)
+        canvas.showPage()
+    canvas.save()
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert not document.flow_findings
+    edge = [block for block in document.blocks if block.source_text in labels]
+    assert len(edge) == 2 and all(block.kind == "paragraph" for block in edge)
+    assert [block.page_number for block in edge] == [1, 2]
+    for block in edge:
+        assert block.bbox[0] == pytest.approx(x * scale)
+        assert block.bbox[2] - block.bbox[0] == pytest.approx(28 * scale)
+        unit = next(unit for unit in document.translation_units if block.id in unit.source_block_ids)
+        assert unit.source_block_ids == (block.id,)
+        assert unit.segment_id == block.segment_id
+
+
 @pytest.mark.parametrize("border", ["rect", "lines", "none"])
 def test_extract_callout_prose_and_wrapped_caption_have_exact_ownership(
     tmp_path: Path, border: str,

@@ -484,6 +484,8 @@ def _write_pdf_assembly_cli_run(run_dir: Path) -> None:
     assignments = run_dir / "assignments"
     assignments.mkdir()
     _write_json(assignments / "zone-001.json", {"zone_id": "zone-001"})
+    from tests.pdf_unit_fixtures import write_native_singleton_fixture
+    write_native_singleton_fixture(run_dir)
     review = _review_payload()
     review["semantic_input_sha256"] = build_pdf_semantic_review_input(
         run_dir

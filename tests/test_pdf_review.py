@@ -21,6 +21,14 @@ from web_translator.zones import Zone
 from tests.test_pdf_unit_bindings import bound_unit_run
 
 
+def test_pdf_review_requires_native_document_even_without_binding(tmp_path):
+    run, _ = _reviewed_run(tmp_path)
+    for name in ("document.json", "assignments/.pdf-unit-binding.json"):
+        (run / name).unlink(missing_ok=True)
+    with pytest.raises(PdfSemanticReviewError, match="native 1.2 document"):
+        build_pdf_semantic_review_input(run)
+
+
 def test_native_review_includes_document_and_binding(bound_unit_run):
     snapshot = build_pdf_semantic_review_input(bound_unit_run)
     names = {item.path for item in snapshot.files}
@@ -90,6 +98,9 @@ def _write(path: Path, content: str) -> None:
 
 
 def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    from dataclasses import replace
+    from tests.pdf_fixtures import make_pdf_source_record
+    from tests.pdf_unit_fixtures import make_unit_document, rebind_native_fixture
     run_dir = tmp_path / ".web-translator" / "runs" / "run"
     (tmp_path / "translated-pdfs").mkdir()
     _write(run_dir / "segments.jsonl", '{"id":"seg-000001"}\n')
@@ -103,6 +114,10 @@ def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         run_dir / "translations" / "zone-001.jsonl",
         '{"segment_id":"seg-000001","text":"번역"}\n',
     )
+    document = replace(make_unit_document(), extracted_schema_version="1.2")
+    _write(run_dir / "document.json", json.dumps(document.to_dict()))
+    _write(run_dir / "source.json", json.dumps(make_pdf_source_record().to_dict()))
+    rebind_native_fixture(run_dir)
     semantic_input = build_pdf_semantic_review_input(run_dir)
     review: dict[str, object] = {
         "semantic_input_sha256": semantic_input.semantic_input_sha256,
@@ -133,9 +148,12 @@ def test_pdf_semantic_review_input_is_typed_canonical_and_deterministic(
         "files": [record.to_dict() for record in first.files],
     }
     assert [record.path for record in first.files] == [
+        "assignments/.pdf-unit-binding.json",
         "assignments/zone-001.json",
+        "document.json",
         "glossary.json",
         "segments.jsonl",
+        "source.json",
         "translations/zone-001.jsonl",
         "zones/zone-001.json",
     ]
@@ -160,7 +178,8 @@ def test_pdf_semantic_review_rejects_every_reviewed_input_mutation(
     path = run_dir / relative_path
     path.write_bytes(path.read_bytes() + b" ")
 
-    with pytest.raises(PdfSemanticReviewError, match="digest does not match"):
+    expected = "binding does not match" if relative_path in {"segments.jsonl", "zones/zone-001.json", "assignments/zone-001.json"} else "digest does not match"
+    with pytest.raises(PdfSemanticReviewError, match=expected):
         validate_pdf_semantic_review(run_dir, review)
 
 

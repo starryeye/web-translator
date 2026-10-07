@@ -45,6 +45,7 @@ from web_translator.pdf_media import build_contact_sheets, render_pdf_pages
 from web_translator.pdf_review import build_pdf_semantic_review_input
 import web_translator.pdf_qa as pdf_qa_module
 from tests.pdf_fixtures import make_text_pdf
+from tests.pdf_unit_fixtures import write_native_singleton_fixture, rebind_native_fixture
 
 
 def make_native_unit_qa_run(tmp_path, *, case="joined"):
@@ -543,6 +544,7 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
             "zone_id": "zone-001",
         },
     )
+    write_native_singleton_fixture(run_dir)
     _write_review(run_dir)
     media = run_dir / "media"
     media.mkdir()
@@ -634,7 +636,7 @@ def test_prepare_pdf_qa_rejects_specialized_role_in_body_template(
         document_mutation=mark_dedication,
     )
 
-    with pytest.raises(PdfQAFailure, match="specialized role uses an invalid layout template"):
+    with pytest.raises(PdfQAFailure, match="layout unit representative kind or role disagrees"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -697,7 +699,7 @@ def test_prepare_pdf_qa_rejects_merged_reference_entries(
         layout_mutation=merge_layout,
     )
 
-    with pytest.raises(PdfQAFailure, match="reference entry is not separately traceable"):
+    with pytest.raises(PdfQAFailure, match="missing required physical member or logical unit coverage"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -716,7 +718,7 @@ def test_prepare_pdf_qa_rejects_running_furniture_in_body_flow(
         document_mutation=mark_header,
     )
 
-    with pytest.raises(PdfQAFailure, match="running furniture entered body flow"):
+    with pytest.raises(PdfQAFailure, match="layout unit member coverage does not match document"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -743,6 +745,7 @@ def test_prepare_pdf_qa_rejects_figure_crop_absorbing_selectable_prose(
     )
     document["source_sha256"] = digest
     _write_json(assembled_pdf_run.run_dir / "document.json", document)
+    rebind_native_fixture(assembled_pdf_run.run_dir)
     _refresh_review_digest(assembled_pdf_run.run_dir)
     monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
 
@@ -773,6 +776,7 @@ def test_prepare_pdf_qa_allows_sparse_source_figure_labels(
     )
     document["source_sha256"] = digest
     _write_json(assembled_pdf_run.run_dir / "document.json", document)
+    rebind_native_fixture(assembled_pdf_run.run_dir)
     _refresh_review_digest(assembled_pdf_run.run_dir)
     monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
 
@@ -860,7 +864,7 @@ def test_prepare_pdf_qa_rejects_detached_callout_content(
         layout_mutation=detach_body,
     )
 
-    with pytest.raises(PdfQAFailure, match="detached callout content"):
+    with pytest.raises(PdfQAFailure, match="missing required physical member or logical unit coverage"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -1069,13 +1073,14 @@ def test_prepare_pdf_qa_rejects_legacy_document_as_publication_evidence(
     document_path = assembled_pdf_run.run_dir / "document.json"
     document = json.loads(document_path.read_text(encoding="utf-8"))
     document["schema_version"] = "1.0"
+    for key in ("extracted_schema_version", "translation_units", "flow_findings"):
+        document.pop(key)
     for block in document["blocks"]:
         block.pop("semantic_role")
         block.pop("continuation_of")
     _write_json(document_path, document)
-    _refresh_review_digest(assembled_pdf_run.run_dir)
 
-    with pytest.raises(PdfQAFailure, match="legacy PDF document is diagnostic only"):
+    with pytest.raises(PdfQAFailure, match="native 1.2 extraction"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -1088,7 +1093,7 @@ def test_prepare_pdf_qa_rejects_layout_without_publication_evidence_fields(
         layout.pop(field)
     _write_json(layout_path, layout)
 
-    with pytest.raises(PdfQAFailure, match="layout publication evidence fields"):
+    with pytest.raises(PdfQAFailure, match="unit member anchor must resolve to paragraph start"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -1114,7 +1119,7 @@ def test_prepare_pdf_qa_rejects_diagnostic_only_footnote_ownership(
         layout_mutation=mark_legacy_ownership,
     )
 
-    with pytest.raises(PdfQAFailure, match="legacy footnote ownership is diagnostic only"):
+    with pytest.raises(PdfQAFailure, match="footnote must have exactly one marker owner"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -1152,7 +1157,8 @@ def test_prepare_pdf_qa_rejects_inputs_mutated_after_semantic_review(
     path = assembled_pdf_run.run_dir / relative_path
     path.write_bytes(path.read_bytes() + b" ")
 
-    with pytest.raises(PdfQAFailure, match="digest does not match"):
+    expected = "binding does not match" if relative_path in {"segments.jsonl", "zones/zone-001.json", "assignments/zone-001.json"} else "digest does not match"
+    with pytest.raises(PdfQAFailure, match=expected):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
     assert not (assembled_pdf_run.run_dir / "pdf-qa.json").exists()
@@ -1839,7 +1845,9 @@ def _rewrite_publication_evidence(
         document = json.loads(document_path.read_text(encoding="utf-8"))
         document_mutation(document)  # type: ignore[operator]
         _write_json(document_path, document)
-        _refresh_review_digest(run.run_dir)
+        if document["schema_version"] == "1.2":
+            write_native_singleton_fixture(run.run_dir)
+            _refresh_review_digest(run.run_dir)
     if layout_mutation is not None:
         layout_path = run.run_dir / "layout.json"
         layout = json.loads(layout_path.read_text(encoding="utf-8"))
@@ -2014,6 +2022,9 @@ def test_prepare_pdf_qa_rejects_table_grid_mismatch(
     document = json.loads(path.read_text(encoding="utf-8"))
     document["table_cells"] = document["table_cells"][:-1]
     _write_json(path, document)
+
+    rebind_native_fixture(assembled_pdf_run.run_dir)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="table cells"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
@@ -2769,6 +2780,9 @@ def test_prepare_pdf_qa_rejects_broken_figure_caption_relationship(
     caption["caption_id"] = "pdf:page-0001:block-0001"
     _write_json(path, document)
 
+    rebind_native_fixture(assembled_pdf_run.run_dir)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
+
     with pytest.raises(PdfQAFailure, match="figure-caption"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
@@ -2971,10 +2985,7 @@ def test_prepare_pdf_qa_rejects_layout_block_text_mapping_swap(
 
     with pytest.raises(
         PdfQAFailure,
-        match=(
-            "not selectable.*seg-000001|not selectable.*seg-000005|"
-            "expected output destination"
-        ),
+        match="invalid unit/member provenance",
     ):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
@@ -3147,6 +3158,9 @@ def test_prepare_pdf_qa_requires_external_link_for_each_source_block(
     internal["destination"] = None
     internal["uri"] = "https://example.com/a%20b"
     _write_json(path, document)
+
+    rebind_native_fixture(assembled_pdf_run.run_dir)
+    _refresh_review_digest(assembled_pdf_run.run_dir)
 
     with pytest.raises(PdfQAFailure, match="external URI annotation.*block"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)

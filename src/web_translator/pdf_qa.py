@@ -1949,19 +1949,7 @@ def _validate_publication_evidence(
         if document_value.get("extracted_schema_version") != "1.2" or layout.schema_version != "1.2":
             raise PdfQAFailure("native unit publication requires native 1.2 origin and layout")
         return
-    if document_value.get("schema_version") != "1.1":
-        raise PdfQAFailure(
-            "legacy PDF document is diagnostic only and cannot prove publication quality"
-        )
-    if layout.schema_version != "1.1":
-        raise PdfQAFailure(
-            "legacy PDF layout is diagnostic only and cannot prove publication quality"
-        )
-    required_layout_fields = {"toc_entries", "footnote_continuations", "anchor_pages"}
-    if not required_layout_fields.issubset(layout_value):
-        raise PdfQAFailure(
-            "layout publication evidence fields are absent; legacy-compatible evidence is diagnostic only"
-        )
+    raise PdfQAFailure("publication requires native 1.2 extraction; legacy evidence is diagnostic only")
 
 
 def _validate_specialized_role_templates(

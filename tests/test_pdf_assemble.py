@@ -38,6 +38,7 @@ from web_translator.pdf_models import (
     PdfSourceRecord,
     PdfTableCell,
 )
+from tests.pdf_unit_fixtures import write_native_singleton_fixture, rebind_native_fixture, protect_fixture_note_markers, replace_fixture_document
 
 
 ROOT = Path(__file__).parents[1]
@@ -237,17 +238,15 @@ def test_joined_unit_layout_rejects_invalid_provenance(tmp_path, mutation):
         PdfAssemblyLayout.from_dict(data)
 
 
-def test_joined_unit_singleton_adapter_retains_rich_rendering(tmp_path):
-    from tests.pdf_unit_fixtures import bind_render_unit_run
+def test_native_singleton_units_retain_rich_rendering(tmp_path):
     from web_translator.pdf_extract import build_pdf_unit_segments
-    from web_translator.pdf_models import upgrade_pdf_document_to_units
     run, _translations, _glossary, _ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=3)
-    document = PdfDocument.from_dict(upgrade_pdf_document_to_units(json.loads((run / "document.json").read_text())))
+    document = PdfDocument.from_dict(json.loads((run / "document.json").read_text()))
     blocks, units, segments = build_pdf_unit_segments(document.blocks, document.translation_units)
     document = replace(document, blocks=blocks, translation_units=units, extracted_schema_version="1.2")
     (run / "document.json").write_text(json.dumps(document.to_dict()), encoding="utf-8")
     write_segments(run / "segments.jsonl", segments)
-    bind_render_unit_run(run)
+    rebind_native_fixture(run)
     translations = {segment.id: Translation(segment.id, segment.source_text) for segment in segments}
     original = (run / "document.json").read_bytes()
     assemble_pdf(run, translations, {}, tmp_path / "output")
@@ -382,6 +381,7 @@ def _assembly_run(
         ),
         "seg-000003": Translation("seg-000003", "첫째 ⟦WT:000002⟧"),
     }
+    write_native_singleton_fixture(run_dir)
     return run_dir, translations, {"replication": "복제"}
 
 
@@ -654,6 +654,8 @@ def _rich_assembly_run(
         encoding="utf-8",
     )
     write_segments(run_dir / "segments.jsonl", segments)
+    write_native_singleton_fixture(run_dir)
+    protect_fixture_note_markers(run_dir, translations)
     return run_dir, translations, {}, {
         "caption": caption.id,
         "external": external.id,
@@ -750,11 +752,14 @@ def _publication_assembly_run(tmp_path: Path, rows: list[tuple[int, str, str]]) 
     (run_dir / "document.json").write_text(json.dumps(document.to_dict()), encoding="utf-8")
     (run_dir / "segments.jsonl").unlink()
     write_segments(run_dir / "segments.jsonl", segments)
+    write_native_singleton_fixture(run_dir)
     return run_dir
 
 
 def _assemble_publication(run_dir: Path, output: Path) -> Path:
+    write_native_singleton_fixture(run_dir)
     translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
+    protect_fixture_note_markers(run_dir, translations)
     return assemble_pdf(run_dir=run_dir, translations=translations, glossary={}, output_dir=output)
 
 
@@ -802,7 +807,7 @@ def test_roman_toc_does_not_use_decimal_furniture_to_choose_duplicate_title(tmp_
         (3, "reference-heading", "Introduction"), (3, "body", "13"),
     ])
     document = PdfDocument.from_dict(json.loads((run_dir / "document.json").read_text()))
-    document = replace(document, blocks=[
+    document = replace_fixture_document(document, blocks=[
         replace(block, kind="page-number", segment_id=None)
         if block.source_text in {"xiii", "13"} else block for block in document.blocks
     ])
@@ -924,6 +929,7 @@ def test_toc_source_annotation_links_translated_label_to_nested_callout_anchor(t
     path.write_text(json.dumps(document.to_dict()))
     translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
     translations[entry.segment_id] = Translation(entry.segment_id, "번역된 주제 ... 9")
+    rebind_native_fixture(run_dir)
     output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
     layout = read_pdf_layout(run_dir / "layout.json")
     resolved = layout.toc_entries[0]
@@ -985,7 +991,7 @@ def test_footnote_continuation_preserves_text_and_owner_without_overlap(tmp_path
     document = PdfDocument.from_dict(json.loads((run_dir / "document.json").read_text()))
     note = next(b for b in document.blocks if b.id == ids["page_note"])
     text = " ".join(f"각주문장{index:04d}" for index in range(900))
-    translations[note.segment_id] = Translation(note.segment_id, text)
+    translations[note.segment_id] = Translation(note.segment_id, "⟦WT:000000⟧ " + text)
     output = assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
     layout = read_pdf_layout(run_dir / "layout.json")
     parts = [r for r in layout.flowables if r.block_id == note.id]
@@ -1007,18 +1013,19 @@ def test_footnote_continuation_preserves_text_and_owner_without_overlap(tmp_path
 def _footnote_publication_run(tmp_path: Path, *, preceding_lines: int, note_words: int) -> Path:
     run_dir = _publication_assembly_run(tmp_path, [
         (1, "body", "앞선 문장입니다.") for _ in range(preceding_lines)
-    ] + [(1, "body", "소유 문장 1"), (1, "body", " ".join(f"주석{n:04d}" for n in range(note_words)))])
+    ] + [(1, "body", "소유 문장 1"), (1, "body", "1 " + " ".join(f"주석{n:04d}" for n in range(note_words)))])
     path = run_dir / "document.json"
     document = PdfDocument.from_dict(json.loads(path.read_text()))
     blocks = list(document.blocks)
     blocks[-2] = replace(blocks[-2], destination=blocks[-1].id)
     blocks[-1] = replace(blocks[-1], kind="footnote")
-    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    path.write_text(json.dumps(replace_fixture_document(document, blocks=blocks).to_dict()))
     segments_path = run_dir / "segments.jsonl"
     segments = read_segments(segments_path)
     segments[-1] = replace(segments[-1], semantic_type="footnote")
     segments_path.unlink()
     write_segments(segments_path, segments)
+    write_native_singleton_fixture(run_dir)
     return run_dir
 
 
@@ -1057,8 +1064,7 @@ def test_long_owner_marker_near_bottom_does_not_move_whole_paragraph_to_empty_pa
     path = run_dir / "document.json"
     document = PdfDocument.from_dict(json.loads(path.read_text()))
     blocks = list(document.blocks)
-    blocks[-1] = replace(blocks[-1], source_text="1 " + blocks[-1].source_text)
-    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    path.write_text(json.dumps(replace_fixture_document(document, blocks=blocks).to_dict()))
     segments_path = run_dir / "segments.jsonl"
     segments = read_segments(segments_path)
     segments[-1] = replace(segments[-1], source_text=blocks[-1].source_text)
@@ -1066,6 +1072,8 @@ def test_long_owner_marker_near_bottom_does_not_move_whole_paragraph_to_empty_pa
     write_segments(segments_path, segments)
     translations = {s.id: Translation(s.id, s.source_text) for s in segments}
     translations[segments[0].id] = Translation(segments[0].id, "긴 소유 문장입니다. " * 140 + "1")
+    write_native_singleton_fixture(run_dir)
+    protect_fixture_note_markers(run_dir, translations)
     output = assemble_pdf(run_dir, translations, {}, tmp_path / "out")
     layout = read_pdf_layout(run_dir / "layout.json")
     owners = [r for r in layout.flowables if r.block_id == blocks[0].id]
@@ -1076,7 +1084,7 @@ def test_long_owner_marker_near_bottom_does_not_move_whole_paragraph_to_empty_pa
     assert all((page.extract_text() or "").strip() for page in PdfReader(output).pages)
 
 
-def test_footnote_ownership_evidence_distinguishes_protected_marker_and_legacy_block(tmp_path: Path) -> None:
+def test_footnote_ownership_evidence_requires_protected_native_marker(tmp_path: Path) -> None:
     run_dir, translations, glossary, ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
     path = run_dir / "segments.jsonl"
     segments = read_segments(path)
@@ -1087,20 +1095,21 @@ def test_footnote_ownership_evidence_distinguishes_protected_marker_and_legacy_b
             translations[segment.id] = Translation(segment.id, "페이지 지역 표지 " + token.token)
     path.unlink()
     write_segments(path, segments)
+    write_native_singleton_fixture(run_dir)
     assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
     note = next(r for r in read_pdf_layout(run_dir / "layout.json").flowables if r.block_id == ids["page_note"])
     assert note.footnote_owner_id == ids["owner"]
     assert note.footnote_ownership == "protected-footnote-marker"
     legacy = _footnote_publication_run(tmp_path / "legacy", preceding_lines=0, note_words=10)
     _assemble_publication(legacy, tmp_path / "legacy-out")
-    assert read_pdf_layout(legacy / "layout.json").flowables[-1].footnote_ownership == "block-only-legacy"
+    assert read_pdf_layout(legacy / "layout.json").flowables[-1].footnote_ownership == "protected-footnote-marker"
 
 
 def test_footnote_repeated_translated_marker_fails_closed(tmp_path: Path) -> None:
     run_dir, translations, glossary, ids = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
     owner = next(s for s in read_segments(run_dir / "segments.jsonl") if s.locator == ids["owner"])
-    translations[owner.id] = Translation(owner.id, "표지 1 반복 1")
-    with pytest.raises(PdfAssemblyError, match="marker is not unique"):
+    translations[owner.id] = Translation(owner.id, "표지 ⟦WT:000000⟧ 반복 ⟦WT:000000⟧")
+    with pytest.raises(PdfAssemblyError, match="protected token.*exactly once"):
         assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
     assert not (run_dir / "layout.json").exists()
 
@@ -1119,12 +1128,13 @@ def _competing_footnotes_run(tmp_path: Path, *, section_end: bool) -> tuple[Path
     for index in (0, 1):
         blocks[index] = replace(blocks[index], destination=blocks[index + 2].id)
         blocks[index + 2] = replace(blocks[index + 2], kind="footnote")
-    path.write_text(json.dumps(replace(document, blocks=blocks).to_dict()))
+    path.write_text(json.dumps(replace_fixture_document(document, blocks=blocks).to_dict()))
     path = run_dir / "segments.jsonl"
     segments = [replace(segment, semantic_type=blocks[index].kind)
                 for index, segment in enumerate(read_segments(path))]
     path.unlink()
     write_segments(path, segments)
+    write_native_singleton_fixture(run_dir)
     return run_dir, blocks
 
 
@@ -1136,7 +1146,7 @@ def test_competing_local_footnotes_share_first_part_capacity_with_each_marker(tm
         owner_part = next(r for r in layout.flowables if r.block_id == owner.id)
         note_parts = [r for r in layout.flowables if r.block_id == note.id]
         assert note_parts[0].page_number == owner_part.page_number == 1
-        assert note_parts[0].footnote_ownership == "unique-source-marker"
+        assert note_parts[0].footnote_ownership == "protected-footnote-marker"
         assert [r.split_part for r in note_parts] == list(range(len(note_parts)))
     with pdfplumber.open(output) as pdf:
         text = " ".join(page.extract_text() for page in pdf.pages)
@@ -1176,7 +1186,7 @@ def test_local_continuations_keep_section_end_note_pages_mixed_until_body_finish
 
 
 def test_publication_nonconverging_index_is_bounded_and_never_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", "One entry")])
+    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", '[1] A: "One entry", Press, 2024.')])
     monkeypatch.setattr(pdf_assemble_module._PublicationIndex, "isSatisfied", lambda self: False)
     with pytest.raises(PdfAssemblyError, match="not resolved after 8 passes"):
         _assemble_publication(run_dir, tmp_path / "out")
@@ -1185,7 +1195,7 @@ def test_publication_nonconverging_index_is_bounded_and_never_published(tmp_path
 
 
 def test_note_free_rich_page_uses_body_space_without_reserved_bottom_band(tmp_path: Path) -> None:
-    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", "끝까지 채우는 본문입니다.") for _ in range(27)])
+    run_dir = _publication_assembly_run(tmp_path, [(1, "reference-entry", '[1] A: "B", 2024.') for _ in range(27)])
     output = _assemble_publication(run_dir, tmp_path / "out")
     layout = read_pdf_layout(run_dir / "layout.json")
     assert len(PdfReader(output).pages) == 1
@@ -1277,9 +1287,9 @@ def test_visible_provenance_is_metadata_only(tmp_path: Path, rich: bool) -> None
 def test_reference_entries_use_hanging_indent_and_explicit_continuations(tmp_path: Path) -> None:
     run_dir = _publication_assembly_run(tmp_path, [
         (1, "reference-heading", "References"),
-        (1, "reference-entry", "[1] " + "Reference details for a useful book. " * 5),
-        (2, "reference-entry", "Continued publication details."),
-        (2, "reference-entry", "[2] Another independent reference."),
+        (1, "reference-entry", '[1] A. Writer: "' + "Reference details for a useful book. " * 5 + '",'),
+        (2, "reference-entry", "Continued publication details, Press, 2024."),
+        (2, "reference-entry", '[2] B. Reader: "Another independent reference", Press, 2025.'),
     ])
     path = run_dir / "document.json"
     data = json.loads(path.read_text())
@@ -1393,7 +1403,7 @@ def test_layout_semantic_role_legacy_diagnostics_and_strict_new_schema(tmp_path:
     _assemble_publication(run_dir, tmp_path / "out")
     path = run_dir / "layout.json"
     data = json.loads(path.read_text())
-    assert data["schema_version"] == "1.1"
+    assert data["schema_version"] == "1.2"
     assert data["flowables"][0]["semantic_role"] == "chapter-title"
     data["flowables"][0]["semantic_role"] = "invented"
     path.write_text(json.dumps(data))
@@ -1404,6 +1414,9 @@ def test_layout_semantic_role_legacy_diagnostics_and_strict_new_schema(tmp_path:
     with pytest.raises(PdfAssemblyError, match="semantic_role"):
         read_pdf_layout(path)
     data["schema_version"] = "1.0"
+    for record in data["flowables"]:
+        record.pop("unit_id", None)
+        record.pop("source_block_ids", None)
     data["page_size"]["name"] = "LETTER"
     path.write_text(json.dumps(data))
     assert read_pdf_layout(path).flowables[0].semantic_role == "body"
@@ -1575,7 +1588,7 @@ def test_assemble_pdf_embeds_regular_and_bold_with_tounicode_without_headings(
     ]
     (run_dir / "document.json").write_text(
         json.dumps(
-            replace(document, blocks=remaining_blocks).to_dict(),
+            replace_fixture_document(document, blocks=remaining_blocks).to_dict(),
             ensure_ascii=False,
         )
         + "\n",
@@ -1596,6 +1609,7 @@ def test_assemble_pdf_embeds_regular_and_bold_with_tounicode_without_headings(
     write_segments(run_dir / "segments.jsonl", remaining_segments)
     translations.pop("seg-000001")
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     contracts = _embedded_font_contracts(staged)
@@ -1629,7 +1643,7 @@ def test_assemble_pdf_normalizes_heading_levels_from_document_evidence(
         json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
     )
     (run_dir / "document.json").write_text(
-        json.dumps(replace(document, blocks=blocks).to_dict()) + "\n",
+        json.dumps(replace_fixture_document(document, blocks=blocks).to_dict()) + "\n",
         encoding="utf-8",
     )
     segments = [
@@ -1651,6 +1665,7 @@ def test_assemble_pdf_normalizes_heading_levels_from_document_evidence(
         for index, segment in enumerate(segments)
     }
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert _heading_font_sizes(staged, labels) == [18.0, 16.0, 16.0, 18.0]
@@ -1690,7 +1705,7 @@ def test_assemble_pdf_preserves_list_marker_family_and_relative_nesting(
         json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
     )
     (run_dir / "document.json").write_text(
-        json.dumps(replace(document, blocks=blocks).to_dict()) + "\n",
+        json.dumps(replace_fixture_document(document, blocks=blocks).to_dict()) + "\n",
         encoding="utf-8",
     )
     segments = [
@@ -1712,6 +1727,7 @@ def test_assemble_pdf_preserves_list_marker_family_and_relative_nesting(
         for segment in segments
     }
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
@@ -2045,10 +2061,10 @@ def test_assemble_pdf_writes_reportlab_through_open_anchored_file(
     run_dir, translations, glossary = _assembly_run(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    original_document = pdf_assemble_module.SimpleDocTemplate
+    original_document = pdf_assemble_module.PublicationDocTemplate
     swapped = False
 
-    def swap_staging_before_reportlab(destination: object, **kwargs: object) -> object:
+    def swap_staging_before_reportlab(destination: object, *args: object, **kwargs: object) -> object:
         nonlocal swapped
         if not swapped:
             swapped = True
@@ -2060,11 +2076,11 @@ def test_assemble_pdf_writes_reportlab_through_open_anchored_file(
             staging = temporary / "staged-output"
             staging.rename(temporary / "moved-staged-output")
             staging.symlink_to(outside, target_is_directory=True)
-        return original_document(destination, **kwargs)
+        return original_document(destination, *args, **kwargs)
 
     monkeypatch.setattr(
         pdf_assemble_module,
-        "SimpleDocTemplate",
+        "PublicationDocTemplate",
         swap_staging_before_reportlab,
     )
 
@@ -2216,7 +2232,7 @@ def test_assemble_pdf_stages_selectable_korean_without_publishing(
     assert any("Bold" in name for name in programs)
 
     layout = read_pdf_layout(run_dir / "layout.json")
-    assert layout.schema_version == "1.1"
+    assert layout.schema_version == "1.2"
     assert layout.reserved_output_dir == str(final_output)
     assert layout.staged_pdf_sha256 == hashlib.sha256(staged.read_bytes()).hexdigest()
     assert layout.page_size.name == "SOURCE"
@@ -2270,6 +2286,7 @@ def test_assemble_pdf_normalizes_alternating_footer_page_tokens(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
@@ -2308,6 +2325,7 @@ def test_assemble_pdf_allows_figure_to_fill_declared_body_frame(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert staged.is_file()
@@ -2393,6 +2411,7 @@ def test_assemble_pdf_omits_coherent_varying_composite_footers(tmp_path: Path) -
         encoding="utf-8",
     )
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
@@ -2445,6 +2464,7 @@ def test_assemble_pdf_rejects_repeated_identical_composite_footer(tmp_path: Path
     )
 
     with pytest.raises(PdfAssemblyError, match="ambiguous repeated footer evidence"):
+        write_native_singleton_fixture(run_dir)
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
@@ -3784,6 +3804,7 @@ def test_assemble_pdf_recreates_each_unambiguous_inline_link_span(
     )
     translations[segment_id] = Translation(segment_id, "Read Alpha and Beta now")
 
+    rebind_native_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     uris = [
@@ -3831,6 +3852,7 @@ def test_translated_link_evidence_downgrades_unmapped_label_without_proportional
         block.segment_id, "완전히 관련 없는 한국어 ⟦WT:000001⟧"
     )
 
+    write_native_singleton_fixture(run_dir)
     assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
     effective = read_pdf_layout(run_dir / "layout.json").links
 
@@ -3901,7 +3923,7 @@ def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
     assert owner.segment_id is not None
     translations[owner.segment_id] = Translation(
         owner.segment_id,
-        "페이지 지역 표지 " * 250 + "1",
+        "페이지 지역 표지 " * 250 + "⟦WT:000000⟧",
     )
 
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
@@ -3931,8 +3953,12 @@ def test_page_local_footnote_owned_by_repeated_table_cell_is_emitted_once(
             block["destination"] = None
         elif block["id"] == identifiers["table_link_target"]:
             block["destination"] = identifiers["page_note"]
+            block["source_text"] += " 1"
+            translations[block["segment_id"]] = Translation(block["segment_id"], translations[block["segment_id"]].text + " 1")
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    write_native_singleton_fixture(run_dir)
+    protect_fixture_note_markers(run_dir, translations)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
@@ -3972,6 +3998,7 @@ def test_caption_above_figure_is_emitted_once_in_source_order(
         block["order"] = order
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
@@ -4016,7 +4043,7 @@ def test_standalone_uncaptioned_figure_is_emitted_once(
         )
     ]
     document_path.write_text(
-        json.dumps(replace(document, blocks=blocks).to_dict(), ensure_ascii=False) + "\n",
+        json.dumps(replace_fixture_document(document, blocks=blocks).to_dict(), ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     segments = [
@@ -4028,6 +4055,7 @@ def test_standalone_uncaptioned_figure_is_emitted_once(
     assert caption.segment_id is not None
     translations.pop(caption.segment_id)
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     layout = read_pdf_layout(run_dir / "layout.json")
@@ -4068,6 +4096,7 @@ def test_orphan_caption_and_nonreciprocal_pair_still_fail(
     )
 
     with pytest.raises(PdfAssemblyError, match="every caption"):
+        write_native_singleton_fixture(run_dir)
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
@@ -4112,6 +4141,7 @@ def test_rich_assembly_rejects_raw_or_structurally_invalid_uri(
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
     with pytest.raises(PdfAssemblyError, match="unsafe external URI"):
+        write_native_singleton_fixture(run_dir)
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
 
@@ -4143,6 +4173,7 @@ def test_rich_assembly_preserves_valid_external_uri_exactly(
     external["uri"] = expected
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    write_native_singleton_fixture(run_dir)
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     uris = [
@@ -4247,6 +4278,7 @@ def test_rich_assembly_fails_closed_on_invalid_media_evidence(
         )
 
     with pytest.raises(PdfAssemblyError, match=message):
+        rebind_native_fixture(run_dir)
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert not (run_dir / "staged-output").exists()

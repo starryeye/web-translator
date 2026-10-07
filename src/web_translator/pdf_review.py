@@ -181,11 +181,15 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
             for name, opened in root_files.items()
         }
         logical_units = False
+        if "document.json" not in anchored._anchored_directory_names(run_anchor):
+            raise PdfSemanticReviewError("PDF semantic review requires a native 1.2 document")
         if "document.json" in anchored._anchored_directory_names(run_anchor):
             opened = anchored._open_anchored_input_file(run_anchor, "document.json", "PDF document")
             root_files["document.json"] = opened
             document_bytes = anchored._read_opened_bytes(opened, run_anchor.path / "document.json", "PDF document")
             document = PdfDocument.from_dict(json.loads(document_bytes))
+            from web_translator.pdf_unit_bindings import require_assignable_pdf
+            require_assignable_pdf(document)
             logical_units = document.schema_version == "1.2"
             if logical_units:
                 payloads["document.json"] = document_bytes

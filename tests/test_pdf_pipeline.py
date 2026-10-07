@@ -36,6 +36,77 @@ from tests.test_pdf_qa import PdfQARun, _write_passing_layout_review, assembled_
 PDF_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "pdf"
 
 
+@pytest.mark.parametrize("origin", ["1.1", "adapted"])
+@pytest.mark.parametrize("stage", ["assembly", "review", "qa", "plan"])
+def test_native_unit_gates_reject_legacy_diagnostics(tmp_path, origin, stage):
+    from tests.test_pdf_qa import make_native_unit_qa_run
+    from web_translator.pdf_review import build_pdf_semantic_review_input, PdfSemanticReviewError
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, _document, _layout = make_native_unit_qa_run(tmp_path)
+    path = run.run_dir / "document.json"
+    value = json.loads(path.read_bytes())
+    if origin == "adapted":
+        value["extracted_schema_version"] = "1.1"
+    else:
+        value["schema_version"] = "1.1"
+        for key in ("extracted_schema_version", "translation_units", "flow_findings"):
+            value.pop(key)
+    path.write_text(json.dumps(value), encoding="utf-8")
+    if origin == "1.1":
+        (run.run_dir / "assignments/.pdf-unit-binding.json").rename(run.run_dir / "saved-native-binding.json")
+    if stage == "assembly":
+        (run.run_dir / "staged-output").rename(run.run_dir / "saved-staged-output")
+        (run.run_dir / "layout.json").rename(run.run_dir / "saved-layout.json")
+        with pytest.raises(PdfAssemblyError, match="native 1.2"):
+            assemble_pdf(run.run_dir, {}, {}, run.output_dir)
+    elif stage == "review":
+        with pytest.raises(PdfSemanticReviewError, match="native 1.2"):
+            build_pdf_semantic_review_input(run.run_dir)
+    elif stage == "qa":
+        with pytest.raises(PdfQAFailure, match="native 1.2"):
+            prepare_pdf_qa(run.run_dir, run.output_dir)
+    else:
+        # Shared stage path must be in the public exact-root allocation contract.
+        public, _ = _pdf_cli_paths(tmp_path / "cli")
+        for name in ("source.json", "document.json", "segments.jsonl"):
+            shutil.copyfile(run.run_dir / name, public / name)
+        assert main(["plan-zones", "--run-dir", str(public)]) != 0
+        assert not (public / "zones").exists()
+
+
+def test_native_unit_pipeline_publishes_exact_artifacts(tmp_path):
+    from tests.pdf_unit_fixtures import run_native_unit_pipeline
+    run, output = run_native_unit_pipeline(tmp_path)
+    doc = json.loads((run / "document.json").read_bytes())
+    assert doc["schema_version"] == doc["extracted_schema_version"] == "1.2"
+    joined = [u for u in doc["translation_units"] if len(u["source_block_ids"]) > 1]
+    assert len(joined) == 1
+    assert joined[0]["source_block_ids"] == ["pdf:page-0001:block-0002", "pdf:page-0002:block-0001"]
+    assert (run / "assignments/.pdf-unit-binding.json").is_file()
+    assert {p.name for p in output.iterdir()} == {"translated.pdf", "manifest.json", "review-report.md"}
+    manifest = json.loads((output / "manifest.json").read_bytes())
+    assert manifest["qa"]["automated"]["metrics"]["translated_block_count"] == 4
+    assert manifest["qa"]["automated"]["metrics"]["translation_unit_count"] == 3
+    before = {p.name: p.read_bytes() for p in output.iterdir()}
+    assert main(["pdf-qa", "finalize", "--run-dir", str(run), "--output-dir", str(output)]) != 0
+    assert {p.name: p.read_bytes() for p in output.iterdir()} == before
+
+
+@pytest.mark.parametrize("case", ["ambiguous", "oversized"])
+def test_native_unit_refusal_before_planning_or_assignment(tmp_path, capsys, case):
+    from tests.pdf_unit_fixtures import make_native_flow_pdf
+    source = make_native_flow_pdf(tmp_path / "source.pdf", **{case: True})
+    run, _ = _pdf_cli_paths(tmp_path)
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run)]) == 0
+    assert main(["pdf-extract", "--run-dir", str(run)]) == 0
+    assert json.loads((run / "document.json").read_bytes())["schema_version"] == "1.2"
+    assert main(["plan-zones", "--run-dir", str(run)]) != 0
+    diagnostic = capsys.readouterr().err
+    assert ("flow findings" if case == "ambiguous" else "budget") in diagnostic
+    assert not (run / "zones").exists()
+    assert not (run / "assignments").exists()
+
+
 def test_unit_manifest_maps_every_physical_member_without_invented_rectangles(tmp_path):
     from tests.test_pdf_qa import make_native_unit_qa_run
     run, document, _layout = make_native_unit_qa_run(tmp_path)
@@ -1531,7 +1602,7 @@ def test_finalize_rejects_inputs_mutated_after_semantic_review(
     assignment = prepared_pdf_run.run_dir / "assignments" / "zone-001.json"
     assignment.write_bytes(assignment.read_bytes() + b" ")
 
-    with pytest.raises(PdfQAFailure, match="digest does not match"):
+    with pytest.raises(PdfQAFailure, match="binding does not match"):
         finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
 
     assert not prepared_pdf_run.output_dir.exists()
@@ -1722,7 +1793,7 @@ def test_finalize_rejects_source_and_document_sha_mismatch(
         encoding="utf-8",
     )
 
-    with pytest.raises(PdfQAFailure, match="source SHA"):
+    with pytest.raises(PdfQAFailure, match="source/document SHA-256 mismatch"):
         finalize_pdf_output(prepared_pdf_run.run_dir, prepared_pdf_run.output_dir)
 
     assert not prepared_pdf_run.output_dir.exists()
@@ -2037,6 +2108,8 @@ def test_pdf_manifest_schema_is_exact_and_report_contains_equivalent_evidence(
 
     assert set(manifest) == {
         "schema_version",
+        "translation_units",
+        "semantic_input",
         "tool_version",
         "input",
         "source",
@@ -2174,6 +2247,10 @@ def test_pdf_manifest_and_report_preserve_complete_unreconstructed_link_evidence
         encoding="utf-8",
     )
 
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from tests.test_pdf_qa import _refresh_review_digest
+    rebind_native_fixture(prepared_pdf_run.run_dir)
+    _refresh_review_digest(prepared_pdf_run.run_dir)
     manifest = build_pdf_manifest(prepared_pdf_run.run_dir)
     unresolved = manifest["extraction"]["unreconstructed_links"]
     assert unresolved[0]["visible_label"] == "Quality"
@@ -2198,6 +2275,8 @@ def test_finalize_atomically_publishes_exact_reviewed_output(prepared_pdf_run: P
     manifest = json.loads((finalized / "manifest.json").read_text(encoding="utf-8"))
     assert set(manifest) == {
         "counts",
+        "translation_units",
+        "semantic_input",
         "extraction",
         "input",
         "output",

@@ -148,6 +148,16 @@ semantic-review evidence. PDF `review.json` carries its `semantic_input_sha256`,
 the exact segments, zones, assignments, translations, and glossary policy/content before
 assembly and both QA stages.
 
+Fresh PDF extraction uses native schema/origin 1.2: one translation target owns a
+complete logical unit, including proven cross-page paragraph continuations. Physical
+block text, IDs, geometry, and relationships remain unchanged. Required extraction-flow
+findings stop planning; indivisible units exceeding the configured 12,000-character
+budget are refused. Legacy extractions remain diagnostic-only and require a fresh run
+for new assignments or publication. The immutable assignment binding and semantic
+digest cover the unit map and exact reviewed bytes, so old approval cannot be reused
+merely because the source PDF is unchanged. Native manifests distinguish physical
+translated blocks from logical units and report paragraph-start member anchors.
+
 Poppler/Pillow rendering is limited to 36,000,000 pixels per page, 2,000,000,000 pixels
 per PDF, 64 MiB per encoded PNG, and 4 GiB for the rendered set. Each Poppler subprocess
 is limited to 600 seconds. Decoded dimensions are checked before full decode. These

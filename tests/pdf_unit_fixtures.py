@@ -10,6 +10,79 @@ from web_translator.pdf_models import (
 )
 
 
+def make_native_flow_pdf(path, *, ambiguous=False, oversized=False):
+    """Invented selectable source with measured cross-page flow; never real AI output."""
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    canvas = Canvas(str(path), pagesize=(612, 792), invariant=1)
+    lines = [
+        ["The observers record the first measured conditions",
+         "and retain the complete account for later comparison",
+         "while the opening account remains separate.",
+         "A second account starts near the end of the sheet",
+         "and records every qualification in its original order",
+         "while the account continues across the physical boundary"],
+        ["without losing the relationship between its source parts",
+         "or assigning separate translations to incomplete clauses",
+         "until the entire account reaches its conclusion.",
+         "The final account describes a separate observation",
+         "and preserves the evidence for independent inspection",
+         "before the generated example comes to an end."],
+    ]
+    if ambiguous:
+        lines[0][-1] += "."
+    if oversized:
+        # A genuine long paragraph, not a raised planner budget or split unit.
+        lines = [["Selectable words " * 800]]
+    for page_lines in lines:
+        for top, text in zip((72, 90, 108, 672, 690, 708), page_lines):
+            obj = canvas.beginText(72, 792 - top - 9.516)
+            obj.setFont("Helvetica", 12)
+            obj.setHorizScale(468 / stringWidth(text, "Helvetica", 12) * 100)
+            obj.textLine(text)
+            canvas.drawText(obj)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
+def run_native_unit_pipeline(root):
+    """Public workflow with explicitly test-only translations and approvals."""
+    import json
+    from web_translator.cli import main
+    from web_translator.models import read_segments
+    from tests.test_pdf_qa import _write_review, _write_passing_layout_review
+    run = root / ".web-translator" / "runs" / "논리 단위"
+    output = root / "translated-pdfs" / "논리 단위"
+    run.mkdir(parents=True)
+    output.parent.mkdir()
+    source = make_native_flow_pdf(root / "두 페이지 source.pdf")
+    def command(*args):
+        assert main([*args, "--run-dir", str(run)]) == 0
+    command("pdf-acquire", str(source))
+    command("pdf-extract")
+    command("plan-zones")
+    (run / "glossary.json").write_text("{}\n", encoding="utf-8")
+    (run / "document-summary.txt").write_text("TEST ONLY generated flow fixture", encoding="utf-8")
+    command("prepare-assignments")
+    translations = ("첫 번째 관찰 기록을 보존합니다.", "물리적 페이지 경계를 넘는 하나의 완전한 기록입니다.", "마지막 관찰을 검토합니다.")
+    targets = [s for s in read_segments(run / "segments.jsonl") if s.target]
+    assert len(targets) == 3
+    (run / "translations").mkdir()
+    (run / "translations/zone-001.jsonl").write_text("".join(
+        json.dumps({"segment_id": segment.id, "text": text, "notes": "TEST ONLY", "glossary_observations": {}}, ensure_ascii=False) + "\n"
+        for segment, text in zip(targets, translations, strict=True)), encoding="utf-8")
+    command("validate-translations", "--zone-id", "zone-001")
+    command("validate-translations")
+    command("pdf-review-input")
+    _write_review(run)  # Test-only simulated approval, not human/AI acceptance.
+    command("pdf-assemble", "--output-dir", str(output))
+    command("pdf-qa", "prepare", "--output-dir", str(output))
+    _write_passing_layout_review(run)  # Test-only simulated all-page approval.
+    command("pdf-qa", "finalize", "--output-dir", str(output))
+    return run, output
+
+
 def make_unit_document(
     texts: tuple[str, ...] = ("A para‐", "graph continues."),
     *, operation: str = "remove-discretionary-hyphen",
@@ -292,3 +365,76 @@ def bind_render_unit_run(run):
         {"zone-001.json": (run / "assignments/zone-001.json").read_bytes()})
     (run / "assignments/.pdf-unit-binding.json").write_text(
         json.dumps(binding.to_dict()) + "\n", encoding="utf-8")
+
+
+def write_native_singleton_fixture(run):
+    """Explicit synthetic unit ownership for renderer tests, not producer evidence.
+
+    Call only while constructing a fixture, before approval. Existing physical
+    fields and Segment bytes remain unchanged; tests for stale input never call it.
+    """
+    import json
+    from web_translator.pdf_units import TRANSLATABLE_KINDS
+    value = json.loads((run / "document.json").read_bytes())
+    units = [PdfTranslationUnit(f"pdf:unit-{index:06d}", (block.id,),
+             block.kind, block.semantic_role, block.segment_id, ())
+             for index, block in enumerate((PdfBlock.from_dict(block) for block in value["blocks"]
+                 if block["kind"] in TRANSLATABLE_KINDS and block["source_text"].strip()), 1)]
+    value.update(schema_version="1.2", extracted_schema_version="1.2",
+                 translation_units=[unit.to_dict() for unit in units], flow_findings=[])
+    (run / "document.json").write_text(json.dumps(value) + "\n", encoding="utf-8")
+    rebind_native_fixture(run)
+
+
+def replace_fixture_document(document, **changes):
+    """Keep synthetic singleton ownership aligned with deliberate block edits."""
+    from web_translator.pdf_units import TRANSLATABLE_KINDS
+    updated = replace(document, **changes)
+    units = [PdfTranslationUnit(f"pdf:unit-{index:06d}", (block.id,), block.kind,
+             block.semantic_role, block.segment_id, ()) for index, block in enumerate(
+                 (b for b in updated.blocks if b.kind in TRANSLATABLE_KINDS and b.source_text.strip()), 1)]
+    return replace(updated, translation_units=units)
+
+
+def rebind_native_fixture(run):
+    """Bind deliberate synthetic setup changes before any fresh review."""
+    import json
+    from web_translator.pdf_unit_bindings import build_pdf_unit_binding
+    for name in ("zones", "assignments"):
+        directory = run / name
+        if not directory.exists():
+            directory.mkdir()
+            (directory / "zone-001.json").write_text('{"zone_id":"zone-001"}\n', encoding="utf-8")
+    binding = build_pdf_unit_binding((run / "document.json").read_bytes(),
+        (run / "segments.jsonl").read_bytes(),
+        {p.name: p.read_bytes() for p in (run / "zones").glob("zone-*.json")},
+        {p.name: p.read_bytes() for p in (run / "assignments").glob("zone-*.json")})
+    (run / "assignments/.pdf-unit-binding.json").write_text(json.dumps(binding.to_dict()) + "\n", encoding="utf-8")
+
+
+def protect_fixture_note_markers(run, translations):
+    """Make old renderer-only note data use native physical marker provenance."""
+    import json
+    from web_translator.models import ProtectedToken, read_segments, write_segments
+    from web_translator.pdf_units import _unit_protection
+    from web_translator.protection import restore_tokens
+    document = PdfDocument.from_dict(json.loads((run / "document.json").read_bytes()))
+    by_id = {block.id: block for block in document.blocks}
+    by_segment = {unit.segment_id: unit for unit in document.translation_units}
+    segments = read_segments(run / "segments.jsonl")
+    for index, segment in enumerate(segments):
+        unit = by_segment[segment.id]
+        block = by_id[unit.source_block_ids[0]]
+        if block.kind != "footnote" and not (block.destination in by_id and by_id[block.destination].kind == "footnote"):
+            continue
+        source, occurrences = _unit_protection(unit, by_id)
+        raw = restore_tokens(translations[segment.id].text, segment.protected)
+        for occurrence in occurrences:
+            assert occurrence.value in raw
+            raw = raw.replace(occurrence.value, occurrence.placeholder, 1)
+        segments[index] = replace(segment, source_text=source, protected=[
+            ProtectedToken(item.placeholder, item.kind, item.value) for item in occurrences])
+        translations[segment.id] = replace(translations[segment.id], text=raw)
+    (run / "segments.jsonl").unlink()
+    write_segments(run / "segments.jsonl", segments)
+    rebind_native_fixture(run)

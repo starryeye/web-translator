@@ -22,7 +22,7 @@ class PdfContractError(ValueError):
 
 
 _SCHEMA_VERSION = "1.0"
-PDF_DOCUMENT_SCHEMA_VERSION = "1.1"
+PDF_DOCUMENT_SCHEMA_VERSION = "1.2"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _BLOCK_ID = re.compile(
     r"pdf:page-(?P<page>\d{4}):(?:block-\d{4}|table-\d{4}:row-\d{4}:cell-\d{4})\Z"
@@ -734,9 +734,9 @@ class PdfDocument:
             if root_version == "1.2" else set()))
         if root_version == "1.0":
             data = upgrade_pdf_document_v1(data)
-        elif root_version not in {PDF_DOCUMENT_SCHEMA_VERSION, "1.2"}:
+        elif root_version not in {"1.1", PDF_DOCUMENT_SCHEMA_VERSION}:
             raise PdfContractError(
-                f"{context}.schema_version must be 1.0, {PDF_DOCUMENT_SCHEMA_VERSION}, or 1.2"
+                f"{context}.schema_version must be 1.0, 1.1, or {PDF_DOCUMENT_SCHEMA_VERSION}"
             )
         pages = [PdfPage.from_dict(_require_mapping(item, f"{context}.pages[{index}]")) for index, item in enumerate(_require_list(data, "pages", context))]
         page_count = _require_positive_int(data, "page_count", context)
@@ -1053,9 +1053,9 @@ def _require_schema_version(data: Mapping[str, Any], context: str) -> str:
 
 def _require_pdf_document_schema_version(data: Mapping[str, Any], context: str) -> str:
     value = _require_string(data, "schema_version", context)
-    if value != PDF_DOCUMENT_SCHEMA_VERSION:
+    if value != "1.1":
         raise PdfContractError(
-            f"{context}.schema_version must be {PDF_DOCUMENT_SCHEMA_VERSION}"
+            f"{context}.schema_version must be 1.1"
         )
     return value
 
@@ -1068,7 +1068,7 @@ def upgrade_pdf_document_v1(data: Mapping[str, Any]) -> dict[str, Any]:
     )
     blocks = _require_list(data, "blocks", context)
     upgraded = dict(data)
-    upgraded["schema_version"] = PDF_DOCUMENT_SCHEMA_VERSION
+    upgraded["schema_version"] = "1.1"
     upgraded["blocks"] = [
         {**dict(_require_mapping(block, f"{context}.blocks[{index}]")),
          "semantic_role": dict(block).get("semantic_role", "body"),

@@ -16,6 +16,25 @@ from web_translator.pdf_extract_transaction import extract_pdf_transaction
 Extractor = Callable[[Path, Path, Path, Path], object]
 
 
+def test_native_unit_transaction_preserves_published_extraction_on_retry(tmp_path):
+    from tests.pdf_unit_fixtures import make_native_flow_pdf
+    from web_translator.cli import main
+    source = make_native_flow_pdf(tmp_path / "입력 source.pdf")
+    run = tmp_path / ".web-translator" / "runs" / "단위 run"
+    run.mkdir(parents=True)
+    (tmp_path / "translated-pdfs").mkdir()
+    assert main(["pdf-acquire", str(source), "--run-dir", str(run)]) == 0
+    original = source.read_bytes()
+    assert main(["pdf-extract", "--run-dir", str(run)]) == 0
+    before = {name: (run / name).read_bytes() for name in ("source.pdf", "source.json", "document.json", "segments.jsonl")}
+    assert json.loads(before["document.json"])["extracted_schema_version"] == "1.2"
+    with pytest.raises(PdfExtractionError, match="exist"):
+        extract_pdf_transaction(run)
+    assert {name: (run / name).read_bytes() for name in before} == before
+    assert source.read_bytes() == original
+    assert not list(run.glob(".pdf-extracting-*"))
+
+
 def _acquired_run(tmp_path: Path) -> Path:
     source = make_text_pdf(tmp_path / "source.pdf")
     run_dir = tmp_path / "run"

@@ -168,6 +168,43 @@ if allocation or strict JSON parsing fails; do not guess either directory.
 
 ## Master workflow
 
+### Native logical-unit evidence
+
+Fresh `pdf-extract` writes `document.json` with both `schema_version` and
+`extracted_schema_version` equal to `1.2`. Legacy 1.0/1.1 documents remain readable
+for diagnostics; compatibility adaptation retains the old extraction origin.
+New assignments and publication require a fresh native 1.2 run, even when an old
+run has the same source-PDF hash and approved translations.
+
+Each `translation_units` entry owns an ordered `source_block_ids` list and one
+`segment_id`. The corresponding `Segment` contains the complete logical source
+for direct AI translation; its opaque locator is only the first physical member's
+representative locator. Use the unit map to inspect every member's unchanged text,
+page, geometry, and relationships. A paragraph crossing two source pages is one
+target and one translation record, with reversible join evidence in `joins`.
+
+Before planning or AI dispatch, inspect `flow_findings`. Any finding with
+`severity: "required"` blocks planning and assignment. Its boundary evidence needs
+an extraction-detector correction followed by fresh extraction in a new run;
+translation review does not clear it. Each unit is indivisible under the configured
+12,000-character budget. An oversized unit is refused with its unit ID, member IDs,
+measured length, and budget; retain that diagnostic and report the blocker.
+
+`prepare-assignments` publishes `assignments/.pdf-unit-binding.json`, binding the
+exact document, segments, zone, and assignment bytes. The semantic-review digest
+also binds `document.json`, `source.json`, and this binding. A changed unit map or
+binding invalidates prior approval; semantic review applies to the current exact
+inputs, not merely an unchanged source-PDF hash.
+
+The native final manifest uses schema 1.1. Its automated metrics distinguish
+`translated_block_count` (physical members) from `translation_unit_count` (logical
+targets). Each manifest `translation_units` entry records `unit_id`, `segment_id`,
+ordered `source_block_ids`, sorted unique `source_pages`, member-aligned
+`source_bboxes`, sorted unique `output_pages`, and
+`anchor_granularity: "paragraph-start"`. Member anchors identify the rendered
+paragraph's start; they do not claim separate output rectangles for fragments
+translated together.
+
 Run the following commands in this exact order. Substitute the completed zone ID for
 `zone-001` and run that per-zone command once for every zone:
 

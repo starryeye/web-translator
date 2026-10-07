@@ -17,6 +17,77 @@ def build_flow(case, *, scale=1.0):
     return blocks, pdf_units.build_translation_units(blocks, pages, boundaries)
 
 
+def _observed_edge_items(*, scale=1.0, x=530, labels=("Opaque alpha", "Unrelated beta"), problem=None):
+    """Real line grouping/ownership, with no footer vocabulary classification."""
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+    from web_translator.pdf_models import PdfPage
+    pages = [PdfPage(n, 612 * scale, 792 * scale, 0) for n in (1, 2)]
+    blocks, lines = [], {}
+    for page in pages:
+        rows = [(54, 72, 490, 11, "Substantive body continues"),
+                (54, 90, 490, 11, "with observed physical lines"),
+                (54, 108, 490, 11, "and a separate lower edge item.")]
+        if problem == "nearby-body":
+            rows.append((54, 715, 490, 11, "actual body overflow remains plausible"))
+        if not (problem == "absent-peer" and page.number == 2):
+            edge_x = x + (30 if problem == "misaligned-peer" and page.number == 2 else 0)
+            edge_size = 11 if problem == "same-size" else 9
+            rows.append((edge_x, 748, edge_x + (400 if problem == "full-width" else 28), edge_size, labels[page.number - 1]))
+            if problem == "multiline":
+                rows.append((edge_x, 761, edge_x + 28, edge_size, "second owned line"))
+        words = [dict(text=text, x0=a*scale, top=b*scale, x1=c*scale,
+                      bottom=(b+size)*scale, size=size*scale, fontname="ObservedFace",
+                      chars=[{"text": char} for char in text if not char.isspace()])
+                 for a, b, c, size, text in rows]
+        lines[page.number] = group_words_into_lines(words)
+        blocks.extend(build_text_blocks(lines[page.number], page.number))
+    blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
+    return blocks, pages, lines
+
+
+@pytest.mark.parametrize("scale", [0.6, 1.0, 1.8])
+@pytest.mark.parametrize("x,labels", [(54, ("Q-7", "R-8")), (290, ("North", "South")), (530, ("Page 1", "Page 2"))])
+def test_observed_isolated_edge_items_are_separate_targets(scale, x, labels):
+    blocks, pages, lines = _observed_edge_items(scale=scale, x=x, labels=labels)
+    before = [block.to_dict() for block in blocks]
+    assert hasattr(pdf_extract, "collect_owned_flow_lines")
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    edge = [block for block in blocks if block.source_text in labels]
+    assert len(edge) == 2 and all(len(owned[block.id]) == 1 for block in edge)
+    units, findings = pdf_units.build_translation_units(blocks, pages, {}, owned_lines=owned)
+    assert not findings
+    assert [unit.source_block_ids for unit in units] == [(block.id,) for block in blocks]
+    assert [block.to_dict() for block in blocks] == before
+
+
+@pytest.mark.parametrize("problem", ["nearby-body", "same-size", "absent-peer", "misaligned-peer", "multiline", "full-width", "missing-lines", "foreign-lines", "duplicate-lines", "wrong-text", "wrong-bbox", "duplicate-owner"])
+def test_unproven_edge_or_body_overflow_keeps_required_finding(problem):
+    blocks, pages, lines = _observed_edge_items(x=54, problem=problem)
+    edge = next(block for block in blocks if block.page_number == 1 and block.source_text.startswith("Opaque alpha"))
+    if problem == "duplicate-owner":
+        blocks.append(replace(edge, id="pdf:page-0001:block-0099", order=edge.order + 0.5))
+    assert hasattr(pdf_extract, "collect_owned_flow_lines")
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    if problem == "missing-lines":
+        owned.pop(edge.id)
+    elif problem == "foreign-lines":
+        owned[edge.id] = owned[blocks[0].id]
+    elif problem == "duplicate-lines":
+        owned[edge.id] *= 2
+    elif problem in {"wrong-text", "wrong-bbox"}:
+        line = owned[edge.id][0]
+        owned[edge.id] = (replace(line, **({"text": "not the source"} if problem == "wrong-text" else {"bbox": (0, 0, 28, 9)})),)
+    units, findings = pdf_units.build_translation_units(blocks, pages, {}, owned_lines=owned)
+    assert all(len(unit.source_block_ids) == 1 for unit in units)
+    assert findings and all(finding.severity == "required" for finding in findings)
+
+
+def test_missing_owned_lines_default_does_not_separate_edge_items():
+    blocks, pages, _ = _observed_edge_items()
+    _, findings = pdf_units.build_translation_units(blocks, pages, {})
+    assert len(findings) == 1 and findings[0].severity == "required"
+
+
 @pytest.mark.parametrize("scale", [0.75, 1.0, 1.7])
 def test_cross_page_discretionary_word_is_one_unit(scale):
     blocks, (units, findings) = build_flow("discretionary", scale=scale)

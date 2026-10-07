@@ -9,7 +9,7 @@ from typing import Literal, Mapping, Sequence
 from web_translator.models import Segment
 from web_translator.pdf_layout import _DISCRETIONARY_HYPHENS, split_list_marker
 from web_translator.pdf_models import (
-    PdfBlock, PdfBlockBoundary, PdfContractError, PdfDocument, PdfFlowFinding,
+    PdfBlock, PdfBlockBoundary, PdfBoundaryLine, PdfContractError, PdfDocument, PdfFlowFinding,
     PdfJoinEvidence, PdfPage, PdfTextJoin, PdfTranslationUnit,
 )
 from web_translator.protection import protect_fragment
@@ -129,9 +129,70 @@ def decide_page_join(
     ))
 
 
+def _isolated_repeated_edge_item(
+    left: PdfBlock, right: PdfBlock, blocks: Sequence[PdfBlock],
+    pages: Mapping[int, PdfPage], owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]],
+) -> bool:
+    """Prove separation, not furniture reclassification or a guessed frame.
+
+    A narrow, smaller, genuinely single-line item in the bottom tenth repeats
+    at the same normalized geometry/style on the next page. Four font heights
+    of whitespace from ALL other non-furniture content on BOTH pages rule out
+    nearby body overflow. Each threshold is conjunctive; absent proof refuses.
+    """
+    def evidence(block: PdfBlock) -> PdfBoundaryLine | None:
+        lines = owned_lines.get(block.id, ())
+        if (block.kind != "paragraph" or block.semantic_role != "body"
+                or block.destination or block.uri or len(lines) != 1):
+            return None
+        line = lines[0]
+        page = pages.get(block.page_number)
+        if (page is None or line.text != block.source_text or line.bbox != block.bbox
+                or line.font_size <= 0 or not line.font_family
+                or line.bbox[1] < page.height * 0.90
+                or line.bbox[2] - line.bbox[0] > page.width * 0.20
+                or line.bbox[3] - line.bbox[1] > line.font_size * 1.5):
+            return None
+        others = [other for other in blocks if other.page_number == block.page_number
+                  and other.id != block.id and other.kind not in {"header", "footer", "page-number"}]
+        if not others or any(other.bbox[3] > line.bbox[1] - 4 * line.font_size + 1e-9 for other in others):
+            return None
+        # A larger observed body line establishes that this is small edge text,
+        # not a repeated ordinary body paragraph in a sparse document.
+        if not any(other.kind == "paragraph" and other.semantic_role == "body"
+                   and any(member.font_size > line.font_size * 1.15
+                           and member.bbox[2] - member.bbox[0] > page.width * 0.40
+                           for member in owned_lines.get(other.id, ())) for other in others):
+            return None
+        return line
+
+    tail = evidence(left)
+    if tail is None or right.page_number not in pages:
+        return False
+    lp, rp = pages[left.page_number], pages[right.page_number]
+    for peer in blocks:
+        if peer.page_number != right.page_number or peer.style.bold != left.style.bold:
+            continue
+        line = evidence(peer)
+        if line is None or line.font_family.casefold() != tail.font_family.casefold():
+            continue
+        size = max(tail.font_size / lp.width, line.font_size / rp.width)
+        if abs(tail.font_size / lp.width - line.font_size / rp.width) > size * 0.15:
+            continue
+        # Quarter-em placement/width tolerance permits measurement rounding,
+        # not materially shifted text. Normalize each page independently.
+        if all(abs(a / ld - b / rd) <= size * 0.25 + 1e-9
+               for a, b, ld, rd in zip(tail.bbox, line.bbox,
+                                      (lp.width, lp.height, lp.width, lp.height),
+                                      (rp.width, rp.height, rp.width, rp.height))):
+            return True
+    return False
+
+
 def build_translation_units(
     blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
-    boundaries: Mapping[str, PdfBlockBoundary],
+    boundaries: Mapping[str, PdfBlockBoundary], *,
+    owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]] | None = None,
 ) -> tuple[list[PdfTranslationUnit], list[PdfFlowFinding]]:
     """Build unassigned logical ownership without modifying physical blocks."""
     ordered = sorted(blocks, key=lambda block: block.order)
@@ -145,6 +206,8 @@ def build_translation_units(
     findings: list[PdfFlowFinding] = []
     for left, right in zip(flow, flow[1:]):
         if not _flow_pair(left, right):
+            continue
+        if _isolated_repeated_edge_item(left, right, blocks, page_map, owned_lines or {}):
             continue
         if left.id not in boundaries or right.id not in boundaries:
             decision = _ambiguous(left, right, "missing provable boundary ownership or column frame")

@@ -75,12 +75,12 @@ def bound_unit_run(tmp_path):
     return run
 
 
-def test_native_origin_is_readable_without_activating_writer():
+def test_native_origin_is_current_and_readable():
     from web_translator.pdf_models import PDF_DOCUMENT_SCHEMA_VERSION
     payload = make_unit_document().to_dict()
     payload["extracted_schema_version"] = "1.2"
     assert PdfDocument.from_dict(payload).extracted_schema_version == "1.2"
-    assert PDF_DOCUMENT_SCHEMA_VERSION == "1.1"
+    assert PDF_DOCUMENT_SCHEMA_VERSION == "1.2"
 
 
 def test_binding_matches_exact_bytes_and_has_immutable_maps(bound_unit_run):

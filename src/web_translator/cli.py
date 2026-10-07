@@ -228,12 +228,10 @@ def _hold_command_pdf_units(args: argparse.Namespace, run_anchor: Any) -> Iterat
     try:
         with ExitStack() as stack:
             inputs = stack.enter_context(_hold_pdf_unit_inputs(run_anchor, directories))
-            # Explicit compatibility route until the extraction writer switches.
-            if inputs.document.schema_version == "1.2":
-                require_assignable_pdf(inputs.document)
-                args._pdf_unit_inputs = inputs
-                if args.command == "validate-translations":
-                    stack.enter_context(hold_pdf_unit_binding(run_anchor))
+            require_assignable_pdf(inputs.document)
+            args._pdf_unit_inputs = inputs
+            if args.command == "validate-translations":
+                stack.enter_context(hold_pdf_unit_binding(run_anchor))
             yield
     except (PdfUnitBindingError, PdfContractError) as error:
         raise CLIContractError(str(error)) from error
