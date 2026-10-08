@@ -425,6 +425,119 @@ def make_native_region_pdf(path, *, scale=1, margin=72, font="Helvetica",
     return path
 
 
+CONTEXT_PROSE = (
+    "An unrelated inventory records its ordinary sequence",
+    "while retaining independently selectable observations",
+    "before introducing the following measured descriptions",
+    "The first description preserves its complete source order",
+    "and retains all relationships for independent inspection",
+    "before reaching a separately measured conclusion.",
+    "A second description records another distinct observation",
+    "and keeps every qualification in its original sequence",
+    "until this independent description reaches its conclusion.",
+)
+CONTEXT_NOTE = ("* An ancillary observation accompanies the inventory",
+                "and preserves the complete selectable note.")
+
+
+def owned_context_records(*, margin=72, font="Helvetica", mixed=True, note=True,
+                          label="Variant label", spacing=18, label_first=False, problem=None):
+    """Invented grouped prose and real final-owner/raw-kind disagreement."""
+    records = [[(*row, "Courier" if row[4] == 10 else font)
+                for row in page] for page in region_source_lines(margin=margin)]
+    if mixed:
+        style = "Times-Italic" if font == "Times-Roman" else "Helvetica-Oblique"
+        prose = iter(CONTEXT_PROSE)
+        middle = []
+        for index in range(11):
+            styled = index in {3, 7}
+            top = 300 + index * spacing + (2 if index >= 4 else 0) + (2 if index >= 8 else 0)
+            middle.append((label if styled else next(prose),
+                           margin + (36 if index < 4 or styled else 54), top,
+                           margin + (132 if styled else 300), 12, style if styled else font))
+        if label_first:
+            middle = [(text, x0, top - 3 * spacing, x1, size, own_font)
+                      for text, x0, top, x1, size, own_font in middle[3:]]
+        if problem == "irregular-run":
+            text, x0, top, x1, size, own_font = middle[5]
+            middle[5] = (text, x0, top + 4, x1, size, own_font)
+        if problem == "broad-label":
+            middle[3] = (*middle[3][:3], margin + 300, *middle[3][4:])
+        if problem == "mixed-columns":
+            middle = [(text, margin + (240 if index >= 7 else 36), top,
+                       margin + (420 if index >= 7 else 198), size, own_font)
+                      for index, (text, x0, top, x1, size, own_font) in enumerate(middle)]
+        if problem == "incompatible-prose":
+            middle = [(*row[:5], "Courier" if 4 <= index <= 6 else row[5])
+                      for index, row in enumerate(middle)]
+        records[1][4:8] = middle
+        if problem == "insufficient-anchors":
+            records[1][-2:] = [(text, x0, top, x1 - 60, size, own_font)
+                              for text, x0, top, x1, size, own_font in records[1][-2:]]
+    if note:
+        row = records[1][4]
+        records[1][4] = (row[0] + " *", *row[1:])
+        records[1].extend((text, margin, 746 + index * 12, margin + 250, 8, font)
+                          for index, text in enumerate(CONTEXT_NOTE))
+    return records
+
+
+def _context_record_words(row, scale):
+    text, x0, top, x1, size, font = row
+    parts = [(text, x0, x1, size)]
+    if text.endswith(" *"):
+        parts = [(text[:-2], x0, x1 - 12, size), ("*", x1 - 8, x1, 8)]
+    elif text.startswith("1. "):
+        parts = [("1.", x0, x0 + 28, size), (text[3:], x0 + 36, x1, size)]
+    return [dict(text=value, x0=left * scale, x1=right * scale, top=top * scale,
+                 bottom=(top + own_size) * scale, size=own_size * scale, fontname=font,
+                 chars=[dict(text=c, x0=left * scale, x1=right * scale,
+                             top=top * scale, bottom=(top + own_size) * scale,
+                             size=own_size * scale) for c in value if not c.isspace()])
+            for value, left, right, own_size in parts]
+
+
+def make_observed_owned_context(*, scale=1, margin=72, font="Helvetica", mixed=True,
+                               note=True, label="Variant label", spacing=18, label_first=False):
+    from web_translator.pdf_layout import (
+        build_text_blocks, classify_document_lines, classify_semantic_roles,
+        detect_footnotes, group_words_into_lines, order_page_lines,
+    )
+    pages = [PdfPage(n, 612 * scale, 792 * scale, 0) for n in (1, 2)]
+    words = [[word for row in page for word in _context_record_words(row, scale)]
+             for page in owned_context_records(margin=margin, font=font, mixed=mixed,
+                                                note=note, label=label, spacing=spacing,
+                                                label_first=label_first)]
+    classified = classify_semantic_roles(classify_document_lines([
+        (group_words_into_lines(page_words), page.height)
+        for page_words, page in zip(words, pages)]))
+    blocks, lines = [], {}
+    for page, members, page_words in zip(pages, classified, words):
+        lines[page.number] = order_page_lines(members, page.width)
+        blocks.extend(detect_footnotes(build_text_blocks(lines[page.number], page.number),
+                                      [c for word in page_words for c in word["chars"]],
+                                      page_height=page.height))
+    return [replace(block, order=index) for index, block in enumerate(blocks)], pages, lines
+
+
+def make_native_owned_context_pdf(path, *, scale=1, **kwargs):
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    canvas = Canvas(str(path), pagesize=(612 * scale, 792 * scale), invariant=1)
+    for page in owned_context_records(**kwargs):
+        for row in page:
+            for word in _context_record_words(row, 1):
+                font, size, text = word["fontname"], word["size"], word["text"]
+                obj = canvas.beginText(word["x0"] * scale, (792 - word["top"] - size * .793) * scale)
+                obj.setFont(font, size * scale)
+                obj.setHorizScale((word["x1"] - word["x0"]) / stringWidth(text, font, size) * 100)
+                obj.textLine(text)
+                canvas.drawText(obj)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
 def make_observed_terminal_paragraphs(*, scale=1.0, margin=72, font="ObservedFace",
                                       texts=TERMINAL_PARAGRAPHS, problem=None):
     """Invented justified prose through grouping/classification/order/ownership."""

@@ -113,6 +113,79 @@ def test_native_owned_paragraph_region_writes_one_complete_continuation(tmp_path
         {key: value for key, value in b.items() if key != "segment_id"} for b in physical_before]
 
 
+@pytest.mark.parametrize("scale", [.7, 1.4])
+@pytest.mark.parametrize("margin", [48, 90])
+@pytest.mark.parametrize("font", ["Helvetica", "Times-Roman"])
+@pytest.mark.parametrize("label", ["Unknown label", "Other description"])
+@pytest.mark.parametrize("spacing", [18, 19])
+@pytest.mark.parametrize("label_first", [False, True])
+def test_native_final_owner_mixed_context_writes_complete_target(
+        tmp_path, monkeypatch, scale, margin, font, label, spacing, label_first):
+    # Loss of either proof must surface as a required native writer finding.
+    from tests.pdf_unit_fixtures import make_native_owned_context_pdf, CONTEXT_PROSE, CONTEXT_NOTE
+    from web_translator import pdf_extract
+    from web_translator.pdf_unit_bindings import require_assignable_pdf
+    from web_translator.pdf_units import project_unit_text
+    from web_translator.protection import restore_tokens
+    physical = []
+    observed = {}
+    collector = pdf_extract.collect_flow_boundaries
+    def record(blocks, pages, lines, **kwargs):
+        physical.extend(block.to_dict() for block in blocks)
+        observed.update(lines)
+        return collector(blocks, pages, lines, **kwargs)
+    monkeypatch.setattr(pdf_extract, "collect_flow_boundaries", record)
+    source = make_native_owned_context_pdf(tmp_path / "source.pdf", scale=scale, margin=margin,
+                                          font=font, label=label, spacing=spacing, label_first=label_first)
+    document = pdf_extract.extract_pdf(source, tmp_path / "document.json",
+                                      tmp_path / "segments.jsonl", tmp_path / "media")
+    assert len(document.blocks) == 8
+    middle = [*CONTEXT_PROSE[:3], label, *CONTEXT_PROSE[3:6], label, *CONTEXT_PROSE[6:]]
+    if label_first:
+        middle = middle[3:]
+    middle[0] += " *"
+    assert document.blocks[5].source_text == " ".join(middle)
+    assert document.blocks[5].destination == "pdf:page-0002:block-0004"
+    assert document.blocks[-1].kind == "footnote"
+    assert document.blocks[-1].source_text == " ".join(CONTEXT_NOTE)
+    assert [line.kind for line in observed[2][-2:]] == ["list-item", "paragraph"]
+    owned = pdf_extract.collect_owned_flow_lines(document.blocks, document.pages, observed)
+    assert len(owned[document.blocks[5].id]) == (8 if label_first else 11)
+    assert len({line.font_family for line in owned[document.blocks[5].id]}) == 2
+    assert not document.flow_findings
+    assert [unit.source_block_ids for unit in document.translation_units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0001:block-0002",),
+        ("pdf:page-0001:block-0003",),
+        ("pdf:page-0001:block-0004", "pdf:page-0002:block-0001"),
+        ("pdf:page-0002:block-0002",), ("pdf:page-0002:block-0003",), ("pdf:page-0002:block-0004",)]
+    expected = (
+        "A later account begins with independently measured evidence "
+        "and records every qualification in its original order "
+        "while the account continues across the physical boundary "
+        "without losing the relationship between its source parts "
+        "or assigning separate translations to incomplete clauses "
+        "until the entire account reaches its conclusion Finished.")
+    units = document.translation_units
+    assert units[3].joins[0].operation == "space"
+    assert units[3].joins[0].evidence.right.column_bbox == pytest.approx(
+        (margin * scale, document.blocks[4].bbox[1], (margin + 420) * scale, document.blocks[6].bbox[3]))
+    projection = project_unit_text(units[3], {block.id: block for block in document.blocks})
+    assert projection.text == expected
+    assert [(span.block_id, span.source_start, span.source_end, span.unit_start, span.unit_end)
+            for span in projection.spans] == [
+        ("pdf:page-0001:block-0004", 0, 170, 0, 170),
+        ("pdf:page-0001:block-0004", 170, 170, 170, 171),
+        ("pdf:page-0002:block-0001", 0, 171, 171, 342)]
+    segments = read_segments(tmp_path / "segments.jsonl")
+    assert [restore_tokens(segment.source_text, segment.protected) for segment in segments] == [
+        document.blocks[0].source_text, document.blocks[1].source_text, document.blocks[2].source_text,
+        expected, " ".join(middle), document.blocks[6].source_text, " ".join(CONTEXT_NOTE)]
+    assert [bid for unit in units for bid in unit.source_block_ids] == [block.id for block in document.blocks]
+    assert [{k: v for k, v in block.to_dict().items() if k != "segment_id"} for block in document.blocks] == [
+        {k: v for k, v in block.items() if k != "segment_id"} for block in physical]
+    require_assignable_pdf(document)
+
+
 @pytest.mark.parametrize("problem", ["competing", "half-width", "uncertain-majority"])
 @pytest.mark.parametrize("scale,margin,font", [(.7, 48, "Helvetica"), (1.5, 90, "Times-Roman")])
 def test_native_paragraph_region_keeps_competing_flow_assignment_blocked(tmp_path, problem, scale, margin, font):
@@ -123,6 +196,24 @@ def test_native_paragraph_region_keeps_competing_flow_assignment_blocked(tmp_pat
     document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
     assert document.flow_findings and all(f.severity == "required" for f in document.flow_findings)
     assert all(len(u.source_block_ids) == 1 and not u.joins for u in document.translation_units)
+    with pytest.raises(PdfUnitBindingError, match="flow findings"):
+        require_assignable_pdf(document)
+
+
+@pytest.mark.parametrize("problem", [
+    "irregular-run", "broad-label", "mixed-columns", "incompatible-prose", "insufficient-anchors",
+])
+@pytest.mark.parametrize("scale,font", [(.8, "Times-Roman"), (1.3, "Helvetica")])
+def test_native_mixed_context_keeps_required_planning_refusal(tmp_path, problem, scale, font):
+    from tests.pdf_unit_fixtures import make_native_owned_context_pdf
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_unit_bindings import require_assignable_pdf, PdfUnitBindingError
+    source = make_native_owned_context_pdf(tmp_path / "source.pdf", problem=problem, scale=scale, font=font)
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert document.flow_findings and all(f.severity == "required" for f in document.flow_findings)
+    assert all(len(unit.source_block_ids) == 1 and not unit.joins for unit in document.translation_units)
+    assert [bid for unit in document.translation_units for bid in unit.source_block_ids] == [
+        block.id for block in document.blocks]
     with pytest.raises(PdfUnitBindingError, match="flow findings"):
         require_assignable_pdf(document)
 

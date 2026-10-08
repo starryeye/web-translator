@@ -11,6 +11,210 @@ from web_translator.pdf_units import project_unit_text, unit_for_block, validate
 from web_translator import pdf_units
 
 
+@pytest.mark.parametrize("mixed,note", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("scale", [.7, 1.4])
+@pytest.mark.parametrize("margin", [48, 90])
+@pytest.mark.parametrize("font", ["Helvetica", "Times-Roman"])
+@pytest.mark.parametrize("label", ["Opaque heading", "Alternate caption"])
+@pytest.mark.parametrize("spacing", [18, 19])
+@pytest.mark.parametrize("label_first", [False, True])
+def test_final_owner_and_sequential_context_preserve_complete_continuation(
+        mixed, note, scale, margin, font, label, spacing, label_first):
+    # Removing either proof loses the complete target; raw-kind exclusion or
+    # blanket typography relaxation would break the negative controls below.
+    from tests.pdf_unit_fixtures import make_observed_owned_context, CONTEXT_PROSE, CONTEXT_NOTE
+    blocks, pages, lines = make_observed_owned_context(
+        mixed=mixed, note=note, scale=scale, margin=margin, font=font, label=label,
+        spacing=spacing, label_first=label_first)
+    before = [block.to_dict() for block in blocks]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    context = blocks[5]
+    if mixed:
+        expected = [*CONTEXT_PROSE[:3], label, *CONTEXT_PROSE[3:6], label, *CONTEXT_PROSE[6:]]
+        if label_first:
+            expected = expected[3:]
+        expected[0] += " *" if note else ""
+        assert context.source_text == " ".join(expected)
+        assert len(owned[context.id]) == (8 if label_first else 11)
+        assert len({line.font_family for line in owned[context.id]}) == 2
+    if note:
+        structural = blocks[-1]
+        assert structural.kind == "footnote" and structural.id not in owned
+        assert context.destination == "pdf:page-0002:block-0004"
+        assert structural.source_text == " ".join(CONTEXT_NOTE)
+        assert [line.kind for line in lines[2][-2:]] == ["list-item", "paragraph"]
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert set(boundaries) == {block.id for block in blocks if block.kind != "footnote"}
+    assert boundaries[context.id].column_bbox == pytest.approx(
+        (margin * scale, 72 * scale, (margin + 420) * scale, 720 * scale))
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert not findings
+    expected_ids = [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0001:block-0002",),
+        ("pdf:page-0001:block-0003",),
+        ("pdf:page-0001:block-0004", "pdf:page-0002:block-0001"),
+        ("pdf:page-0002:block-0002",), ("pdf:page-0002:block-0003",),
+    ]
+    if note:
+        expected_ids.append(("pdf:page-0002:block-0004",))
+    assert [unit.source_block_ids for unit in units] == expected_ids
+    projected = project_unit_text(units[3], {block.id: block for block in blocks})
+    assert projected.text == (
+        "A later account begins with independently measured evidence "
+        "and records every qualification in its original order "
+        "while the account continues across the physical boundary "
+        "without losing the relationship between its source parts "
+        "or assigning separate translations to incomplete clauses "
+        "until the entire account reaches its conclusion Finished.")
+    assert [bid for unit in units for bid in unit.source_block_ids] == [block.id for block in blocks]
+    assert units[3].joins[0].operation == "space"
+    assert units[3].joins[0].evidence.left.last_line.text == "while the account continues across the physical boundary"
+    assert units[3].joins[0].evidence.right.first_line.text == "without losing the relationship between its source parts"
+    assert [(span.block_id, span.source_start, span.source_end, span.unit_start, span.unit_end)
+            for span in projected.spans] == [
+        ("pdf:page-0001:block-0004", 0, 170, 0, 170),
+        ("pdf:page-0001:block-0004", 170, 170, 170, 171),
+        ("pdf:page-0002:block-0001", 0, 171, 171, 342)]
+    for span in projected.spans:
+        if span.source_start == span.source_end:
+            assert projected.text[span.unit_start:span.unit_end] == " "
+            continue
+        assert projected.text[span.unit_start:span.unit_end] == next(
+            block.source_text[span.source_start:span.source_end]
+            for block in blocks if block.id == span.block_id)
+    assert [block.to_dict() for block in blocks] == before
+
+
+@pytest.mark.parametrize("problem", [
+    "incomplete-source", "wrong-source", "inflated-bbox", "missing-line", "duplicate-line",
+    "unowned", "competing-owner", "duplicate-owner", "borrowed-tuple", "unknown-body",
+    "duplicate-canonical-lines", "overlapping-members",
+])
+def test_structural_exclusion_needs_actual_complete_unique_owner(problem):
+    # Excluding by raw kind, containing bbox or ID alone would emit a frame.
+    from tests.pdf_unit_fixtures import make_observed_owned_context
+    from web_translator.pdf_layout import group_words_into_lines
+    blocks, pages, lines = make_observed_owned_context(mixed=False)
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    note = blocks[-1]
+    if problem == "incomplete-source":
+        blocks[-1] = replace(note, source_text=lines[2][-2].text)
+    elif problem == "wrong-source":
+        blocks[-1] = replace(note, source_text="Another ancillary observation.")
+    elif problem == "inflated-bbox":
+        blocks[-1] = replace(note, bbox=(note.bbox[0] - 5, *note.bbox[1:]))
+    elif problem == "missing-line":
+        lines[2].pop()
+    elif problem == "duplicate-line":
+        lines[2].append(lines[2][-1])
+    elif problem == "duplicate-canonical-lines":
+        lines[2].append(lines[2][-1])
+        blocks[-1] = replace(note, source_text=note.source_text + " " + lines[2][-1].text)
+    elif problem == "overlapping-members":
+        line = lines[2][-1]
+        lines[2][-1] = replace(line, words=tuple(replace(
+            word, top=word.top - 10, bottom=word.bottom - 10) for word in line.words))
+        blocks[-1] = replace(note, bbox=(*note.bbox[:3], note.bbox[3] - 10))
+    elif problem == "unowned":
+        blocks[-1] = replace(note, bbox=(note.bbox[0] + 5, *note.bbox[1:]))
+    elif problem == "competing-owner":
+        blocks.append(replace(note, id="competing-note-owner", order=8))
+    elif problem == "duplicate-owner":
+        blocks.append(note)
+    elif problem == "borrowed-tuple":
+        owned[note.id] = owned[blocks[6].id]
+    else:
+        lines[2].extend(group_words_into_lines([dict(
+            text="Unattached observed body evidence", x0=10, x1=280, top=540, bottom=552,
+            size=12, fontname="Helvetica", chars=[{"text": c} for c in "Unattached evidence"])]))
+    before = [block.to_dict() for block in blocks]
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert not any(block.id in boundaries for block in blocks if block.page_number == 2)
+    # Duplicate owner IDs are separately invalid physical input; the producer
+    # still must fail closed without manufacturing a frame.
+    if problem != "duplicate-owner":
+        units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+        assert findings and all(f.severity == "required" for f in findings)
+        assert all(len(unit.source_block_ids) == 1 and not unit.joins for unit in units)
+    assert [block.to_dict() for block in blocks] == before
+
+
+@pytest.mark.parametrize("problem", [
+    "irregular-run", "same-font-gap", "unknown-font", "broad-label", "off-margin-label",
+    "terminal-label", "incompatible-prose", "incompatible-prose-pitch", "single-prose-line",
+    "unproved-gap", "overlap", "same-row",
+    "reordered", "interleaved", "narrow-prose", "sparse-columns", "mixed-columns",
+    "insufficient-anchors", "incompatible-anchors",
+])
+def test_mixed_nonanchor_context_cannot_authorize_unproved_flow(problem):
+    # Blanket font/pitch waivers or promoting a split run to an anchor would
+    # turn these into accepted frames and unsafe cross-page targets.
+    from tests.pdf_unit_fixtures import make_observed_owned_context
+    from web_translator.pdf_layout import build_text_blocks
+    blocks, pages, lines = make_observed_owned_context(note=False)
+    page_lines = lines[2]
+    def change(index, *, top=None, x0=None, x1=None, font=None):
+        line = page_lines[index]
+        delta = 0 if top is None else top - line.top
+        page_lines[index] = replace(line, words=tuple(replace(
+            word, top=word.top + delta, bottom=word.bottom + delta,
+            x0=word.x0 if x0 is None else x0, x1=word.x1 if x1 is None else x1,
+            fontname=word.fontname if font is None else font) for word in line.words))
+    if problem == "irregular-run":
+        change(9, top=page_lines[9].top + 4)
+    elif problem == "same-font-gap":
+        for index in (7, 11):
+            change(index, font="Helvetica")
+    elif problem == "unknown-font":
+        change(7, font="")
+    elif problem == "broad-label":
+        change(7, x1=372)
+    elif problem == "off-margin-label":
+        change(7, x0=126)
+    elif problem == "terminal-label":
+        change(14, font="Helvetica-Oblique", x1=204)
+    elif problem == "incompatible-prose":
+        for index in (8, 9, 10):
+            change(index, font="OtherObservedFont")
+    elif problem == "incompatible-prose-pitch":
+        change(9, top=page_lines[9].top + 4)
+        change(10, top=page_lines[10].top + 8)
+    elif problem == "single-prose-line":
+        del page_lines[9:11]
+    elif problem == "unproved-gap":
+        for index in range(8, 15):
+            change(index, top=page_lines[index].top + 40)
+    elif problem in {"overlap", "same-row"}:
+        change(8, top=page_lines[7].top + (6 if problem == "overlap" else 0))
+    elif problem == "reordered":
+        page_lines[8:11] = reversed(page_lines[8:11])
+    elif problem == "interleaved":
+        page_lines[8], page_lines[12] = page_lines[12], page_lines[8]
+    elif problem in {"narrow-prose", "sparse-columns", "mixed-columns"}:
+        for index in range(4, 15):
+            if problem == "narrow-prose" and index in {7, 11}:
+                continue
+            right = problem == "mixed-columns" and index >= 11
+            change(index, x0=312 if right else 108, x1=492 if right else 270)
+    elif problem == "insufficient-anchors":
+        change(16, x1=400)
+        change(17, x1=400)
+    else:
+        for index in (15, 16, 17):
+            change(index, font="DifferentAnchorFace")
+    # Real grouping is re-run, not a manufactured split or manual physical
+    # paragraph held together after impossible geometry changes.
+    page_blocks = build_text_blocks(page_lines, 2)
+    blocks = [*blocks[:4], *page_blocks]
+    blocks = [replace(block, order=index) for index, block in enumerate(blocks)]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert not any(block.id in boundaries for block in blocks if block.page_number == 2)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert findings and all(f.severity == "required" for f in findings)
+    assert all(len(unit.source_block_ids) == 1 and not unit.joins for unit in units)
+
+
 @pytest.mark.parametrize("scale", [.6, 1, 1.8])
 @pytest.mark.parametrize("margin", [48, 90])
 @pytest.mark.parametrize("font", ["OpaqueSerif", "UnrelatedSans"])

@@ -150,6 +150,68 @@ def collect_owned_flow_lines(
     return result
 
 
+def _same_flow_typography(line: PdfLine, reference: PdfLine) -> bool:
+    return (bool(_flow_font(line)) and _flow_font(line) == _flow_font(reference)
+            and abs(line.size - reference.size) <= reference.size * .15 + 1e-9
+            and line.bold == reference.bold)
+
+
+def _regular_flow_pitch(members: Sequence[PdfLine]) -> float | None:
+    intervals = [b.top - a.top for a, b in zip(members, members[1:])]
+    if not intervals:
+        return None
+    pitch = min(intervals)
+    if any(abs(interval - pitch) > max(a.size, b.size) * .15 + 1e-9
+           for a, b, interval in zip(members, members[1:], intervals)):
+        return None
+    return pitch
+
+
+def _central_flow_span(members: Sequence[PdfLine], width: float, middle: float) -> bool:
+    x0, x1 = min(line.x0 for line in members), max(line.x1 for line in members)
+    size = max(line.size for line in members)
+    return (x0 <= middle <= x1 and x1 - x0 > width * .5 + size * .25 + 1e-9
+            and x1 - x0 >= size * 4)
+
+
+def _sequential_nonanchor_context(
+    members: Sequence[PdfLine], reference: PdfLine, pitch: float, width: float, middle: float,
+) -> bool:
+    """Associate short styled labels with independently calibrated prose.
+
+    Runs split only on observed typography, never convenient spacing. The
+    caller checks every adjacency/order and whole-fragment central clearance.
+    Mixed runs cannot supply anchors or replace observed frame extrema.
+    """
+    runs: list[list[PdfLine]] = []
+    for line in members:
+        if not runs or not _same_flow_typography(line, runs[-1][0]):
+            runs.append([line])
+        else:
+            runs[-1].append(line)
+    if len(runs) < 2:
+        return False
+    margin = min(line.x0 for line in members)
+    for index, run in enumerate(runs):
+        first = run[0]
+        if len(run) == 1:
+            # A singleton is not typography/pitch calibration. Its short span
+            # and measured hanging margin must associate it with following
+            # substantial prose, not an arbitrary broad style change.
+            if (_same_flow_typography(first, reference) or not _flow_font(first)
+                    or first.width >= width * .5
+                    or abs(first.x0 - margin) > first.size * .25 + 1e-9
+                    or index + 1 == len(runs) or len(runs[index + 1]) < 2):
+                return False
+        else:
+            value = _regular_flow_pitch(run)
+            if (not _same_flow_typography(first, reference) or value is None
+                    or abs(value - pitch) > max(first.size, reference.size) * .15 + 1e-9
+                    or not _central_flow_span(run, width, middle)):
+                return False
+    return True
+
+
 def _paragraph_owned_single_region(
     page_blocks: Sequence[PdfBlock], lines: Sequence[PdfLine],
     proven: Mapping[str, Sequence[PdfLine]], edge_ids: set[str],
@@ -169,8 +231,35 @@ def _paragraph_owned_single_region(
     context = [line for block in fragments for line in proven[block.id]]
     # No unavailable body line may disappear merely because a block failed
     # reconstruction. Furniture and structural content are not calibration.
+    # Raw classification precedes final structural grouping (notably notes).
+    # Exclude only a complete measured actual owner, never a containing box or
+    # a supplied ownership tuple by itself. Ambiguous members poison its proof.
+    actual: dict[str, list[PdfLine]] = {block.id: [] for block in page_blocks}
+    ambiguous: set[str] = set()
+    for line in lines:
+        owners = [block for block in page_blocks
+                  if _bbox_inside((line.x0, line.top, line.x1, line.bottom), block.bbox)]
+        if len(owners) == 1:
+            actual[owners[0].id].append(line)
+        else:
+            ambiguous.update(block.id for block in owners)
+    structural: set[PdfLine] = set()
+    for block in page_blocks:
+        members = actual[block.id]
+        if (block.id in ambiguous or not members
+                or len(set(members)) != len(members)
+                or any(b.top <= a.top or b.top < a.bottom - 1e-9
+                       for a, b in zip(members, members[1:]))
+                or (block.kind in {"paragraph", "list-item"} and block.semantic_role == "body")
+                or _block_source_text(members) != block.source_text):
+            continue
+        envelope = (min(line.x0 for line in members), min(line.top for line in members),
+                    max(line.x1 for line in members), max(line.bottom for line in members))
+        if all(abs(a - b) <= 1e-7 for a, b in zip(envelope, block.bbox)):
+            structural.update(members)
     observed = [line for line in lines if line.kind in {None, "paragraph", "list-item"}
                 and line.semantic_role == "body"
+                and line not in structural
                 and not any(_bbox_inside((line.x0, line.top, line.x1, line.bottom), block.bbox)
                             for block in page_blocks if block.id in edge_ids)]
     if Counter(context) != Counter(observed) or len(set(context)) != len(context):
@@ -178,6 +267,7 @@ def _paragraph_owned_single_region(
     left, right = min(line.x0 for line in context), max(line.x1 for line in context)
     width, middle = right - left, (left + right) / 2
     anchors: list[tuple[PdfLine, float]] = []
+    mixed: list[Sequence[PdfLine]] = []
     previous: PdfLine | None = None
     for block in fragments:
         members = proven[block.id]
@@ -186,22 +276,21 @@ def _paragraph_owned_single_region(
                                     or first.vertical_overlap_ratio(previous) >= _VERTICAL_OVERLAP):
             return False
         previous = last
-        size, font = first.size, _flow_font(first)
-        if any(_flow_font(line) != font or abs(line.size - size) > size * .15 + 1e-9
-               or line.bold != first.bold for line in members):
-            return False
         # A narrow independent column is not an inset body fragment, even when
         # wide spanning paragraphs happen to overlap its bounding envelope.
-        x0, x1 = min(line.x0 for line in members), max(line.x1 for line in members)
         # A majority inside edge-measurement uncertainty is not positive proof.
-        if not (x0 <= middle <= x1 and x1 - x0 > width * .5 + size * .25 + 1e-9
-                and x1 - x0 >= size * 4):
+        if not _central_flow_span(members, width, middle):
             return False
         intervals = [b.top - a.top for a, b in zip(members, members[1:])]
-        pitch = min(intervals) if intervals else None
-        if any(b.top < a.bottom - 1e-9 or not _paragraphs_are_contiguous(a, b)
-               or abs(interval - pitch) > max(a.size, b.size) * .15 + 1e-9
-               for a, b, interval in zip(members, members[1:], intervals)):
+        if any(b.top <= a.top or b.top < a.bottom - 1e-9
+               or not _paragraphs_are_contiguous(a, b)
+               for a, b in zip(members, members[1:])):
+            return False
+        if any(not _same_flow_typography(line, first) for line in members):
+            mixed.append(members)
+            continue
+        pitch = _regular_flow_pitch(members)
+        if intervals and pitch is None:
             return False
         full = [abs(line.x0 - left) <= line.size * .25 + 1e-9
                 and abs(line.x1 - right) <= line.size * .25 + 1e-9 for line in members]
@@ -213,10 +302,11 @@ def _paragraph_owned_single_region(
     if len(anchors) < 2:
         return False
     reference, pitch = anchors[0]
-    return all(_flow_font(line) == _flow_font(reference)
-               and abs(line.size - reference.size) <= reference.size * .15 + 1e-9
-               and abs(value - pitch) <= max(line.size, reference.size) * .15 + 1e-9
-               for line, value in anchors[1:])
+    return (all(_same_flow_typography(line, reference)
+                and abs(value - pitch) <= max(line.size, reference.size) * .15 + 1e-9
+                for line, value in anchors[1:])
+            and all(_sequential_nonanchor_context(members, reference, pitch, width, middle)
+                    for members in mixed))
 
 
 def collect_flow_boundaries(
