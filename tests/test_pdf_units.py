@@ -133,6 +133,52 @@ def test_paragraph_region_requires_canonical_complete_unique_ownership(problem):
     assert all(len(u.source_block_ids) == 1 for u in units)
 
 
+@pytest.mark.parametrize("kind,role", [
+    ("heading", "body"), ("paragraph", "callout-body"),
+    ("paragraph", "reference-entry"), ("footnote", "body"), ("header", "body"),
+])
+@pytest.mark.parametrize("evidence", ["borrowed", "observed"])
+def test_paragraph_region_rejects_known_noncanonical_contributing_owner(kind, role, evidence):
+    # Checking only body owners lets a known structural owner contaminate the
+    # emitted frame, although neither canonical ownership nor region proves it.
+    from tests.pdf_unit_fixtures import make_observed_region_flow
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines, find_clear_gutter
+    blocks, pages, lines = make_observed_region_flow()
+    original = [b.to_dict() for b in blocks]
+    structural = replace(group_words_into_lines([dict(
+        text="An independently observed structural label", x0=5, top=10, x1=580, bottom=22,
+        size=12, fontname="OpaqueStructuralFace",
+        chars=[{"text": c} for c in "Anindependentlyobservedstructurallabel"],
+    )])[0], kind=kind, semantic_role=role)
+    owner = replace(build_text_blocks([structural], 2)[0], id="known-structural-owner", order=3.5)
+    assert owner.kind == kind and owner.semantic_role == role
+    blocks.insert(4, owner)
+    lines[2] = [structural, *lines[2]]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    assert owner.id not in owned
+    assert set(owned) == {b["id"] for b in original}
+    if evidence == "borrowed":
+        owned[owner.id] = owned["pdf:page-0002:block-0001"]
+    else:
+        owned[owner.id] = (pdf_extract._boundary_line(structural),)
+    observed_context = [line for line in lines[2] if evidence == "observed" or line is not structural]
+    assert find_clear_gutter(observed_context, pages[1].width) is None
+    assert max(l.x0 for l in observed_context) > min(l.x1 for l in observed_context)
+    before = [b.to_dict() for b in blocks]
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert not any(b.id in boundaries for b in blocks if b.page_number == 2)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert all(len(u.source_block_ids) == 1 and not u.joins for u in units)
+    if kind == "header":
+        # Furniture is excluded from candidate flow, so the original page pair
+        # must retain required refusal instead of a falsely proved join/frame.
+        assert [(f.left_block_id, f.right_block_id, f.severity) for f in findings] == [
+            ("pdf:page-0001:block-0004", "pdf:page-0002:block-0001", "required")]
+    else:
+        assert not findings  # Declared structure independently blocks adjacency.
+    assert [b.to_dict() for b in blocks] == before
+
+
 @pytest.mark.parametrize("scale,margin,font", [(0.6, 48, "OpaqueSerif"), (1, 72, "ObservedFace"), (1.8, 90, "UnrelatedSans")])
 def test_observed_justified_terminal_paragraphs_are_independent(scale, margin, font):
     # Missing terminal-layout proof must leave the real producer's required finding.

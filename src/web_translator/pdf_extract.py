@@ -262,6 +262,9 @@ def collect_flow_boundaries(
                         or not set(owned_lines).issubset({block.id for block in blocks})
                         or any(block.id not in canonical
                                or owned_lines.get(block.id) != canonical[block.id] for block in relevant)
+                        # Every contributor to the outer frame must pass the
+                        # same ownership proof, not only helper body fragments.
+                        or any(owned_lines[key] != canonical.get(key) for key in proven)
                         or not _paragraph_owned_single_region(page_blocks, lines, proven, edge_ids)):
                     continue
             columns = [context]
