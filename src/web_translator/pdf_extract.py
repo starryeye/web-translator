@@ -49,6 +49,7 @@ from web_translator.pdf_layout import (
     split_list_marker,
     _block_source_text,
     _paragraphs_are_contiguous,
+    _VERTICAL_OVERLAP,
 )
 from web_translator.pdf_media import (
     FigureRegion,
@@ -149,6 +150,75 @@ def collect_owned_flow_lines(
     return result
 
 
+def _paragraph_owned_single_region(
+    page_blocks: Sequence[PdfBlock], lines: Sequence[PdfLine],
+    proven: Mapping[str, Sequence[PdfLine]], edge_ids: set[str],
+) -> bool:
+    """Prove one region from independent full-span owned paragraph anchors.
+
+    The caller first rechecks canonical ownership. Short tails, hanging lists
+    and inset typography can be context, never calibration by envelope overlap
+    alone. Every fragment must occupy a substantial central part of the region
+    and follow a single noninterleaved observed line flow.
+    """
+    fragments = sorted((block for block in page_blocks if block.id not in edge_ids
+                        and block.kind in {"paragraph", "list-item"}
+                        and block.semantic_role == "body"), key=lambda block: block.order)
+    if len(fragments) < 2 or any(block.id not in proven for block in fragments):
+        return False
+    context = [line for block in fragments for line in proven[block.id]]
+    # No unavailable body line may disappear merely because a block failed
+    # reconstruction. Furniture and structural content are not calibration.
+    observed = [line for line in lines if line.kind in {None, "paragraph", "list-item"}
+                and line.semantic_role == "body"
+                and not any(_bbox_inside((line.x0, line.top, line.x1, line.bottom), block.bbox)
+                            for block in page_blocks if block.id in edge_ids)]
+    if Counter(context) != Counter(observed) or len(set(context)) != len(context):
+        return False
+    left, right = min(line.x0 for line in context), max(line.x1 for line in context)
+    width, middle = right - left, (left + right) / 2
+    anchors: list[tuple[PdfLine, float]] = []
+    previous: PdfLine | None = None
+    for block in fragments:
+        members = proven[block.id]
+        first, last = members[0], members[-1]
+        if previous is not None and (first.top <= previous.top
+                                    or first.vertical_overlap_ratio(previous) >= _VERTICAL_OVERLAP):
+            return False
+        previous = last
+        size, font = first.size, _flow_font(first)
+        if any(_flow_font(line) != font or abs(line.size - size) > size * .15 + 1e-9
+               or line.bold != first.bold for line in members):
+            return False
+        # A narrow independent column is not an inset body fragment, even when
+        # wide spanning paragraphs happen to overlap its bounding envelope.
+        x0, x1 = min(line.x0 for line in members), max(line.x1 for line in members)
+        # A majority inside edge-measurement uncertainty is not positive proof.
+        if not (x0 <= middle <= x1 and x1 - x0 > width * .5 + size * .25 + 1e-9
+                and x1 - x0 >= size * 4):
+            return False
+        intervals = [b.top - a.top for a, b in zip(members, members[1:])]
+        pitch = min(intervals) if intervals else None
+        if any(b.top < a.bottom - 1e-9 or not _paragraphs_are_contiguous(a, b)
+               or abs(interval - pitch) > max(a.size, b.size) * .15 + 1e-9
+               for a, b, interval in zip(members, members[1:], intervals)):
+            return False
+        full = [abs(line.x0 - left) <= line.size * .25 + 1e-9
+                and abs(line.x1 - right) <= line.size * .25 + 1e-9 for line in members]
+        if (block.kind == "paragraph" and not block.style.bold and len(intervals) >= 2
+                and any(a and b for a, b in zip(full, full[1:]))):
+            anchors.append((first, pitch))
+    # Two independent, compatible regular paragraphs are positive calibration;
+    # no-gutter, indentation and short lines themselves supply no such proof.
+    if len(anchors) < 2:
+        return False
+    reference, pitch = anchors[0]
+    return all(_flow_font(line) == _flow_font(reference)
+               and abs(line.size - reference.size) <= reference.size * .15 + 1e-9
+               and abs(value - pitch) <= max(line.size, reference.size) * .15 + 1e-9
+               for line, value in anchors[1:])
+
+
 def collect_flow_boundaries(
     blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
     lines_by_page: Mapping[int, Sequence[PdfLine]], *,
@@ -181,7 +251,19 @@ def collect_flow_boundaries(
             # A no-gutter result alone does not prove a single column. Every
             # line must overlap a shared horizontal interval.
             if max(line.x0 for line in context) >= min(line.x1 for line in context):
-                continue
+                # Only this failed sufficient proof gets the paragraph-owned
+                # fallback; ordinary common-interval and true-gutter paths stay
+                # unchanged. Never trust foreign/incomplete caller ownership.
+                canonical = collect_owned_flow_lines(page_blocks, [page], {page.number: lines})
+                relevant = [block for block in page_blocks if block.id not in edge_ids
+                            and block.kind in {"paragraph", "list-item"}
+                            and block.semantic_role == "body"]
+                if (len({block.id for block in blocks}) != len(blocks)
+                        or not set(owned_lines).issubset({block.id for block in blocks})
+                        or any(block.id not in canonical
+                               or owned_lines.get(block.id) != canonical[block.id] for block in relevant)
+                        or not _paragraph_owned_single_region(page_blocks, lines, proven, edge_ids)):
+                    continue
             columns = [context]
         else:
             if any(line.x0 < gutter[1] and line.x1 > gutter[0] for line in context):

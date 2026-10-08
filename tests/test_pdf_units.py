@@ -11,6 +11,128 @@ from web_translator.pdf_units import project_unit_text, unit_for_block, validate
 from web_translator import pdf_units
 
 
+@pytest.mark.parametrize("scale", [.6, 1, 1.8])
+@pytest.mark.parametrize("margin", [48, 90])
+@pytest.mark.parametrize("font", ["OpaqueSerif", "UnrelatedSans"])
+@pytest.mark.parametrize("discretionary,opaque", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("problem", [None, "proved-majority"])
+def test_owned_paragraph_spans_prove_region_despite_disjoint_lines(scale, margin, font, discretionary, opaque, problem):
+    # Removing the owned-span fallback must retain a required missing-frame finding.
+    from tests.pdf_unit_fixtures import make_observed_region_flow
+    blocks, pages, lines = make_observed_region_flow(
+        scale=scale, margin=margin, font=font, discretionary=discretionary, opaque=opaque, problem=problem)
+    before = [b.to_dict() for b in blocks]
+    assert len(blocks) == 7 and all(b.semantic_role == "body" for b in blocks)
+    assert blocks[1].kind == "list-item" and blocks[2].kind == "paragraph"
+    assert all(max(l.x0 for l in members) > min(l.x1 for l in members) for members in lines.values())
+    flags = {}
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines, discretionary_continuations=flags)
+    assert [len(owned[b.id]) for b in blocks] == [4, 4, 3, 3, 4, 4, 3]
+    assert owned[blocks[2].id][0].font_family != owned[blocks[0].id][0].font_family
+    assert blocks[2].bbox[1] < blocks[1].bbox[3]
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert set(boundaries) == {b.id for b in blocks}
+    for boundary in boundaries.values():
+        assert boundary.column_bbox == pytest.approx((margin * scale, 72 * scale, (margin + 420) * scale, 720 * scale))
+        assert boundary.line_pitch == pytest.approx(18 * scale)
+        assert (boundary.column_index, boundary.column_count) == (0, 1)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned,
+                                                      owned_line_continuations=flags)
+    assert not findings
+    assert [u.source_block_ids for u in units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0001:block-0002",),
+        ("pdf:page-0001:block-0003",),
+        ("pdf:page-0001:block-0004", "pdf:page-0002:block-0001"),
+        ("pdf:page-0002:block-0002",), ("pdf:page-0002:block-0003",)]
+    expected = ("A later account begins with independently measured evidence "
+                "and records every qualification in its original order "
+                "while the account continues across the physical boundary "
+                "without losing the relationship between its source parts "
+                "or assigning separate translations to incomplete clauses "
+                "until the entire account reaches its conclusion Finished.")
+    if discretionary:
+        expected = expected.replace("the physical boundary without losing", "a measured paragraph retains")
+    if opaque:
+        expected = expected.replace("account", "record")
+    assert project_unit_text(units[3], {b.id: b for b in blocks}).text == expected
+    join = units[3].joins[0]
+    assert join.evidence.left.last_line == owned[blocks[3].id][-1]
+    assert join.evidence.right.first_line == owned[blocks[4].id][0]
+    assert join.operation == ("remove-discretionary-hyphen" if discretionary else "space")
+    assert [b.to_dict() for b in blocks] == before
+    assert [bid for u in units for bid in u.source_block_ids] == [b.id for b in blocks]
+
+
+@pytest.mark.parametrize("scale", [.6, 1, 1.8])
+@pytest.mark.parametrize("problem", ["uncertain-majority", "at-majority"])
+def test_paragraph_region_majority_requires_font_relative_uncertainty_clearance(scale, problem):
+    from tests.pdf_unit_fixtures import make_observed_region_flow
+    blocks, pages, lines = make_observed_region_flow(scale=scale, problem=problem)
+    assert max(l.x0 for l in lines[2]) > min(l.x1 for l in lines[2])
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    assert set(owned) == {b.id for b in blocks}
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert not any(b.id in boundaries for b in blocks if b.page_number == 2)
+    assert findings and all(f.severity == "required" for f in findings)
+    assert all(len(u.source_block_ids) == 1 for u in units)
+    assert [bid for u in units for bid in u.source_block_ids] == [b.id for b in blocks]
+
+
+@pytest.mark.parametrize("problem", ["sparse", "staggered", "spanning", "ragged", "irregular", "font", "few-calibrated",
+                                    "anchor-font", "anchor-pitch", "half-width", "off-center", "parallel"])
+def test_unproved_paragraph_region_keeps_required_builder_refusal(problem):
+    # Envelope overlap/no-gutter without aligned owned spans must not earn a frame.
+    from tests.pdf_unit_fixtures import make_observed_region_flow
+    blocks, pages, lines = make_observed_region_flow(problem=problem)
+    before = [b.to_dict() for b in blocks]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert not any(b.id in boundaries for b in blocks if b.page_number == 2)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert findings and all(f.severity == "required" for f in findings)
+    assert all(len(u.source_block_ids) == 1 for u in units)
+    assert [b.to_dict() for b in blocks] == before
+
+
+@pytest.mark.parametrize("problem", ["missing", "foreign", "duplicate", "mismatch", "reorder", "bbox", "unknown", "competing",
+                                    "incomplete", "source", "missing-line", "duplicate-block"])
+def test_paragraph_region_requires_canonical_complete_unique_ownership(problem):
+    from tests.pdf_unit_fixtures import make_observed_region_flow
+    blocks, pages, lines = make_observed_region_flow()
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    key = blocks[6].id
+    if problem == "missing":
+        owned.pop(key)
+    elif problem == "foreign":
+        owned[key] = owned[blocks[1].id]
+    elif problem == "duplicate":
+        owned[key] = (*owned[key], owned[key][-1])
+    elif problem == "mismatch":
+        owned[key] = (replace(owned[key][0], text="Unrelated evidence"), *owned[key][1:])
+    elif problem == "reorder":
+        owned[key] = tuple(reversed(owned[key]))
+    elif problem == "bbox":
+        owned[key] = (replace(owned[key][0], bbox=(1, 2, 3, 4)), *owned[key][1:])
+    elif problem == "unknown":
+        owned["foreign-owner"] = owned[key]
+    elif problem == "incomplete":
+        owned[key] = owned[key][:-1]
+    elif problem == "source":
+        blocks[6] = replace(blocks[6], source_text="An unrelated complete account.")
+    elif problem == "missing-line":
+        lines[2] = lines[2][:-1]
+    elif problem == "duplicate-block":
+        blocks.append(blocks[6])
+    else:
+        blocks.append(replace(blocks[6], id="competing-owner", order=7))
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert not any(b.id in boundaries for b in blocks if b.page_number == 2)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert findings and all(f.severity == "required" for f in findings)
+    assert all(len(u.source_block_ids) == 1 for u in units)
+
+
 @pytest.mark.parametrize("scale,margin,font", [(0.6, 48, "OpaqueSerif"), (1, 72, "ObservedFace"), (1.8, 90, "UnrelatedSans")])
 def test_observed_justified_terminal_paragraphs_are_independent(scale, margin, font):
     # Missing terminal-layout proof must leave the real producer's required finding.

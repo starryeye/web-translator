@@ -47,6 +47,86 @@ from web_translator.pdf_extract import (
 from web_translator.pdf_models import PdfBlock, PdfBlockStyle, PdfPageEvidence
 
 
+@pytest.mark.parametrize("scale", [.65, 1.6])
+@pytest.mark.parametrize("margin", [48, 90])
+@pytest.mark.parametrize("font", ["Helvetica", "Times-Roman"])
+@pytest.mark.parametrize("discretionary,opaque", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("problem", [None, "proved-majority"])
+def test_native_owned_paragraph_region_writes_one_complete_continuation(tmp_path, monkeypatch, scale, margin, font, discretionary, opaque, problem):
+    # Native grouping and writer must propagate span proof, not lose a source clause.
+    from tests.pdf_unit_fixtures import make_native_region_pdf, REGION_PARAGRAPHS, REGION_INSET
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_units import project_unit_text
+    from web_translator.pdf_unit_bindings import require_assignable_pdf
+    from web_translator.protection import restore_tokens
+    from web_translator import pdf_extract
+    physical_before = []
+    collector = pdf_extract.collect_flow_boundaries
+    def record_physical(blocks, pages, lines, **kwargs):
+        physical_before.extend(b.to_dict() for b in blocks)
+        return collector(blocks, pages, lines, **kwargs)
+    # A recording wrapper delegates to the actual collector; it cannot supply
+    # frames, classification, ownership or writer results.
+    monkeypatch.setattr(pdf_extract, "collect_flow_boundaries", record_physical)
+    source = make_native_region_pdf(tmp_path / "source.pdf", scale=scale, margin=margin,
+                                    font=font, discretionary=discretionary, opaque=opaque, problem=problem)
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    expected = [
+        " ".join(REGION_PARAGRAPHS[0][0]), " ".join(REGION_PARAGRAPHS[0][1]),
+        " ".join(REGION_INSET), " ".join(REGION_PARAGRAPHS[0][2]), " ".join(REGION_PARAGRAPHS[1][0]),
+        " ".join(REGION_PARAGRAPHS[1][1]), " ".join(REGION_PARAGRAPHS[1][2]),
+    ]
+    if discretionary:
+        expected[3] = expected[3].replace("the physical boundary", "a measured para‐")
+        expected[4] = expected[4].replace("without losing", "graph retains")
+    if opaque:
+        expected = [s.replace("account", "record").replace("observations", "measurements") for s in expected]
+    assert [b.source_text for b in document.blocks] == expected
+    assert not document.flow_findings
+    assert [u.source_block_ids for u in document.translation_units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0001:block-0002",),
+        ("pdf:page-0001:block-0003",),
+        ("pdf:page-0001:block-0004", "pdf:page-0002:block-0001"),
+        ("pdf:page-0002:block-0002",), ("pdf:page-0002:block-0003",)]
+    assert [bid for u in document.translation_units for bid in u.source_block_ids] == [b.id for b in document.blocks]
+    join = document.translation_units[3].joins[0]
+    assert join.evidence.left.last_line.text == expected[3].split("order ")[1]
+    assert join.evidence.right.first_line.text == (
+        "graph retains the relationship between its source parts" if discretionary
+        else "without losing the relationship between its source parts")
+    assert join.evidence.left.column_bbox == pytest.approx(
+        (margin * scale, document.blocks[0].bbox[1], (margin + 420) * scale, document.blocks[3].bbox[3]))
+    assert join.evidence.right.line_pitch == pytest.approx(18 * scale)
+    projected = expected[3][:-1] + expected[4] if discretionary else expected[3] + " " + expected[4]
+    segments = read_segments(tmp_path / "segments.jsonl")
+    assert [restore_tokens(s.source_text, s.protected) for s in segments] == [
+        *expected[:3], projected, expected[5], expected[6]]
+    assert document.blocks[1].kind == "list-item" and document.blocks[2].kind == "paragraph"
+    assert document.blocks[2].bbox[1] < document.blocks[1].bbox[3]
+    assert all(s.target for s in segments)
+    before = [b.to_dict() for b in document.blocks]
+    require_assignable_pdf(document)
+    assert project_unit_text(document.translation_units[3], {b.id: b for b in document.blocks}).text == projected
+    assert [b.to_dict() for b in document.blocks] == before
+    assert [{key: value for key, value in b.to_dict().items() if key != "segment_id"}
+            for b in document.blocks] == [
+        {key: value for key, value in b.items() if key != "segment_id"} for b in physical_before]
+
+
+@pytest.mark.parametrize("problem", ["competing", "half-width", "uncertain-majority"])
+@pytest.mark.parametrize("scale,margin,font", [(.7, 48, "Helvetica"), (1.5, 90, "Times-Roman")])
+def test_native_paragraph_region_keeps_competing_flow_assignment_blocked(tmp_path, problem, scale, margin, font):
+    from tests.pdf_unit_fixtures import make_native_region_pdf
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.pdf_unit_bindings import require_assignable_pdf, PdfUnitBindingError
+    source = make_native_region_pdf(tmp_path / "source.pdf", scale=scale, margin=margin, font=font, problem=problem)
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert document.flow_findings and all(f.severity == "required" for f in document.flow_findings)
+    assert all(len(u.source_block_ids) == 1 and not u.joins for u in document.translation_units)
+    with pytest.raises(PdfUnitBindingError, match="flow findings"):
+        require_assignable_pdf(document)
+
+
 @pytest.mark.parametrize("scale,margin,font", [(0.65, 48, "Helvetica"), (1, 72, "Times-Roman"), (1.6, 90, "Helvetica")])
 def test_native_justified_terminal_paragraphs_write_two_complete_targets(tmp_path, scale, margin, font):
     from tests.pdf_unit_fixtures import make_native_terminal_pdf

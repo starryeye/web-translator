@@ -254,6 +254,177 @@ TERMINAL_PARAGRAPHS = (
 )
 
 
+REGION_PARAGRAPHS = (
+    (("Measured records preserve an ordinary opening account",
+      "while observers retain the sequence of recorded events",
+      "before preparing the evidence for careful inspection", "Done."),
+     ("1. Indented observations describe a different measured interval",
+      "and preserve their original geometric relationships",
+      "while retaining the complete selectable source sequence",
+      "before this independent account reaches its conclusion."),
+     ("A later account begins with independently measured evidence",
+      "and records every qualification in its original order",
+      "while the account continues across the physical boundary")),
+    (("without losing the relationship between its source parts",
+      "or assigning separate translations to incomplete clauses",
+      "until the entire account reaches its conclusion", "Finished."),
+     ("Different observations describe another measured interval",
+      "and retain their independently recorded relationships",
+      "while preserving all original selectable source evidence",
+      "before the independent explanation reaches its conclusion."),
+     ("The final account describes a separate observation",
+      "and preserves the evidence for independent inspection",
+      "before the generated example comes to an end.")),
+)
+
+REGION_INSET = (
+    "Inset records retain a separately measured sequence",
+    "with exact selectable text and independent typography",
+    "before the inset account reaches its conclusion.",
+)
+
+
+def region_source_lines(*, margin=72, discretionary=False, opaque=False):
+    """Generic measured paragraphs, including disjoint short/indented lines."""
+    result = []
+    for page, paragraphs in enumerate(REGION_PARAGRAPHS):
+        records = []
+        for paragraph, texts in enumerate(paragraphs):
+            for index, text in enumerate(texts):
+                if discretionary and page == 0 and paragraph == 2 and index == 2:
+                    text = "while the account continues across a measured para‐"
+                if discretionary and page == 1 and paragraph == 0 and index == 0:
+                    text = "graph retains the relationship between its source parts"
+                if opaque:
+                    text = text.replace("account", "record").replace("observations", "measurements")
+                x0 = margin + (36 if paragraph == 1 and (page == 1 or index > 0) else 0)
+                if page == 1 and paragraph == 1 and index == 0:
+                    x0 = margin + 60
+                x1 = margin + (24 if paragraph == 0 and index == 3 else
+                               300 if paragraph == 1 and page == 1 else 420)
+                top = (72, 300, 672)[paragraph] + index * 18
+                size = 10 if paragraph == 1 and page == 1 else 11.4 if paragraph == 1 else 12
+                records.append((text, x0, top, x1, size))
+            if paragraph == 1 and page == 0:
+                # Adjacent fragment metrics overlap by .4em, not parallel rows.
+                for index, text in enumerate(REGION_INSET):
+                    if opaque:
+                        text = text.replace("account", "record")
+                    records.append((text, margin + 36, 361.4 + index * 18, margin + 300, 10))
+        result.append(records)
+    return result
+
+
+def make_observed_region_flow(*, scale=1, margin=72, font="ObservedFace", problem=None,
+                              discretionary=False, opaque=False):
+    from web_translator.pdf_layout import (
+        build_text_blocks, classify_document_lines, classify_semantic_roles,
+        group_words_into_lines, order_page_lines,
+    )
+    pages = [PdfPage(n, 612 * scale, 792 * scale, 0) for n in (1, 2)]
+    raw = []
+    for page, records in zip(pages, region_source_lines(
+            margin=margin, discretionary=discretionary, opaque=opaque)):
+        words = []
+        for index, (text, x0, top, x1, size) in enumerate(records):
+            line_font = "InsetMono" if size == 10 else font
+            if page.number == 2:
+                if problem in {"sparse", "staggered", "spanning"} and index >= 4:
+                    # Two narrow independent paragraphs; no aligned gutter rows.
+                    x0, x1 = ((margin, margin + 180) if index < 8
+                              else (margin + 240, margin + 420))
+                    if problem == "sparse" and index >= 8:
+                        top += 15
+                    if problem == "spanning" and index < 8:
+                        x0, x1 = margin, margin + 420
+                if problem == "ragged" and index in {1, 5, 6, 9}:
+                    x1 -= 25
+                if problem == "irregular" and index == 5:
+                    top += 4
+                if problem == "font" and index == 5:
+                    line_font = "IncompatibleFace"
+                if problem == "anchor-font" and index >= 8:
+                    line_font = "OtherAnchor"
+                if problem == "anchor-pitch" and index >= 8:
+                    top += (index - 8) * 4
+                if problem == "half-width" and 4 <= index < 8:
+                    x0, x1 = margin + (60 if index == 4 else 0), margin + 210
+                if problem == "off-center" and 4 <= index < 8:
+                    x0, x1 = margin + 216, margin + 420
+                if problem in {"uncertain-majority", "at-majority", "proved-majority"} and 4 <= index < 8:
+                    extra = {"uncertain-majority": 1, "at-majority": 2.5, "proved-majority": 5}[problem]
+                    x0, x1 = margin + (60 if index == 4 else 36), margin + 246 + extra
+                if problem == "parallel" and 4 <= index < 8:
+                    top = 132 + (index - 4) * 18
+                if problem == "few-calibrated" and index in {1, 2, 9, 10}:
+                    x1 -= 35
+            if text.startswith("1. "):
+                words.append(dict(text="1.", x0=x0 * scale, x1=(x0 + 28) * scale,
+                                  top=top * scale, bottom=(top + size) * scale,
+                                  size=size * scale, fontname=line_font, chars=[{"text": "1"}, {"text": "."}]))
+                text, x0 = text[3:], x0 + 36
+            words.append(dict(text=text, x0=x0 * scale, x1=x1 * scale,
+                              top=top * scale, bottom=(top + size) * scale,
+                              size=size * scale, fontname=line_font,
+                              chars=[{"text": char} for char in text if not char.isspace()]))
+        if page.number == 2 and problem == "spanning":
+            for index, text in enumerate(REGION_INSET):
+                words.append(dict(text=text, x0=margin * scale, x1=(margin + 180) * scale,
+                                  top=(450 + index * 18) * scale, bottom=(462 + index * 18) * scale,
+                                  size=12 * scale, fontname=font,
+                                  chars=[{"text": char} for char in text if not char.isspace()]))
+        raw.append((group_words_into_lines(words), page.height))
+    classified = classify_semantic_roles(classify_document_lines(raw))
+    blocks, lines = [], {}
+    for page, members in zip(pages, classified):
+        lines[page.number] = order_page_lines(members, page.width)
+        blocks.extend(build_text_blocks(lines[page.number], page.number))
+    return [replace(block, order=index) for index, block in enumerate(blocks)], pages, lines
+
+
+def make_native_region_pdf(path, *, scale=1, margin=72, font="Helvetica",
+                           discretionary=False, opaque=False, problem=None):
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    if discretionary:
+        from pathlib import Path
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        font = "RegionFixtureUnicode"
+        pdfmetrics.registerFont(TTFont(font, str(
+            Path(__file__).parents[1] / "src/web_translator/font_assets/NotoSansKR-Regular.ttf")))
+    canvas = Canvas(str(path), pagesize=(612 * scale, 792 * scale), invariant=1)
+    for page, records in enumerate(region_source_lines(margin=margin, discretionary=discretionary, opaque=opaque)):
+        if page == 1 and problem == "competing":
+            records = [(text, margin + 240, top, margin + 420, size) if 4 <= index < 8
+                       else (text, x0, top, x1, size)
+                       for index, (text, x0, top, x1, size) in enumerate(records)]
+            records.extend((text, margin, 450 + index * 18, margin + 180, 12)
+                           for index, text in enumerate(REGION_INSET))
+        if page == 1 and problem in {"half-width", "uncertain-majority", "proved-majority"}:
+            extra = {"half-width": 0, "uncertain-majority": 1, "proved-majority": 5}[problem]
+            records = [(text, margin + (60 if index == 4 else 36), top, margin + 246 + extra, size)
+                       if 4 <= index < 8 else (text, x0, top, x1, size)
+                       for index, (text, x0, top, x1, size) in enumerate(records)]
+        for text, x0, top, x1, size in records:
+            if text.startswith("1. "):
+                marker = canvas.beginText(x0 * scale, (792 - top - size * .793) * scale)
+                marker.setFont(font, size * scale)
+                marker.setHorizScale(28 / stringWidth("1.", font, size) * 100)
+                marker.textLine("1.")
+                canvas.drawText(marker)
+                text, x0 = text[3:], x0 + 36
+            obj = canvas.beginText(x0 * scale, (792 - top - size * .793) * scale)
+            line_font = "Courier" if size == 10 else font
+            obj.setFont(line_font, size * scale)
+            obj.setHorizScale((x1 - x0) / stringWidth(text, line_font, size) * 100)
+            obj.textLine(text)
+            canvas.drawText(obj)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
 def make_observed_terminal_paragraphs(*, scale=1.0, margin=72, font="ObservedFace",
                                       texts=TERMINAL_PARAGRAPHS, problem=None):
     """Invented justified prose through grouping/classification/order/ownership."""
