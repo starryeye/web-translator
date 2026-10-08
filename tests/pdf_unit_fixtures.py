@@ -240,6 +240,85 @@ def make_observed_flow(*, columns: int = 1, scale: float = 1.0, list_item: bool 
     return blocks, pages, lines_by_page
 
 
+TERMINAL_PARAGRAPHS = (
+    ("Opaque observations retain an ordinary multiword account",
+     "while independent measurements preserve the complete sequence",
+     "and describe the relationships among several recorded events",
+     "before the evidence receives its final careful consideration",
+     "The account ends."),
+    ("Another independent account begins with measured evidence",
+     "and preserves its own sequence of several unrelated events",
+     "while the observers consider the complete physical record",
+     "before preparing an independent explanation for inspection",
+     "This account also ends."),
+)
+
+
+def make_observed_terminal_paragraphs(*, scale=1.0, margin=72, font="ObservedFace",
+                                      texts=TERMINAL_PARAGRAPHS, problem=None):
+    """Invented justified prose through grouping/classification/order/ownership."""
+    from web_translator.pdf_layout import (
+        build_text_blocks, classify_document_lines, classify_semantic_roles,
+        group_words_into_lines, order_page_lines,
+    )
+    pages = [PdfPage(n, 612 * scale, 792 * scale, 0) for n in (1, 2)]
+    raw = []
+    for page, paragraph in zip(pages, texts):
+        words = []
+        for index, text in enumerate(paragraph):
+            top = (600 if page.number == 1 else 72) + index * 18
+            end = margin + (180 if index == len(paragraph) - 1 else 420)
+            if page.number == 1:
+                if problem == "filled" and index == len(paragraph) - 1:
+                    end = margin + 420
+                if problem == "ragged" and index < len(paragraph) - 1:
+                    end -= index * 23
+                if problem == "few-calibrated" and index < len(paragraph) - 2:
+                    end -= 48
+                if problem in {"irregular", "code-hardwrap", "poetry-hardwrap"} and index >= 2:
+                    top += (index - 1) * 4
+            words.append(dict(text=text, x0=margin * scale, x1=end * scale,
+                              top=top * scale, bottom=(top + 12) * scale,
+                              size=12 * scale, fontname=font,
+                              chars=[{"text": char} for char in text if not char.isspace()]))
+        raw.append((group_words_into_lines(words), page.height))
+    classified = classify_semantic_roles(classify_document_lines(raw))
+    blocks, lines = [], {}
+    for page, members in zip(pages, classified):
+        lines[page.number] = order_page_lines(members, page.width)
+        blocks.extend(build_text_blocks(lines[page.number], page.number))
+    return [replace(block, order=index) for index, block in enumerate(blocks)], pages, lines
+
+
+def make_native_terminal_pdf(path, *, scale=1.0, margin=72, font="Helvetica", normalized=False):
+    """Selectable justified paragraph endings, no simulated translation/approval."""
+    from reportlab.pdfgen.canvas import Canvas
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    paragraphs = TERMINAL_PARAGRAPHS
+    if normalized:
+        from pathlib import Path
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        font = "TerminalFixtureUnicode"
+        pdfmetrics.registerFont(TTFont(font, str(
+            Path(__file__).parents[1] / "src/web_translator/font_assets/NotoSansKR-Regular.ttf")))
+        paragraphs = (("Opaque observations retain a careful para‐", "graph with independent measurements",
+                       *paragraphs[0][2:]), paragraphs[1])
+    canvas = Canvas(str(path), pagesize=(612 * scale, 792 * scale), invariant=1)
+    for page, paragraph in enumerate(paragraphs):
+        for index, text in enumerate(paragraph):
+            top = (600 if page == 0 else 72) + index * 18
+            width = 180 if index == len(paragraph) - 1 else 420
+            obj = canvas.beginText(margin * scale, (792 - top - 9.516) * scale)
+            obj.setFont(font, 12 * scale)
+            obj.setHorizScale(width / stringWidth(text, font, 12) * 100)
+            obj.textLine(text)
+            canvas.drawText(obj)
+        canvas.showPage()
+    canvas.save()
+    return path
+
+
 def make_render_unit_run(root, *, case="joined"):
     """Selectable invented source plus fixed test-only Korean text and exact binding."""
     import hashlib

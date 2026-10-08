@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -120,7 +120,8 @@ def _boundary_line(line: PdfLine) -> PdfBoundaryLine:
 
 def collect_owned_flow_lines(
     blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
-    lines_by_page: Mapping[int, Sequence[PdfLine]],
+    lines_by_page: Mapping[int, Sequence[PdfLine]], *,
+    discretionary_continuations: MutableMapping[str, tuple[bool, ...]] | None = None,
 ) -> dict[str, tuple[PdfBoundaryLine, ...]]:
     """Retain uniquely reconstructed physical lines independently of frames."""
     result: dict[str, tuple[PdfBoundaryLine, ...]] = {}
@@ -142,6 +143,9 @@ def collect_owned_flow_lines(
                     max(line.x1 for line in members), max(line.bottom for line in members))
             if all(abs(a - b) <= 1e-7 for a, b in zip(bbox, block.bbox)):
                 result[block.id] = tuple(_boundary_line(line) for line in members)
+                if discretionary_continuations is not None:
+                    discretionary_continuations[block.id] = tuple(
+                        line.continues_discretionary_hyphen for line in members)
     return result
 
 
@@ -437,9 +441,13 @@ def extract_pdf(
         warnings.warn(message, PdfExtractionWarning, stacklevel=2)
     pages = [PdfPage(evidence.number, material.page_width, material.page_height, evidence.rotation)
              for evidence, material in zip(inspection.pages, materials, strict=True)]
-    owned_lines = collect_owned_flow_lines(blocks, pages, lines_by_page)
+    owned_line_continuations: dict[str, tuple[bool, ...]] = {}
+    owned_lines = collect_owned_flow_lines(
+        blocks, pages, lines_by_page, discretionary_continuations=owned_line_continuations)
     boundaries = collect_flow_boundaries(blocks, pages, lines_by_page, owned_lines=owned_lines)
-    units, flow_findings = build_translation_units(blocks, pages, boundaries, owned_lines=owned_lines)
+    units, flow_findings = build_translation_units(
+        blocks, pages, boundaries, owned_lines=owned_lines,
+        owned_line_continuations=owned_line_continuations)
     blocks, units, segments = build_pdf_unit_segments(blocks, units)
     document = PdfDocument(
         schema_version="1.2",

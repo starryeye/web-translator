@@ -47,6 +47,47 @@ from web_translator.pdf_extract import (
 from web_translator.pdf_models import PdfBlock, PdfBlockStyle, PdfPageEvidence
 
 
+@pytest.mark.parametrize("scale,margin,font", [(0.65, 48, "Helvetica"), (1, 72, "Times-Roman"), (1.6, 90, "Helvetica")])
+def test_native_justified_terminal_paragraphs_write_two_complete_targets(tmp_path, scale, margin, font):
+    from tests.pdf_unit_fixtures import make_native_terminal_pdf
+    from web_translator.pdf_extract import extract_pdf
+    source = make_native_terminal_pdf(tmp_path / "source.pdf", scale=scale, margin=margin, font=font)
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert not document.flow_findings
+    assert len(document.blocks) == len(document.translation_units) == 2
+    assert [u.source_block_ids for u in document.translation_units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0002:block-0001",)]
+    assert not any(u.joins for u in document.translation_units)
+    segments = read_segments(tmp_path / "segments.jsonl")
+    assert [s.locator for s in segments] == ["pdf:page-0001:block-0001", "pdf:page-0002:block-0001"]
+    assert all(s.target for s in segments)
+    expected = [
+        "Opaque observations retain an ordinary multiword account while independent measurements preserve the complete sequence and describe the relationships among several recorded events before the evidence receives its final careful consideration The account ends.",
+        "Another independent account begins with measured evidence and preserves its own sequence of several unrelated events while the observers consider the complete physical record before preparing an independent explanation for inspection This account also ends.",
+    ]
+    assert [s.source_text for s in segments] == expected
+    assert [b.source_text for b in document.blocks] == expected
+
+
+def test_native_normalized_terminal_paragraph_preserves_complete_source(tmp_path):
+    from tests.pdf_unit_fixtures import make_native_terminal_pdf
+    from web_translator.pdf_extract import extract_pdf
+    source = make_native_terminal_pdf(tmp_path / "source.pdf", normalized=True)
+    document = extract_pdf(source, tmp_path / "document.json", tmp_path / "segments.jsonl", tmp_path / "media")
+    assert document.blocks[0].source_text == (
+        "Opaque observations retain a careful paragraph with independent measurements "
+        "and describe the relationships among several recorded events "
+        "before the evidence receives its final careful consideration The account ends.")
+    assert not document.flow_findings
+    assert [u.source_block_ids for u in document.translation_units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0002:block-0001",)]
+    assert not any(u.joins for u in document.translation_units)
+    assert [s.source_text for s in read_segments(tmp_path / "segments.jsonl")] == [
+        "Opaque observations retain a careful paragraph with independent measurements and describe the relationships among several recorded events before the evidence receives its final careful consideration The account ends.",
+        "Another independent account begins with measured evidence and preserves its own sequence of several unrelated events while the observers consider the complete physical record before preparing an independent explanation for inspection This account also ends.",
+    ]
+
+
 def test_native_unit_extraction_collects_real_boundary_evidence(tmp_path):
     from tests.pdf_unit_fixtures import make_native_flow_pdf
     from web_translator.pdf_extract import extract_pdf

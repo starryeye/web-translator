@@ -11,6 +11,216 @@ from web_translator.pdf_units import project_unit_text, unit_for_block, validate
 from web_translator import pdf_units
 
 
+@pytest.mark.parametrize("scale,margin,font", [(0.6, 48, "OpaqueSerif"), (1, 72, "ObservedFace"), (1.8, 90, "UnrelatedSans")])
+def test_observed_justified_terminal_paragraphs_are_independent(scale, margin, font):
+    # Missing terminal-layout proof must leave the real producer's required finding.
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs
+    blocks, pages, lines = make_observed_terminal_paragraphs(scale=scale, margin=margin, font=font)
+    assert len(blocks) == 2 and all(b.kind == "paragraph" and b.semantic_role == "body" for b in blocks)
+    before = [block.to_dict() for block in blocks]
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    assert all(len(owned[block.id]) == 5 for block in blocks)
+    assert all(boundaries[block.id].line_pitch == pytest.approx(18 * scale) for block in blocks)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert not findings
+    assert [unit.source_block_ids for unit in units] == [
+        ("pdf:page-0001:block-0001",), ("pdf:page-0002:block-0001",)]
+    assert not any(unit.joins for unit in units)
+    texts = [project_unit_text(unit, {b.id: b for b in blocks}).text for unit in units]
+    assert texts == [
+        "Opaque observations retain an ordinary multiword account while independent measurements preserve the complete sequence and describe the relationships among several recorded events before the evidence receives its final careful consideration The account ends.",
+        "Another independent account begins with measured evidence and preserves its own sequence of several unrelated events while the observers consider the complete physical record before preparing an independent explanation for inspection This account also ends.",
+    ]
+    assert [block.to_dict() for block in blocks] == before
+
+
+@pytest.mark.parametrize("problem", [
+    "missing", "foreign", "duplicate", "mismatch", "reorder", "bbox", "unknown-owner",
+    "competing-owner", "head-text", "tail-text", "font", "bold", "pitch", "frame",
+    "column", "filled", "ragged", "few-calibrated", "irregular", "code-hardwrap", "poetry-hardwrap", "no-punctuation",
+    "normalized-discretionary", "list", "reference", "callout",
+])
+def test_unproven_terminal_layout_retains_real_required_ambiguity(problem):
+    # Relaxing reconstruction/ownership/calibration/structure must fail one case.
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs, TERMINAL_PARAGRAPHS
+    texts = TERMINAL_PARAGRAPHS
+    if problem == "no-punctuation":
+        texts = ((*texts[0][:-1], "The account ends"), texts[1])
+    elif problem == "normalized-discretionary":
+        texts = (("Opaque observations retain a careful para‐", "graph with independent measurements",
+                  *texts[0][2:]), texts[1])
+    elif problem == "code-hardwrap":
+        texts = (("select measured_value from opaque_events", "where measured_value is not null",
+                  "order by measured_value and observed_time", "return records with their original ownership",
+                  "Query ends."), texts[1])
+    elif problem == "poetry-hardwrap":
+        texts = (("The observers cross the measured field", "Each footstep keeps its separate rhythm",
+                  "The evening carries several quiet echoes", "Before the distant voices turn toward home",
+                  "The stanza ends."), texts[1])
+    blocks, pages, lines = make_observed_terminal_paragraphs(texts=texts, problem=problem)
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    left, right = blocks[0], blocks[-1]
+    if problem == "missing":
+        owned.pop(left.id)
+    elif problem == "foreign":
+        owned[left.id] = owned[right.id]
+    elif problem == "duplicate":
+        owned[left.id] = (*owned[left.id], owned[left.id][-1])
+    elif problem == "mismatch":
+        owned[left.id] = (replace(owned[left.id][0], text="Other evidence"), *owned[left.id][1:])
+    elif problem == "reorder":
+        owned[left.id] = tuple(reversed(owned[left.id]))
+    elif problem == "bbox":
+        owned[left.id] = (replace(owned[left.id][0], bbox=(0, 0, 200, 12)), *owned[left.id][1:])
+    elif problem == "unknown-owner":
+        owned["unknown"] = owned[left.id]
+    elif problem == "competing-owner":
+        blocks.insert(1, replace(left, id="opaque-overlapping-owner", order=0.5))
+    elif problem in {"head-text", "tail-text"}:
+        key, field = (right.id, "first_line") if problem == "head-text" else (left.id, "last_line")
+        boundary = boundaries[key]
+        boundaries[key] = replace(boundary, **{field: replace(getattr(boundary, field), text="Unowned text.")})
+    elif problem == "font":
+        owned[left.id] = (owned[left.id][0], replace(owned[left.id][1], font_family="OtherFace"), *owned[left.id][2:])
+    elif problem == "bold":
+        blocks[0] = replace(left, style=replace(left.style, bold=True))
+    elif problem == "pitch":
+        boundaries[left.id] = replace(boundaries[left.id], line_pitch=22)
+    elif problem == "frame":
+        boundaries[left.id] = replace(boundaries[left.id], column_bbox=(72, 72, 492, 710))
+    elif problem == "column":
+        boundaries[right.id] = replace(boundaries[right.id], column_count=None, column_index=None)
+    elif problem == "list":
+        blocks[0] = replace(left, kind="list-item")
+    elif problem in {"reference", "callout"}:
+        blocks[0] = replace(left, semantic_role="reference-entry" if problem == "reference" else "callout-body")
+    before = [block.to_dict() for block in blocks]
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries, owned_lines=owned)
+    assert all(len(unit.source_block_ids) == 1 and not unit.joins for unit in units)
+    if problem in {"reference", "callout"}:
+        assert not findings  # Existing structural exclusion, not paragraph evidence.
+    else:
+        assert findings and all(finding.severity == "required" for finding in findings)
+    assert [block.to_dict() for block in blocks] == before
+
+
+def test_terminal_layout_missing_default_evidence_keeps_required_finding():
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs
+    blocks, pages, lines = make_observed_terminal_paragraphs()
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines)
+    units, findings = pdf_units.build_translation_units(blocks, pages, boundaries)
+    assert len(findings) == 1 and findings[0].severity == "required"
+    assert [unit.source_block_ids for unit in units] == [(b.id,) for b in blocks]
+
+
+def test_observed_normalized_terminal_paragraph_preserves_exact_discretionary_source():
+    # Loss of canonical continuation flags must prevent this normalized proof.
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs, TERMINAL_PARAGRAPHS
+    texts = (("Opaque observations retain a careful para‐", "graph with independent measurements",
+              *TERMINAL_PARAGRAPHS[0][2:]), TERMINAL_PARAGRAPHS[1])
+    blocks, pages, lines = make_observed_terminal_paragraphs(texts=texts)
+    assert blocks[0].source_text == (
+        "Opaque observations retain a careful paragraph with independent measurements "
+        "and describe the relationships among several recorded events "
+        "before the evidence receives its final careful consideration The account ends.")
+    flags = {}
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines, discretionary_continuations=flags)
+    assert flags[blocks[0].id] == (False, True, False, False, False)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    units, findings = pdf_units.build_translation_units(
+        blocks, pages, boundaries, owned_lines=owned, owned_line_continuations=flags)
+    assert not findings
+    assert [u.source_block_ids for u in units] == [("pdf:page-0001:block-0001",), ("pdf:page-0002:block-0001",)]
+    assert not any(u.joins for u in units)
+    assert project_unit_text(units[0], {b.id: b for b in blocks}).text == (
+        "Opaque observations retain a careful paragraph with independent measurements "
+        "and describe the relationships among several recorded events "
+        "before the evidence receives its final careful consideration The account ends.")
+
+
+@pytest.mark.parametrize("problem", ["missing", "empty", "short", "integer", "first", "reordered", "forged", "foreign", "unknown", "shape"])
+def test_normalized_terminal_flags_cannot_bypass_exact_source_reconstruction(problem):
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs, TERMINAL_PARAGRAPHS
+    texts = (("Opaque observations retain a careful para‐", "graph with independent measurements",
+              *TERMINAL_PARAGRAPHS[0][2:]), TERMINAL_PARAGRAPHS[1])
+    blocks, pages, lines = make_observed_terminal_paragraphs(texts=texts)
+    flags = {}
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines, discretionary_continuations=flags)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    left, right = blocks
+    if problem == "missing":
+        flags.pop(left.id)
+    elif problem == "empty":
+        flags[left.id] = ()
+    elif problem == "short":
+        flags[left.id] = flags[left.id][:-1]
+    elif problem == "integer":
+        flags[left.id] = (False, 1, False, False, False)
+    elif problem == "first":
+        flags[left.id] = (True, True, False, False, False)
+    elif problem == "reordered":
+        flags[left.id] = (False, False, True, False, False)
+    elif problem == "forged":
+        flags[right.id] = (False, True, False, False, False)
+    elif problem == "foreign":
+        flags[left.id] = flags[right.id]
+    elif problem == "shape":
+        flags[left.id] = None
+    else:
+        flags["unknown"] = flags[left.id]
+    units, findings = pdf_units.build_translation_units(
+        blocks, pages, boundaries, owned_lines=owned, owned_line_continuations=flags)
+    assert len(findings) == 1 and findings[0].severity == "required"
+    assert [u.source_block_ids for u in units] == [(left.id,), (right.id,)]
+
+
+def test_terminal_layout_preserves_ordinary_hyphen_and_lowercase_independent_text():
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs
+    texts = (
+        ("Several unrelated observers record a carefully time-", "ordered account of independent observations",
+         "and preserve the physical evidence for later inspection", "before completing the separate explanatory narrative",
+         "An independent account concludes."),
+        ("another ordinary account begins with unrelated evidence", "and records a different sequence of measured events",
+         "while maintaining its own complete independent explanation", "before considering the observations in their original order",
+         "The next account concludes."),
+    )
+    blocks, pages, lines = make_observed_terminal_paragraphs(texts=texts, margin=60, font="OtherSerif")
+    before = [block.to_dict() for block in blocks]
+    flags = {}
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines, discretionary_continuations=flags)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    units, findings = pdf_units.build_translation_units(
+        blocks, pages, boundaries, owned_lines=owned, owned_line_continuations=flags)
+    assert not findings and len(units) == 2 and not any(unit.joins for unit in units)
+    assert [project_unit_text(unit, {b.id: b for b in blocks}).text for unit in units] == [
+        "Several unrelated observers record a carefully time- ordered account of independent observations and preserve the physical evidence for later inspection before completing the separate explanatory narrative An independent account concludes.",
+        "another ordinary account begins with unrelated evidence and records a different sequence of measured events while maintaining its own complete independent explanation before considering the observations in their original order The next account concludes.",
+    ]
+    assert [block.to_dict() for block in blocks] == before
+
+
+def test_equal_line_values_on_different_physical_pages_do_not_compete():
+    from tests.pdf_unit_fixtures import make_observed_terminal_paragraphs
+    blocks, pages, lines = make_observed_terminal_paragraphs()
+    owned = pdf_extract.collect_owned_flow_lines(blocks, pages, lines)
+    boundaries = pdf_extract.collect_flow_boundaries(blocks, pages, lines, owned_lines=owned)
+    left, right = blocks
+    # Identical values on a different actual page are not duplicated ownership.
+    # Deliberately opaque IDs must not be interpreted as page-number metadata.
+    left = replace(left, id="omega")
+    right = replace(right, id="alpha", source_text=left.source_text, bbox=left.bbox, style=left.style)
+    shared = owned[blocks[0].id]
+    lb = replace(boundaries[blocks[0].id], block_id=left.id)
+    rb = replace(lb, block_id=right.id)
+    units, findings = pdf_units.build_translation_units(
+        [left, right], pages, {left.id: lb, right.id: rb},
+        owned_lines={left.id: shared, right.id: shared})
+    # Right page's actual frame starts at its first observed line, unlike left.
+    assert not findings and [u.source_block_ids for u in units] == [("omega",), ("alpha",)]
+
+
 def build_flow(case, *, scale=1.0):
     assert hasattr(pdf_units, "build_translation_units"), "logical flow builder is missing"
     blocks, pages, boundaries = make_flow_case(case, scale=scale)

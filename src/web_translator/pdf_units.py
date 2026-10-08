@@ -59,10 +59,96 @@ def _matches_owned_head(block: PdfBlock, boundary: PdfBlockBoundary) -> bool:
             and block.source_text[len(prefix):len(prefix) + 1].isalpha())
 
 
-def decide_page_join(
+def _observed_terminal_paragraph(
     left: PdfBlock, right: PdfBlock,
     left_boundary: PdfBlockBoundary, right_boundary: PdfBlockBoundary,
     pages: Mapping[int, PdfPage],
+    owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]],
+    ownership_blocks: Sequence[PdfBlock],
+    owned_line_continuations: Mapping[str, tuple[bool, ...]],
+) -> bool:
+    """Narrow transient proof, after the ordinary boundary prerequisites.
+
+    Canonical per-line continuation flags preserve the collector's exact
+    discretionary reconstruction; never infer them from punctuation or text.
+    Without flags only exact raw-space reconstruction can earn this proof.
+    """
+    if (left.kind != "paragraph" or right.kind != "paragraph"
+            or left.style.bold or right.style.bold
+            or not ownership_blocks
+            or len({block.id for block in ownership_blocks}) != len(ownership_blocks)
+            or not set(owned_lines).issubset({block.id for block in ownership_blocks})
+            or not set(owned_line_continuations).issubset(set(owned_lines))):
+        return False
+    for block, boundary in ((left, left_boundary), (right, right_boundary)):
+        members = owned_lines.get(block.id, ())
+        peers = [candidate for candidate in ownership_blocks
+                 if candidate.page_number == block.page_number]
+        if (block not in peers or not members or len(set(members)) != len(members)
+                or members[0] != boundary.first_line or members[-1] != boundary.last_line):
+            return False
+        flags = owned_line_continuations.get(block.id, (False,) * len(members))
+        if (not isinstance(flags, tuple) or len(flags) != len(members)
+                or any(type(flag) is not bool for flag in flags) or flags[0]):
+            return False
+        text = members[0].text
+        for line, continues in zip(members[1:], flags[1:]):
+            if continues:
+                if (text[-1:] not in _DISCRETIONARY_HYPHENS or len(text) < 2
+                        or not text[-2].isalpha() or not line.text[:1].isalpha()):
+                    return False
+                text = text[:-1] + line.text
+            else:
+                text += " " + line.text
+        if text != block.source_text:
+            return False
+        bbox = (min(line.bbox[0] for line in members), min(line.bbox[1] for line in members),
+                max(line.bbox[2] for line in members), max(line.bbox[3] for line in members))
+        if any(abs(a - b) > 1e-7 for a, b in zip(bbox, block.bbox)):
+            return False
+        for line in members:
+            owners = [candidate for candidate in peers
+                      if all(a >= b - 1e-7 for a, b in zip(line.bbox[:2], candidate.bbox[:2]))
+                      and all(a <= b + 1e-7 for a, b in zip(line.bbox[2:], candidate.bbox[2:]))]
+            if owners != [block]:
+                return False
+            if (line.font_family.split("+")[-1].casefold()
+                    != boundary.last_line.font_family.split("+")[-1].casefold()
+                    or abs(line.font_size - boundary.last_line.font_size) > line.font_size * 0.10
+                    or abs(line.bbox[0] - boundary.column_bbox[0] - boundary.text_indent)
+                    > line.font_size * 0.25 + 1e-9
+                    or line.bbox[2] > boundary.column_bbox[2] + 1e-9):
+                return False
+        # Reject irregular hardwraps anywhere in either complete paragraph.
+        if any(abs(b.bbox[1] - a.bbox[1] - boundary.line_pitch)
+               > max(a.font_size, b.font_size) * 0.15 + 1e-9
+               or b.bbox[1] < a.bbox[3] - 1e-9
+               for a, b in zip(members, members[1:])):
+            return False
+    lp, rp = pages[left.page_number], pages[right.page_number]
+    if abs(left_boundary.line_pitch / lp.height - right_boundary.line_pitch / rp.height) > max(
+        left_boundary.line_pitch / lp.height, right_boundary.line_pitch / rp.height,
+    ) * 0.15 + 1e-9:
+        return False
+    members = owned_lines[left.id]
+    tail = members[-1]
+    frame = left_boundary.column_bbox
+    # At least two consecutive full preceding lines calibrate justification.
+    # Quarter-em edge tolerance permits rounding, not ordinary ragged margins.
+    # The terminal gap must be both two ems and 15% of observed column width.
+    return (len(members) >= 3
+            and all(abs(frame[2] - line.bbox[2]) <= line.font_size * 0.25 + 1e-9
+                    for line in members[:-1])
+            and frame[2] - tail.bbox[2] >= max(2 * tail.font_size, (frame[2] - frame[0]) * 0.15))
+
+
+def decide_page_join(
+    left: PdfBlock, right: PdfBlock,
+    left_boundary: PdfBlockBoundary, right_boundary: PdfBlockBoundary,
+    pages: Mapping[int, PdfPage], *,
+    owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]] | None = None,
+    ownership_blocks: Sequence[PdfBlock] = (),
+    owned_line_continuations: Mapping[str, tuple[bool, ...]] | None = None,
 ) -> PdfJoinDecision:
     """Decide one candidate pair; the builder checks global order and blockers."""
     separate = PdfJoinDecision("separate")
@@ -116,6 +202,11 @@ def decide_page_join(
     # independent structure/margins above can prove separation; punctuation
     # alone must not authorize either a join or silently independent targets.
     if left.source_text.rstrip().rstrip("\"'”’)]}").endswith((".", "!", "?", ":", ";", "。", "！", "？")):
+        if (left.source_text.rstrip().rstrip("\"'”’)]}").endswith((".", "!", "?", "。", "！", "？"))
+                and _observed_terminal_paragraph(left, right, left_boundary, right_boundary,
+                                                pages, owned_lines or {}, ownership_blocks,
+                                                owned_line_continuations or {})):
+            return separate
         return _ambiguous(left, right, "sentence end does not establish a paragraph boundary")
     if (lc[2] - tail.bbox[2]) / lp.width > size + 1e-9:
         return _ambiguous(left, right, "tail line is not filled to its observed column edge")
@@ -207,10 +298,22 @@ def build_translation_units(
     blocks: Sequence[PdfBlock], pages: Sequence[PdfPage],
     boundaries: Mapping[str, PdfBlockBoundary], *,
     owned_lines: Mapping[str, tuple[PdfBoundaryLine, ...]] | None = None,
+    owned_line_continuations: Mapping[str, tuple[bool, ...]] | None = None,
 ) -> tuple[list[PdfTranslationUnit], list[PdfFlowFinding]]:
     """Build unassigned logical ownership without modifying physical blocks."""
     ordered = sorted(blocks, key=lambda block: block.order)
     page_map = {page.number: page for page in pages}
+    blocks_by_page: dict[int, list[PdfBlock]] = {}
+    for block in blocks:
+        blocks_by_page.setdefault(block.page_number, []).append(block)
+    # Unknown ownership cannot authorize paragraph separation. Index once, then
+    # prove unique ownership against actual blocks on only the candidate pages.
+    paragraph_lines = owned_lines or {}
+    continuations = owned_line_continuations or {}
+    if (not set(paragraph_lines).issubset({block.id for block in blocks})
+            or not set(continuations).issubset(set(paragraph_lines))):
+        paragraph_lines = {}
+        continuations = {}
     # Furniture and explicitly linked notes cannot hide structural barriers.
     linked = {block.destination for block in blocks if block.destination}
     notes = {block.id for block in blocks if block.kind == "footnote" and block.id in linked}
@@ -226,7 +329,14 @@ def build_translation_units(
         if left.id not in boundaries or right.id not in boundaries:
             decision = _ambiguous(left, right, "missing provable boundary ownership or column frame")
         else:
-            decision = decide_page_join(left, right, boundaries[left.id], boundaries[right.id], page_map)
+            candidates = (*blocks_by_page[left.page_number], *blocks_by_page[right.page_number])
+            evidence = {block.id: paragraph_lines[block.id] for block in candidates
+                        if block.id in paragraph_lines}
+            decision = decide_page_join(left, right, boundaries[left.id], boundaries[right.id], page_map,
+                                        owned_lines=evidence, ownership_blocks=candidates,
+                                        owned_line_continuations={block.id: continuations[block.id]
+                                                                 for block in candidates
+                                                                 if block.id in continuations})
         if decision.status == "join":
             competing = [
                 candidate for candidate in flow if candidate.id not in {left.id, right.id}
