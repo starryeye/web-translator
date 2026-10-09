@@ -814,7 +814,7 @@ def build_pdf_report_evidence(
     glossary = _string_mapping_value(glossary_value, "PDF glossary")
     zone_targets, zone_attempts = _zone_snapshot(zone_values)
     semantic_review = _semantic_review_from_value(
-        review_value, set(zone_values), zone_attempts
+        review_value, set(zone_values), None if native_units else zone_attempts
     )
     source_hash = hashlib.sha256(source_pdf).hexdigest()
     if (
@@ -1353,8 +1353,13 @@ def _zone_snapshot(
 def _semantic_review_from_value(
     review: Mapping[str, Any],
     zone_ids: set[str],
-    zone_attempts: Mapping[str, int],
+    zone_attempts: Mapping[str, int] | None,
 ) -> dict[str, object]:
+    """Validate actual retries, with expected-attempt parity when applicable.
+
+    Native source zones are immutable initial assignments. Legacy reports and
+    typed manifest audit records still supply attempts for strict equality.
+    """
     fields = {
         "semantic_input_sha256",
         "retries",
@@ -1379,7 +1384,9 @@ def _semantic_review_from_value(
         for zone_id, count in retries.items()
     ):
         raise PdfQAFailure("semantic review retries do not exactly cover PDF zones")
-    if any(retries[zone_id] != zone_attempts[zone_id] for zone_id in zone_ids):
+    if zone_attempts is not None and any(
+        retries[zone_id] != zone_attempts[zone_id] for zone_id in zone_ids
+    ):
         raise PdfQAFailure("semantic review retries disagree with PDF zone attempts")
     if not isinstance(findings, Mapping) or set(findings) != zone_ids:
         raise PdfQAFailure("semantic review findings do not exactly cover PDF zones")

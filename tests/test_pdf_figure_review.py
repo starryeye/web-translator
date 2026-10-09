@@ -233,6 +233,140 @@ def test_figure_free_legacy_or_optional_empty_review_round_trips(tmp_path, evide
     assert ("figure-text-input.json" in files) is evidence
 
 
+@pytest.mark.parametrize("retry", [1, 2])
+@pytest.mark.parametrize("entry", ["direct", "lifecycle"])
+def test_native_immutable_attempt_preserves_actual_retry_history(tmp_path, retry, entry):
+    from tests.test_pdf_qa import _write_passing_layout_review
+    from web_translator.pdf_assemble import assemble_pdf
+    from web_translator.pdf_qa import prepare_pdf_qa, finalize_pdf_output, PdfQAFailure
+    from web_translator.pdf_report import PdfFinalManifest
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+
+    run, translations = publication_case(
+        tmp_path, case="diagram" if entry == "direct" else "figure-free",
+    )
+    immutable = {
+        p.relative_to(run.run_dir): (p.read_bytes(), p.stat().st_ino)
+        for p in run.run_dir.rglob("*") if p.is_file() and p.name != "review.json"
+    }
+    assert json.loads((run.run_dir / "zones/zone-001.json").read_bytes())["attempt"] == 0
+    semantic_digest = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+    if entry == "lifecycle":
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    master["retries"] = {"zone-001": retry}
+    for finding in master["section_findings"]["zone-001"]:
+        finding["evidence"] += f" TEST ONLY: {retry} actual same-agent style retries."
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    assert build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256 == semantic_digest
+    if entry == "direct":
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert prepare_pdf_qa(run.run_dir, run.output_dir).passed
+    _write_passing_layout_review(run.run_dir)
+    finalize_pdf_output(run.run_dir, run.output_dir)
+    manifest = json.loads((run.output_dir / "manifest.json").read_bytes())
+    assert manifest["translation"]["retries"] == {"zone-001": retry}
+    assert manifest["translation"]["master_semantic_review"]["retries"] == {"zone-001": retry}
+    assert PdfFinalManifest.from_dict(manifest).to_dict() == manifest
+    report = (run.output_dir / "review-report.md").read_text()
+    assert json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0]) == manifest
+    assert f"{retry} actual same-agent style retries" in report.split("```json\n", 1)[0]
+    assert sorted(p.name for p in run.output_dir.iterdir()) == ["manifest.json", "review-report.md", "translated.pdf"]
+    assert all((run.run_dir / p).read_bytes() == payload and (run.run_dir / p).stat().st_ino == inode
+               for p, (payload, inode) in immutable.items())
+    for field in ["outer", "inner"]:
+        bad = deepcopy(manifest)
+        target = bad["translation"] if field == "outer" else bad["translation"]["master_semantic_review"]
+        target["retries"] = {"zone-001": 0}
+        with pytest.raises(PdfQAFailure, match="retries"):
+            PdfFinalManifest.from_dict(bad)
+    for count in [False, True, -1, 3, 0.5, "1"]:
+        bad = deepcopy(manifest)
+        # Even matching outer/inner values must not bypass retry typing/bounds.
+        bad["translation"]["retries"] = {"zone-001": count}
+        bad["translation"]["master_semantic_review"]["retries"] = {"zone-001": count}
+        with pytest.raises(PdfQAFailure, match="retries"):
+            PdfFinalManifest.from_dict(bad)
+
+
+@pytest.mark.parametrize("attempt", ["missing", False, True, "extra", -1, 3, 0.5])
+def test_native_direct_assembly_validates_immutable_zone_attempt(tmp_path, attempt):
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    run, translations = publication_case(tmp_path, case="figure-free")
+    path = run.run_dir / "zones/zone-001.json"
+    zone = json.loads(path.read_bytes())
+    if attempt == "missing": zone.pop("attempt")
+    elif attempt == "extra": zone["unexpected"] = "TEST ONLY malformed bound source"
+    else: zone["attempt"] = attempt
+    path.write_text(json.dumps(zone) + "\n")
+    # Renew only this synthetic binding/digest so the consumer, not stale-input
+    # rejection, must validate the malformed immutable zone.
+    rebind_native_fixture(run.run_dir)
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    master["semantic_input_sha256"] = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+    master["retries"] = {"zone-001": 1 if attempt is True else 0}
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    with pytest.raises(PdfAssemblyError, match="zone|attempt"):
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+    assert not (run.run_dir / "layout.json").exists()
+    assert not run.output_dir.exists()
+
+
+@pytest.mark.parametrize("retries", [
+    {}, {"zone-999": 0}, {"zone-001": 0, "zone-999": 0},
+    {"zone-001": False}, {"zone-001": True}, {"zone-001": -1},
+    {"zone-001": 3}, {"zone-001": 0.5}, {"zone-001": "1"},
+])
+def test_native_actual_retry_mapping_remains_strict(tmp_path, retries):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path, case="figure-free")
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    master["retries"] = retries
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    with pytest.raises(PdfAssemblyError, match="retries"):
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+
+
+@pytest.mark.parametrize("retry", [1, 2])
+def test_legacy_semantic_review_retains_expected_attempt_equality(tmp_path, retry):
+    from web_translator.pdf_report import _semantic_review_from_value
+    from web_translator.pdf_qa import PdfQAFailure
+    run, _ = publication_case(tmp_path, case="figure-free")
+    master = json.loads((run.run_dir / "review.json").read_bytes())
+    master["retries"] = {"zone-001": retry}
+    with pytest.raises(PdfQAFailure, match="retries disagree"):
+        _semantic_review_from_value(master, {"zone-001"}, {"zone-001": 0})
+    assert _semantic_review_from_value(master, {"zone-001"}, {"zone-001": retry})["retries"] == {"zone-001": retry}
+
+
+@pytest.mark.parametrize("damage", ["missing-dimension", "duplicate-dimension", "hidden-required", "unresolved-required", "extra-unresolved"])
+def test_native_actual_retries_do_not_relax_semantic_findings(tmp_path, damage):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path, case="figure-free")
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    master["retries"] = {"zone-001": 1}
+    findings = master["section_findings"]["zone-001"]
+    if damage == "missing-dimension": findings.pop()
+    elif damage == "duplicate-dimension": findings.append(deepcopy(findings[0]))
+    elif damage in {"hidden-required", "unresolved-required"}:
+        findings[0]["verdict"] = "required-fix"
+        if damage == "unresolved-required":
+            master["unresolved_required"] = [f"zone-001:{findings[0]['dimension']}"]
+    else: master["unresolved_required"] = ["zone-001:naturalness"]
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    with pytest.raises(PdfAssemblyError, match="dimensions|unresolved required"):
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+
+
 def test_figure_review_final_manifest_and_report_retain_complete_evidence(prepared_figure_publication):
     from web_translator.pdf_qa import finalize_pdf_output
     from web_translator.pdf_report import PdfFinalManifest

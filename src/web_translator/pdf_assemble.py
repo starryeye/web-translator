@@ -290,12 +290,15 @@ def assemble_pdf(
             if semantic_snapshot is None:
                 semantic_snapshot = binding_stack.enter_context(hold_pdf_semantic_inputs(run_anchor))
             validate_pdf_semantic_review_snapshot(semantic_snapshot, review_value)
-            from web_translator.pdf_report import _semantic_review_from_value
-            zone_attempts = {
-                Path(path).stem: json.loads(payload).get("attempt", 0)
+            from web_translator.pdf_report import _semantic_review_from_value, _zone_snapshot
+            zone_values = {
+                Path(path).stem: json.loads(payload)
                 for path, payload in semantic_snapshot.payloads.items() if path.startswith("zones/")
             }
-            _semantic_review_from_value(review_value, set(zone_attempts), zone_attempts)
+            _zone_snapshot(zone_values)
+            # Native bound zones retain initial assignment attempts, not later
+            # same-agent retry history recorded in the master review.
+            _semantic_review_from_value(review_value, set(zone_values), None)
             if review_value.get("unresolved_required"):
                 raise PdfAssemblyError("semantic review has unresolved required findings")
             figure_inputs = binding_stack.enter_context(hold_pdf_figure_inputs(run_anchor))
