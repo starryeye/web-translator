@@ -2495,7 +2495,11 @@ def _validated_composite_running_label(
         grouped.setdefault(item[0].casefold(), []).append((block, item))
     for group in grouped.values():
         if len(group) < 2:
-            raise PdfAssemblyError(f"ambiguous repeated {kind} evidence")
+            # A section label can legitimately occur on only one page within
+            # the captured range (for example, a one-page subsection). The
+            # surrounding composite bands still prove varying running labels,
+            # so omit the family instead of rejecting the singleton label.
+            return _VARYING_COMPOSITE_RUNNING_LABELS
         ordered = sorted(group, key=lambda item: item[0].page_number)
         if any(
             right_evidence[1] - left_evidence[1]

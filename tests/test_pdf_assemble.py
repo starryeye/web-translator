@@ -2423,6 +2423,68 @@ def test_assemble_pdf_omits_coherent_varying_composite_footers(tmp_path: Path) -
     )
 
 
+def test_assemble_pdf_omits_varying_composite_footer_with_singleton_section_label(
+    tmp_path: Path,
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    document = PdfDocument.from_dict(
+        json.loads((run_dir / "document.json").read_text(encoding="utf-8"))
+    )
+    footer_style = PdfBlockStyle(9.0, False, "left", 0.0, 0.0)
+    document = replace(
+        document,
+        page_count=3,
+        pages=[
+            *document.pages,
+            PdfPage(number=2, width=612.0, height=792.0, rotation=0),
+            PdfPage(number=3, width=612.0, height=792.0, rotation=0),
+        ],
+        blocks=[
+            *document.blocks,
+            PdfBlock(
+                id="pdf:page-0001:block-0097",
+                page_number=1,
+                order=3,
+                kind="footer",
+                bbox=(72.0, 770.0, 220.0, 782.0),
+                style=footer_style,
+                source_text="vi | Front Matter",
+            ),
+            PdfBlock(
+                id="pdf:page-0002:block-0098",
+                page_number=2,
+                order=4,
+                kind="footer",
+                bbox=(390.0, 770.0, 540.0, 782.0),
+                style=footer_style,
+                source_text="Front Matter | vii",
+            ),
+            PdfBlock(
+                id="pdf:page-0003:block-0099",
+                page_number=3,
+                order=5,
+                kind="footer",
+                bbox=(390.0, 770.0, 540.0, 782.0),
+                style=footer_style,
+                source_text="Unique Section | viii",
+            ),
+        ],
+    )
+    (run_dir / "document.json").write_text(
+        json.dumps(document.to_dict(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+
+    rebind_native_fixture(run_dir)
+
+    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
+    assert "Front Matter" not in text
+    assert "Unique Section" not in text
+
+
 def test_assemble_pdf_rejects_repeated_identical_composite_footer(tmp_path: Path) -> None:
     run_dir, translations, glossary = _assembly_run(tmp_path)
     document = PdfDocument.from_dict(
