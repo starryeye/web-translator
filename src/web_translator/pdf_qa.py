@@ -30,10 +30,13 @@ from web_translator.models import (
     read_segments_stream,
 )
 from web_translator.pdf_flowables import PdfAssemblyError, PdfAssemblyLayout
+from web_translator.pdf_figure_review import (
+    FIGURE_TEXT_INPUT_NAME, PdfFigureReviewError, hold_pdf_figure_inputs,
+    validate_current_pdf_figure_review,
+)
 from web_translator.pdf_media import (
     PdfMediaError,
     build_contact_sheets,
-    figure_owns_character,
     render_pdf_pages,
 )
 from web_translator.pdf_models import (
@@ -48,6 +51,8 @@ from web_translator.pdf_review import (
     hold_pdf_semantic_inputs,
     validate_pdf_semantic_review,
     validate_pdf_semantic_review_snapshot,
+    parse_pdf_preserved_names,
+    preserved_name_pattern,
 )
 
 
@@ -94,20 +99,13 @@ _SPECIALIZED_ROLES = {
 _LATIN_DENSITY_LIMIT = 0.35
 _LATIN_CHARACTER = re.compile(r"[A-Za-z]")
 _KOREAN_CHARACTER = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
-_PROPER_NAME_METADATA = re.compile(
-    r"(?:[A-Z][a-z]+|[A-Z]\.)"
-    r"(?:[ -](?:[A-Z][a-z]+|[A-Z]\.)){1,4}\Z"
+_SQL_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
+_SQL_COLUMN = rf"(?:\*|[A-Za-z_][A-Za-z0-9_]*\.\*|{_SQL_IDENTIFIER})"
+_SQL_QUERY = re.compile(
+    rf"SELECT\s+{_SQL_COLUMN}(?:\s*,\s*{_SQL_COLUMN})*\s+FROM\s+{_SQL_IDENTIFIER}"
+    rf"(?:\s+JOIN\s+{_SQL_IDENTIFIER}\s+ON\s+{_SQL_IDENTIFIER}\s*=\s*{_SQL_IDENTIFIER})*"
+    rf"(?:\s+WHERE\s+{_SQL_IDENTIFIER}\s*=\s*{_SQL_IDENTIFIER})?\s*;?\Z"
 )
-_PUBLICATION_METADATA = re.compile(
-    r"copyright|registered trademark|\btrademarks?\b|"
-    r"^(?:editors?|copyeditor|production editor|proofreader|indexer|"
-    r"interior designer|cover designer|illustrator)\s*:",
-    re.IGNORECASE,
-)
-_SOURCE_NAME_TOKEN = re.compile(
-    r"(?<![A-Za-z])[A-Z][A-Za-z’'\-]*(?![A-Za-z])"
-)
-_SQL_QUERY = re.compile(r"^SELECT\s+.+\s+FROM\s+.+\Z", re.DOTALL)
 _ACRONYM = re.compile(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])")
 _IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]+_[A-Za-z0-9_]+|[a-z]+[A-Z][A-Za-z0-9]*)(?![A-Za-z0-9_])"
@@ -324,6 +322,8 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
     publication_rolled_back = False
     semantic_context: Any | None = None
     semantic_snapshot: PdfSemanticInputSnapshot | None = None
+    figure_context: Any | None = None
+    figure_snapshot: Any | None = None
     try:
         run_anchor = assembly._open_directory_anchor(run_dir, "run")
         semantic_context = hold_pdf_semantic_inputs(run_anchor)
@@ -441,6 +441,18 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             "staged translated PDF",
         )
         staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        if FIGURE_TEXT_INPUT_NAME in semantic_snapshot.payloads:
+            figure_context = hold_pdf_figure_inputs(run_anchor)
+            figure_snapshot = figure_context.__enter__()
+            document = PdfDocument.from_dict(document_value)
+            image_evidence = _validate_text_image_separation(document, layout, snapshot_bytes["source.pdf"],
+                figure_snapshot=figure_snapshot,
+                inventory_bytes=semantic_snapshot.payloads[FIGURE_TEXT_INPUT_NAME],
+                review_value=semantic_value["figure_text_review"], review_bytes=snapshot_bytes["review.json"])
+            current_findings = [finding.evidence for finding in qa.findings if finding.code == "publication.text_image_separation"]
+            if current_findings != [image_evidence]:
+                raise PdfQAFailure("figure inventory/review binding differs from prepared QA; renew QA and visual review")
+            _validate_figure_media(run_anchor, document, pdf_bytes)
         if (
             staged_hash != qa.staged_pdf_sha256
             or staged_hash != review.staged_pdf_sha256
@@ -495,6 +507,18 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
                 assembly._close_opened_file(item)
         output_parent_anchor = _ensure_output_parent(output_dir)
         _validate_locations(run_anchor, output_dir)
+        def verify_figure_publication_inputs() -> None:
+            try:
+                _verify_report_evidence_snapshot(run_anchor, opened, snapshot_hashes)
+                semantic_snapshot.verify()
+                if figure_snapshot is not None:
+                    figure_snapshot.verify()
+            except (PdfSemanticReviewError, PdfFigureReviewError, PdfAssemblyError) as error:
+                # Normalize all held-input refusals so post-rename failures enter
+                # the same recoverable rollback path as artifact failures.
+                raise PdfQAFailure(str(error)) from error
+
+        verify_figure_publication_inputs()
         _publish_final_directory_no_clobber(
             run_anchor,
             staged_anchor,
@@ -502,6 +526,7 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             output_dir.name,
             final_identities,
             final_hashes,
+            **({"verify_inputs": verify_figure_publication_inputs} if figure_snapshot is not None else {}),
         )
         completed = True
         return output_dir
@@ -537,6 +562,8 @@ def finalize_pdf_output(run_dir: Path, output_dir: Path) -> Path:
             staged_anchor.close()
         if output_parent_anchor is not None:
             output_parent_anchor.close()
+        if figure_context is not None:
+            figure_context.__exit__(None, None, None)
         if semantic_context is not None:
             semantic_context.__exit__(None, None, None)
         if run_anchor is not None:
@@ -711,6 +738,8 @@ def _publish_final_directory_no_clobber(
     destination_name: str,
     expected_identities: Mapping[str, tuple[int, int]],
     expected_hashes: Mapping[str, str],
+    *,
+    verify_inputs: Any | None = None,
 ) -> None:
     destination = destination_parent.path / destination_name
     publication_handle: int | None = None
@@ -727,6 +756,8 @@ def _publish_final_directory_no_clobber(
             expected_hashes,
         )
         destination_parent.verify_visible()
+        if verify_inputs is not None:
+            verify_inputs()
         publication_handle = _rename_anchored_directory_no_replace(
             source_parent,
             "staged-output",
@@ -758,6 +789,8 @@ def _publish_final_directory_no_clobber(
                     expected_identities,
                     expected_hashes,
                 )
+                if verify_inputs is not None:
+                    verify_inputs()
             finally:
                 published.close()
         except (PdfQAFailure, PdfAssemblyError) as error:
@@ -1280,6 +1313,9 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
     temporary_name: str | None = None
     semantic_context: Any | None = None
     semantic_snapshot: PdfSemanticInputSnapshot | None = None
+    figure_context: Any | None = None
+    figure_snapshot: Any | None = None
+    review_bytes: bytes | None = None
     try:
         run_anchor = assembly._open_directory_anchor(run_dir, "run")
         semantic_context = hold_pdf_semantic_inputs(run_anchor)
@@ -1321,6 +1357,12 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             translation_zone_ids,
             semantic_snapshot=semantic_snapshot,
         )
+        review_bytes = assembly._read_opened_bytes(opened["review.json"], run_dir / "review.json", "PDF master review")
+        if _strict_json_mapping(review_bytes, "PDF master review") != review:
+            raise PdfQAFailure("PDF master review changed during QA consumption")
+        if FIGURE_TEXT_INPUT_NAME in semantic_snapshot.payloads:
+            figure_context = hold_pdf_figure_inputs(run_anchor)
+            figure_snapshot = figure_context.__enter__()
         source_pdf_bytes = _validate_source(document, source, opened["source.pdf"])
         _validate_publication_evidence(document_value, layout_value, layout)
         if document.schema_version == "1.2":
@@ -1335,7 +1377,9 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         toc_evidence = _validate_toc_pages(document, layout, staged_reader)
         reference_evidence = _validate_reference_layout(document, layout)
         image_evidence = _validate_text_image_separation(
-            document, layout, source_pdf_bytes
+            document, layout, source_pdf_bytes, figure_snapshot=figure_snapshot,
+            inventory_bytes=semantic_snapshot.payloads.get(FIGURE_TEXT_INPUT_NAME),
+            review_value=review.get("figure_text_review"), review_bytes=review_bytes,
         )
         furniture_evidence = _validate_running_furniture(document, layout)
         callout_evidence = _validate_callout_layout(document, layout)
@@ -1349,6 +1393,7 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             {block.id: translated for block, _segment, translated in normalized},
             segments={segment.id: segment for segment in segments},
             glossary=glossary,
+            preserved_names=review.get("preserved_names", {}),
         )
         staged_hash = hashlib.sha256(pdf_bytes).hexdigest()
         if layout.staged_pdf_sha256 != staged_hash:
@@ -1523,6 +1568,7 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
         assembly._finalize_opened_file(qa_json, "PDF QA record")
         qa_json.stream.close()
         assembly._verify_anchored_evidence(qa_pages_anchor, qa_artifacts)
+        _verify_prepare_figure_snapshot(run_anchor, opened, figure_snapshot, review_bytes)
         if prior is not None:
             _move_prior_evidence_to_staging(run_anchor, staging_anchor, prior)
         assembly._verify_anchored_evidence(
@@ -1558,6 +1604,7 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
             qa_artifact_hashes,
         )
         semantic_snapshot.verify()
+        _verify_prepare_figure_snapshot(run_anchor, opened, figure_snapshot, review_bytes)
         completed = True
         if prior is not None:
             _discard_prior_evidence(staging_anchor, prior)
@@ -1639,10 +1686,22 @@ def prepare_pdf_qa(run_dir: Path, output_dir: Path) -> PdfQAResult:
                     child=staging_anchor,
                 )
             staging_anchor.close()
+        if figure_context is not None:
+            figure_context.__exit__(None, None, None)
         if semantic_context is not None:
             semantic_context.__exit__(None, None, None)
         if run_anchor is not None:
             run_anchor.close()
+
+
+def _verify_prepare_figure_snapshot(run_anchor: Any, opened: Mapping[str, Any],
+                                   figure_snapshot: Any | None, review_bytes: bytes | None) -> None:
+    if figure_snapshot is None:
+        return
+    figure_snapshot.verify()
+    assembly._verify_anchored_evidence(run_anchor, {"review.json": opened["review.json"]})
+    if assembly._read_opened_bytes(opened["review.json"], run_anchor.path / "review.json", "PDF master review") != review_bytes:
+        raise PdfQAFailure("PDF master review changed content during QA preparation")
 
 
 def _verify_staged_pdf_content(
@@ -1856,12 +1915,13 @@ def _review(
             validate_pdf_semantic_review_snapshot(semantic_snapshot, value)
     except PdfSemanticReviewError as error:
         raise PdfQAFailure(str(error)) from error
-    if set(value) != {
+    fields = {
         "semantic_input_sha256",
         "retries",
         "section_findings",
         "unresolved_required",
-    }:
+    }
+    if not fields <= set(value) <= fields | {"preserved_names", "figure_text_review"}:
         raise PdfQAFailure("semantic review fields are not exact")
     unresolved = value["unresolved_required"]
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
@@ -2221,189 +2281,37 @@ def _validate_reference_layout(
     return f"Validated separate layout traceability for {len(entries)} reference entries."
 
 
-def _source_character_box(character: Mapping[str, object]) -> tuple[float, float, float, float] | None:
-    try:
-        box = tuple(float(character[key]) for key in ("x0", "top", "x1", "bottom"))
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not all(math.isfinite(item) for item in box) or box[2] <= box[0] or box[3] <= box[1]:
-        return None
-    return box  # type: ignore[return-value]
-
-
-def _top_boxes_intersect(
-    left: tuple[float, float, float, float],
-    right: tuple[float, float, float, float],
-) -> bool:
-    return (
-        min(left[2], right[2]) - max(left[0], right[0]) > 1e-6
-        and min(left[3], right[3]) - max(left[1], right[1]) > 1e-6
-    )
-
-
 def _validate_text_image_separation(
     document: PdfDocument,
     layout: PdfAssemblyLayout,
     source_pdf_bytes: bytes,
+    *,
+    figure_snapshot: Any | None = None,
+    inventory_bytes: bytes | None = None,
+    review_value: Any | None = None,
+    review_bytes: bytes | None = None,
 ) -> str:
-    """Recompute figure character ownership from the already verified held source."""
+    """Verify source ownership and explicit complete AI approval, never infer labels."""
     figures = [block for block in document.blocks if block.kind == "figure"]
     by_block = _flowables_by_block(layout)
     if any(not by_block.get(figure.id) for figure in figures):
         raise PdfQAFailure("figure is missing output layout evidence")
-    translatable = [
-        block
-        for block in document.blocks
-        if block.segment_id is not None and block.kind not in _RUNNING_FURNITURE_KINDS
-    ]
-    owned_total = 0
+    if inventory_bytes is None and not figures:
+        return "Validated 0 source figure regions from held bytes; 0 approved image-owned characters."
+    if figure_snapshot is None or inventory_bytes is None or review_value is None or review_bytes is None:
+        raise PdfQAFailure("source figures require exact figure inventory and explicit AI review")
+    if figure_snapshot.document != document or figure_snapshot.source_pdf_bytes != source_pdf_bytes:
+        raise PdfQAFailure("figure review held inputs disagree with QA inputs")
     try:
-        with pdfplumber.open(io.BytesIO(source_pdf_bytes)) as pdf:
-            if len(pdf.pages) != document.page_count:
-                raise PdfQAFailure("held source page count disagrees with document evidence")
-            for figure in figures:
-                page = pdf.pages[figure.page_number - 1]
-                owned: list[Mapping[str, object]] = []
-                for raw_character in page.chars:
-                    if not isinstance(raw_character, Mapping):
-                        raise PdfQAFailure("held source contains malformed character evidence")
-                    if not str(raw_character.get("text", "")).strip():
-                        continue
-                    try:
-                        is_owned = figure_owns_character(
-                            raw_character, figure.bbox, page_number=figure.page_number
-                        )
-                    except PdfMediaError as error:
-                        raise PdfQAFailure(
-                            f"figure selectable-text ownership is ambiguous: {error}"
-                        ) from error
-                    if is_owned:
-                        owned.append(raw_character)
-                owned_total += len(owned)
-                for character in owned:
-                    char_box = _source_character_box(character)
-                    assert char_box is not None
-                    if any(
-                        block.page_number == figure.page_number
-                        and block.id != figure.id
-                        and _top_boxes_intersect(char_box, block.bbox)
-                        for block in translatable
-                    ):
-                        raise PdfQAFailure(
-                            "figure contains translatable selectable text: "
-                            f"page {figure.page_number} block {figure.id} bounds {figure.bbox}"
-                        )
-                words = page.extract_words(return_chars=True)
-                owned_words = []
-                for word in words if isinstance(words, list) else []:
-                    chars = word.get("chars", [])
-                    if not isinstance(chars, list) or not chars:
-                        continue
-                    nonspace = [char for char in chars if str(char.get("text", "")).strip()]
-                    if nonspace and all(
-                        figure_owns_character(
-                            char, figure.bbox, page_number=figure.page_number
-                        )
-                        for char in nonspace
-                    ):
-                        owned_words.append(word)
-                line_groups: dict[int, list[Mapping[str, object]]] = {}
-                for word in owned_words:
-                    try:
-                        key = round(float(word["top"]) / 3)
-                    except (KeyError, TypeError, ValueError):
-                        raise PdfQAFailure("held source contains malformed word evidence")
-                    line_groups.setdefault(key, []).append(word)
-                prose_lines = [
-                    group
-                    for group in line_groups.values()
-                    if len(group) >= 4
-                    and sum(len(str(word.get("text", ""))) for word in group) >= 24
-                    and not _looks_like_diagram_label(group)
-                ]
-                clear_single_lines = [
-                    group for group in prose_lines if _looks_like_complete_prose_line(group)
-                ]
-                if _has_aligned_prose_lines(prose_lines) or clear_single_lines:
-                    description = (
-                        f"{len(prose_lines)} prose lines"
-                        if len(prose_lines) >= 2
-                        else "a complete prose sentence"
-                    )
-                    raise PdfQAFailure(
-                        "figure contains translatable selectable text: "
-                        f"page {figure.page_number} block {figure.id} has {description}"
-                    )
-    except PdfQAFailure:
-        raise
-    except Exception as error:
-        raise PdfQAFailure(f"cannot validate held source figure ownership: {error}") from error
-    return (
-        f"Validated {len(figures)} source figure regions from held bytes; "
-        f"{owned_total} sparse artwork-label characters remained image-owned."
-    )
-
-
-def _looks_like_complete_prose_line(words: Sequence[Mapping[str, object]]) -> bool:
-    text = " ".join(str(word.get("text", "")) for word in words).strip()
-    lexical_words = re.findall(
-        r"[A-Za-z\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]+",
-        text,
-    )
-    letters = len(_LATIN_CHARACTER.findall(text)) + len(_KOREAN_CHARACTER.findall(text))
-    return (
-        len(lexical_words) >= 5
-        and letters >= 28
-        and re.search(r"[.!?。！？]\s*$", text) is not None
-    )
-
-
-def _has_aligned_prose_lines(
-    lines: Sequence[Sequence[Mapping[str, object]]],
-) -> bool:
-    """Recognize multiple prose-like lines as a text block, not diagram labels."""
-    left_edges: list[float] = []
-    for words in lines:
-        try:
-            left_edges.append(min(float(word["x0"]) for word in words))
-        except (KeyError, TypeError, ValueError):
-            continue
-    aligned = any(
-        abs(right - left) <= 12.0
-        for index, left in enumerate(left_edges)
-        for right in left_edges[index + 1 :]
-    )
-    return aligned
-
-
-def _looks_like_diagram_label(words: Sequence[Mapping[str, object]]) -> bool:
-    text = " ".join(str(word.get("text", "")) for word in words)
-    return (
-        len(words) <= 8
-        and not _looks_like_complete_prose_line(words)
-        and bool(re.search(r"[0-9():]", text))
-    )
-
-
-def _mask_source_name_tokens(
-    characters: list[str], source_text: str, exclusions: list[str], label: str,
-    *, prose: bool = False,
-) -> None:
-    """Exclude only preserved capitalized labels backed by exact source tokens."""
-    source_tokens = set()
-    for match in _SOURCE_NAME_TOKEN.finditer(source_text):
-        prefix = source_text[:match.start()].rstrip()
-        if prose and (not prefix.strip("•- ") or re.search(r"[.!?]$", prefix)):
-            continue
-        source_tokens.add(match.group())
-    source_tokens -= {"The", "A", "An", "This", "That", "These", "Those", "All", "It"}
-    for token in sorted(source_tokens, key=lambda value: (-len(value), value)):
-        _mask_matches(
-            characters,
-            re.compile(rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])"),
-            label,
-            exclusions,
-        )
+        validate_current_pdf_figure_review(figure_snapshot, inventory_bytes=inventory_bytes,
+                                          review_value=review_value)
+    except PdfFigureReviewError as error:
+        raise PdfQAFailure(str(error)) from error
+    owned_total = sum(len(f["characters"]) for f in json.loads(inventory_bytes)["figures"])
+    return (f"Validated {len(figures)} source figure regions from held bytes; "
+            f"{owned_total} approved image-owned characters; "
+            f"inventory_sha256={hashlib.sha256(inventory_bytes).hexdigest()}; "
+            f"review_sha256={hashlib.sha256(review_bytes).hexdigest()}.")
 
 
 def _validate_running_furniture(
@@ -2528,8 +2436,13 @@ def _validate_latin_density(
     *,
     segments: Mapping[str, Segment],
     glossary: Mapping[str, str],
+    preserved_names: Mapping[str, Any] | None = None,
 ) -> str:
     """Enforce Korean prose density after explicit, evidenced exclusions."""
+    try:
+        reviewed_names = parse_pdf_preserved_names(preserved_names or {})
+    except PdfSemanticReviewError as error:
+        raise PdfQAFailure(str(error)) from error
     seen_terms: set[str] = set()
     applied_exclusions: Counter[str] = Counter()
     maximum = 0.0
@@ -2554,14 +2467,9 @@ def _validate_latin_density(
                     _mask_span(characters, found, found + len(token.value))
                     exclusions.append(f"protected-{token.kind}")
                     start = found + len(token.value)
-        if _PUBLICATION_METADATA.search(block.source_text):
-            _mask_source_name_tokens(
-                characters, block.source_text, exclusions, "source-publication-name"
-            )
+        for record in reviewed_names.get(block.segment_id or "", []):
+            _mask_matches(characters, preserved_name_pattern(record["text"]), "reviewed-name", exclusions)
         if block.semantic_role in _TOC_ROLES:
-            _mask_source_name_tokens(
-                characters, block.source_text, exclusions, "source-toc-label"
-            )
             reference = _TOC_SOURCE_REFERENCE.fullmatch(block.source_text)
             if reference is not None:
                 _mask_matches(
@@ -2570,38 +2478,12 @@ def _validate_latin_density(
                     "source-toc-page-reference",
                     exclusions,
                 )
-        if block.semantic_role == "epigraph-attribution":
-            _mask_source_name_tokens(
-                characters, block.source_text, exclusions, "source-attribution-name"
-            )
-        if block.kind in {"paragraph", "list-item"} and _KOREAN_CHARACTER.search(text):
-            _mask_source_name_tokens(
-                characters, block.source_text, exclusions, "source-prose-name",
-                prose=True,
-            )
-        if (
-            block.kind == "heading"
-            and text == block.source_text
-            and _PROPER_NAME_METADATA.fullmatch(block.source_text.strip())
-            and any(
-                re.search(
-                    rf"\bby\s+{re.escape(block.source_text)}(?![A-Za-z])",
-                    candidate.source_text,
-                    re.IGNORECASE,
+        for source_line in block.source_text.splitlines():
+            if _SQL_QUERY.fullmatch(source_line) and re.search(r"[.*=]", source_line):
+                _mask_matches(
+                    characters, re.compile(re.escape(source_line)),
+                    "source-sql-query", exclusions,
                 )
-                for candidate in document.blocks
-            )
-        ):
-            _mask_source_name_tokens(
-                characters, block.source_text, exclusions, "source-author-name"
-            )
-        if (
-            text == block.source_text
-            and _SQL_QUERY.fullmatch(block.source_text)
-            and re.search(r"[.*=]", block.source_text)
-        ):
-            applied_exclusions["source-sql-query"] += 1
-            continue
         visible_before_gloss = "".join(characters)
         for term, gloss in sorted(glossary.items(), key=lambda item: (-len(item[0]), item[0])):
             pair = f"{gloss}({term})"

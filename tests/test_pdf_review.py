@@ -21,6 +21,15 @@ from web_translator.zones import Zone
 from tests.test_pdf_unit_bindings import bound_unit_run
 
 
+@pytest.mark.parametrize("field", ["preserved_names", "figure_text_review"])
+def test_html_review_rejects_pdf_only_evidence(tmp_path, field):
+    from web_translator.cli import _read_review
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps({"retries": {}, "section_findings": {}, "unresolved_required": [], field: {}}))
+    with pytest.raises(CLIContractError, match="review fields"):
+        _read_review(path, [])
+
+
 def test_pdf_review_requires_native_document_even_without_binding(tmp_path):
     run, _ = _reviewed_run(tmp_path)
     for name in ("document.json", "assignments/.pdf-unit-binding.json"):
@@ -97,7 +106,7 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+def _reviewed_run(tmp_path: Path, *, names: bool = False) -> tuple[Path, dict[str, object]]:
     from dataclasses import replace
     from tests.pdf_fixtures import make_pdf_source_record
     from tests.pdf_unit_fixtures import make_unit_document, rebind_native_fixture
@@ -114,10 +123,26 @@ def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         run_dir / "translations" / "zone-001.jsonl",
         '{"segment_id":"seg-000001","text":"번역"}\n',
     )
-    document = replace(make_unit_document(), extracted_schema_version="1.2")
+    source_document = (
+        make_unit_document(("Alice Brown writes", "about systems."), operation="space")
+        if names else make_unit_document()
+    )
+    document = replace(source_document, extracted_schema_version="1.2")
     _write(run_dir / "document.json", json.dumps(document.to_dict()))
     _write(run_dir / "source.json", json.dumps(make_pdf_source_record().to_dict()))
+    if names:
+        from web_translator.models import Segment
+        _write(run_dir / "segments.jsonl", json.dumps(Segment(
+            id="seg-000001", locator=document.blocks[0].id, semantic_type="paragraph",
+            heading_path=[], source_text="Alice Brown writes about systems.",
+            protected=[], context_ids=[], target=True,
+        ).to_dict()) + "\n")
     rebind_native_fixture(run_dir)
+    if names:
+        _write(run_dir / "translations" / "zone-001.jsonl", json.dumps({
+            "segment_id": "seg-000001", "text": "Alice Brown은 시스템을 설명한다.",
+            "notes": None, "glossary_observations": {},
+        }) + "\n")
     semantic_input = build_pdf_semantic_review_input(run_dir)
     review: dict[str, object] = {
         "semantic_input_sha256": semantic_input.semantic_input_sha256,
@@ -126,6 +151,63 @@ def _reviewed_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         "unresolved_required": [],
     }
     return run_dir, review
+
+
+def test_pdf_review_accepts_explicit_source_backed_preserved_name(tmp_path: Path) -> None:
+    run, review = _reviewed_run(tmp_path, names=True)
+    review["preserved_names"] = {"seg-000001": [{
+        "text": "Alice Brown", "reason": "Reviewed personal name; retain exact source spelling.",
+    }]}
+    validate_pdf_semantic_review(run, review)
+
+
+@pytest.mark.parametrize("names", [
+    {"seg-999999": [{"text": "Alice Brown", "reason": "Author name"}]},
+    {"seg-000001": [{"text": "Foreign Name", "reason": "Not source backed"}]},
+    {"seg-000001": [{"text": "Alice Brown", "reason": ""}]},
+    {"seg-000001": [{"text": "Alice Brown", "reason": "Name", "extra": True}]},
+    {"seg-000001": [{"text": "Alice Brown", "reason": "Name"}, {"text": "Alice Brown", "reason": "Duplicate"}]},
+])
+def test_pdf_review_rejects_invalid_preserved_name_evidence(tmp_path: Path, names) -> None:
+    run, review = _reviewed_run(tmp_path, names=True)
+    review["preserved_names"] = names
+    with pytest.raises(PdfSemanticReviewError, match="preserved name"):
+        validate_pdf_semantic_review(run, review)
+
+
+@pytest.mark.parametrize("translated", [
+    "Alice Browne은 시스템을 설명한다.",
+    "alice brown은 시스템을 설명한다.",
+    "앨리스 브라운은 시스템을 설명한다.",
+])
+def test_pdf_review_requires_exact_preserved_spelling_in_translation(
+    tmp_path: Path, translated: str,
+) -> None:
+    run, review = _reviewed_run(tmp_path, names=True)
+    review["preserved_names"] = {"seg-000001": [{
+        "text": "Alice Brown", "reason": "Source author name.",
+    }]}
+    path = run / "translations" / "zone-001.jsonl"
+    value = json.loads(path.read_text())
+    value["text"] = translated
+    _write(path, json.dumps(value) + "\n")
+    review["semantic_input_sha256"] = build_pdf_semantic_review_input(run).semantic_input_sha256
+    with pytest.raises(PdfSemanticReviewError, match="not exact in source and translation"):
+        validate_pdf_semantic_review(run, review)
+
+
+def test_pdf_report_review_retains_explicit_preserved_names(tmp_path: Path) -> None:
+    from web_translator.pdf_report import _semantic_review_from_value
+    run, review = _reviewed_run(tmp_path, names=True)
+    names = {"seg-000001": [{"text": "Alice Brown", "reason": "Source author name."}]}
+    review["preserved_names"] = names
+    review["section_findings"] = {"zone-001": [
+        {"dimension": dimension, "verdict": "pass", "evidence": f"Reviewed {dimension}."}
+        for dimension in _DIMENSIONS
+    ]}
+    validate_pdf_semantic_review(run, review)
+    parsed = _semantic_review_from_value(review, {"zone-001"}, {"zone-001": 0})
+    assert parsed["preserved_names"] == names
 
 
 def test_pdf_semantic_review_input_is_typed_canonical_and_deterministic(

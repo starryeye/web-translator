@@ -24,11 +24,12 @@ def test_pdf_skill_commands_create_native_full_unit_assignments(tmp_path, capsys
     commands = [[values.get(arg, arg) for arg in line.split()[3:]]
                 for line in PDF_SKILL.read_text("utf-8").splitlines()
                 if line.startswith("<python> -m web_translator ")]
-    for args in commands[:3]:
-        assert main(args) == 0
+    by_command = {args[0]: args for args in commands}
+    for name in ["pdf-acquire", "pdf-extract", "pdf-figure-review-input", "plan-zones"]:
+        assert main(by_command[name]) == 0
     (run / "glossary.json").write_text("{}\n", encoding="utf-8")
     (run / "document-summary.txt").write_text("TEST ONLY generated assignment", encoding="utf-8")
-    assert main(commands[3]) == 0
+    assert main(by_command["prepare-assignments"]) == 0
     document = json.loads((run / "document.json").read_bytes())
     assert document["schema_version"] == document["extracted_schema_version"] == "1.2"
     unit = document["translation_units"][1]
@@ -40,7 +41,7 @@ def test_pdf_skill_commands_create_native_full_unit_assignments(tmp_path, capsys
     before = binding.read_bytes()
     document["extracted_schema_version"] = "1.1"
     (run / "document.json").write_text(json.dumps(document), encoding="utf-8")
-    assert main(commands[2]) != 0
+    assert main(by_command["plan-zones"]) != 0
     assert "native 1.2" in capsys.readouterr().err
     assert binding.read_bytes() == before
 

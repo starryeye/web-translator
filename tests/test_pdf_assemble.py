@@ -41,6 +41,7 @@ from web_translator.pdf_models import (
     PdfTableCell,
 )
 from tests.pdf_unit_fixtures import write_native_singleton_fixture, rebind_native_fixture, protect_fixture_note_markers, replace_fixture_document
+from tests.pdf_fixtures import prepare_test_empty_artwork_source, write_test_empty_artwork_approval
 
 
 ROOT = Path(__file__).parents[1]
@@ -265,7 +266,7 @@ def test_native_singleton_units_retain_rich_rendering(tmp_path):
     rebind_native_fixture(run)
     translations = {segment.id: Translation(segment.id, segment.source_text) for segment in segments}
     original = (run / "document.json").read_bytes()
-    assemble_pdf(run, translations, {}, tmp_path / "output")
+    _assemble_rich_fixture(run, translations, {}, tmp_path / "output")
     assert (run / "document.json").read_bytes() == original
     layout = read_pdf_layout(run / "layout.json")
     records = {record.block_id: record for record in layout.flowables}
@@ -672,6 +673,8 @@ def _rich_assembly_run(
     write_segments(run_dir / "segments.jsonl", segments)
     write_native_singleton_fixture(run_dir)
     protect_fixture_note_markers(run_dir, translations)
+    prepare_test_empty_artwork_source(run_dir, translations, {}, figures={
+        figure.id: "TEST ONLY page 1: fixed blue rectangle, no selectable labels, translated caption outside the artwork."})
     return run_dir, translations, {}, {
         "caption": caption.id,
         "external": external.id,
@@ -685,6 +688,23 @@ def _rich_assembly_run(
         "table_link_target": blocks[table_start_order + 1].id,
         "target": target.id,
     }
+
+
+def _assemble_rich_fixture(run_dir, translations, glossary, output):
+    """Renew intentional renderer fixture edits, only for its inspected empty blue art."""
+    original = json.loads((run_dir / "review.json").read_bytes())["figure_text_review"]["figures"]
+    assert len(original) == 1
+    with Image.open(run_dir / "media/figure-0001.png") as artwork:
+        assert artwork.size == (240, 120)
+        assert artwork.convert("RGB").getextrema() == ((42, 42), (120, 120), (196, 196))
+    (run_dir / "translations/zone-001.jsonl").write_text("".join(
+        json.dumps(value.to_dict(), ensure_ascii=False) + "\n" for value in translations.values()), encoding="utf-8")
+    (run_dir / "glossary.json").write_text(json.dumps(glossary) + "\n", encoding="utf-8")
+    rebind_native_fixture(run_dir)
+    write_test_empty_artwork_approval(run_dir, figures={
+        key: "TEST ONLY page 1: fixed blue rectangle inspected without selectable text; caption/body remain independent."
+        for key in original})
+    return assemble_pdf(run_dir, translations, glossary, output)
 
 
 def _embedded_font_programs(path: Path) -> dict[str, bytes]:
@@ -776,6 +796,11 @@ def _assemble_publication(run_dir: Path, output: Path) -> Path:
     write_native_singleton_fixture(run_dir)
     translations = {s.id: Translation(s.id, s.source_text) for s in read_segments(run_dir / "segments.jsonl")}
     protect_fixture_note_markers(run_dir, translations)
+    document = json.loads((run_dir / "document.json").read_bytes())
+    if any(block["kind"] == "figure" for block in document["blocks"]):
+        assert [b["id"] for b in document["blocks"] if b["kind"] == "figure"] == ["pdf:page-0001:block-0099"]
+        prepare_test_empty_artwork_source(run_dir, translations, {}, figures={
+            "pdf:page-0001:block-0099": "TEST ONLY page 1: fixed solid-blue callout icon alongside separately selectable title and body; no labels."})
     return assemble_pdf(run_dir=run_dir, translations=translations, glossary={}, output_dir=output)
 
 
@@ -1008,7 +1033,7 @@ def test_footnote_continuation_preserves_text_and_owner_without_overlap(tmp_path
     note = next(b for b in document.blocks if b.id == ids["page_note"])
     text = " ".join(f"각주문장{index:04d}" for index in range(900))
     translations[note.segment_id] = Translation(note.segment_id, "⟦WT:000000⟧ " + text)
-    output = assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+    output = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "out")
     layout = read_pdf_layout(run_dir / "layout.json")
     parts = [r for r in layout.flowables if r.block_id == note.id]
     owner = next(r for r in layout.flowables if r.block_id == ids["owner"])
@@ -1112,7 +1137,7 @@ def test_footnote_ownership_evidence_requires_protected_native_marker(tmp_path: 
     path.unlink()
     write_segments(path, segments)
     write_native_singleton_fixture(run_dir)
-    assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+    _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "out")
     note = next(r for r in read_pdf_layout(run_dir / "layout.json").flowables if r.block_id == ids["page_note"])
     assert note.footnote_owner_id == ids["owner"]
     assert note.footnote_ownership == "protected-footnote-marker"
@@ -1126,7 +1151,7 @@ def test_footnote_repeated_translated_marker_fails_closed(tmp_path: Path) -> Non
     owner = next(s for s in read_segments(run_dir / "segments.jsonl") if s.locator == ids["owner"])
     translations[owner.id] = Translation(owner.id, "표지 ⟦WT:000000⟧ 반복 ⟦WT:000000⟧")
     with pytest.raises(PdfAssemblyError, match="protected token.*exactly once"):
-        assemble_pdf(run_dir, translations, glossary, tmp_path / "out")
+        _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "out")
     assert not (run_dir / "layout.json").exists()
 
 
@@ -1292,7 +1317,8 @@ def test_visible_provenance_is_metadata_only(tmp_path: Path, rich: bool) -> None
         run_dir, translations, glossary, _ = _rich_assembly_run(tmp_path, table_columns=2, table_rows=2)
     else:
         run_dir, translations, glossary = _assembly_run(tmp_path)
-    reader = PdfReader(assemble_pdf(run_dir, translations, glossary, tmp_path / "out"))
+    assemble = _assemble_rich_fixture if rich else assemble_pdf
+    reader = PdfReader(assemble(run_dir, translations, glossary, tmp_path / "out"))
     text = "\n".join(page.extract_text() for page in reader.pages)
     assert "Source:" not in text and "Generated:" not in text
     source = json.loads((run_dir / "source.json").read_text())
@@ -2469,6 +2495,8 @@ def test_assemble_pdf_allows_figure_to_fill_declared_body_frame(tmp_path: Path) 
     )
 
     write_native_singleton_fixture(run_dir)
+    prepare_test_empty_artwork_source(run_dir, translations, glossary, figures={
+        "pdf:page-0001:block-0096": "TEST ONLY page 1: fixed tall solid-blue rectangle fills the body frame; no selectable labels."})
     staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
     assert staged.is_file()
@@ -3856,7 +3884,7 @@ def test_assemble_pdf_reflows_rich_content_with_complete_layout_evidence(
 ) -> None:
     run_dir, translations, glossary, identifiers = _rich_assembly_run(tmp_path)
 
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     reader = PdfReader(staged)
     assert len(reader.pages) >= 4
@@ -4074,7 +4102,7 @@ def test_pdf_layout_reader_rejects_contained_table_cell_peer_overlap(
         table_columns=4,
         table_rows=4,
     )
-    assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
     path = run_dir / "layout.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     cells = [item for item in payload["flowables"] if item["kind"] == "table-cell"]
@@ -4105,7 +4133,7 @@ def test_assemble_pdf_keeps_readable_native_table_on_portrait_pages(
         table_rows=4,
     )
 
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     assert all(
         float(page.mediabox.width) < float(page.mediabox.height)
@@ -4131,7 +4159,7 @@ def test_page_local_footnote_is_emitted_once_when_its_owner_splits(
         "페이지 지역 표지 " * 250 + "⟦WT:000000⟧",
     )
 
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     reader = PdfReader(staged)
     extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -4164,7 +4192,7 @@ def test_page_local_footnote_owned_by_repeated_table_cell_is_emitted_once(
 
     write_native_singleton_fixture(run_dir)
     protect_fixture_note_markers(run_dir, translations)
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
     assert extracted.count("1 페이지 지역 각주") == 1
@@ -4204,7 +4232,7 @@ def test_caption_above_figure_is_emitted_once_in_source_order(
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
     write_native_singleton_fixture(run_dir)
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     extracted = "\n".join(page.extract_text() or "" for page in PdfReader(staged).pages)
     assert extracted.count("그림 1. 원본 렌더링 픽셀") == 1
@@ -4261,7 +4289,7 @@ def test_standalone_uncaptioned_figure_is_emitted_once(
     translations.pop(caption.segment_id)
 
     write_native_singleton_fixture(run_dir)
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     layout = read_pdf_layout(run_dir / "layout.json")
     assert sum(
@@ -4302,7 +4330,7 @@ def test_orphan_caption_and_nonreciprocal_pair_still_fail(
 
     with pytest.raises(PdfAssemblyError, match="every caption"):
         write_native_singleton_fixture(run_dir)
-        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+        _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
 
 @pytest.mark.parametrize(
@@ -4347,7 +4375,7 @@ def test_rich_assembly_rejects_raw_or_structurally_invalid_uri(
 
     with pytest.raises(PdfAssemblyError, match="unsafe external URI"):
         write_native_singleton_fixture(run_dir)
-        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+        _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
 
 @pytest.mark.parametrize(
@@ -4379,7 +4407,7 @@ def test_rich_assembly_preserves_valid_external_uri_exactly(
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
     write_native_singleton_fixture(run_dir)
-    staged = assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    staged = _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     uris = [
         str(annotation.get_object()["/A"].get_object()["/URI"])
@@ -4482,7 +4510,7 @@ def test_rich_assembly_fails_closed_on_invalid_media_evidence(
             encoding="utf-8",
         )
 
-    with pytest.raises(PdfAssemblyError, match=message):
+    with pytest.raises(PdfAssemblyError, match=message + "|figure inventory|semantic review digest"):
         rebind_native_fixture(run_dir)
         assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
 
@@ -4500,7 +4528,7 @@ def test_assemble_pdf_fails_when_table_is_unreadable_at_nine_points(
     )
 
     with pytest.raises(PdfAssemblyError, match="table .* unreadable at 9-point"):
-        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+        _assemble_rich_fixture(run_dir, translations, glossary, tmp_path / "final")
 
     assert not (run_dir / "staged-output").exists()
     assert not (run_dir / "layout.json").exists()

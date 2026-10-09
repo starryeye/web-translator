@@ -1,4 +1,20 @@
 {
+  "figure_text_review": {
+    "figures": {
+      "pdf:page-0001:block-0007": {
+        "evidence": "TEST ONLY page 1: inspected solid-blue raster status panel with no intrinsic selectable labels; Figure 1 caption remains outside.",
+        "labels": [],
+        "verdict": "pass"
+      },
+      "pdf:page-0001:block-0008": {
+        "evidence": "TEST ONLY page 1: inspected red rising vector trend inside a pale-blue frame with no selectable labels; Figure 2 caption and explanatory body remain outside.",
+        "labels": [],
+        "verdict": "pass"
+      }
+    },
+    "inventory_sha256": "d223217b372b490a5ca53266710ea4d7b26c0e9313d32e9d9a4be0476a236fd2",
+    "schema_version": "1.0"
+  },
   "retries": {
     "zone-001": 0
   },

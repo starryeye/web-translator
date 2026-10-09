@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,10 @@ import stat
 from typing import Any
 
 from web_translator.pdf_models import PdfContractError, PdfDocument
+from web_translator.pdf_figure_review import (
+    FIGURE_TEXT_INPUT_NAME, PdfFigureReviewError, validate_pdf_figure_text_review,
+)
+from web_translator.models import SegmentContractError, read_segments_stream
 from web_translator.pdf_unit_bindings import (
     PDF_UNIT_BINDING_NAME, PdfUnitBindingError, _binding_from_payloads,
 )
@@ -28,6 +33,21 @@ _REPARSE_POINT = 0x400
 
 class PdfSemanticReviewError(ValueError):
     """PDF semantic-review inputs or their digest are unsafe or inconsistent."""
+
+
+def _master_review_from_bytes(payload: bytes) -> Mapping[str, Any]:
+    """Reject ambiguous duplicate fields before interpreting master decisions."""
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise PdfSemanticReviewError(f"PDF master review contains duplicate field: {key}")
+            result[key] = value
+        return result
+    try:
+        return _mapping(json.loads(payload, object_pairs_hook=unique), "PDF master review")
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PdfSemanticReviewError(str(error)) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +142,9 @@ class PdfSemanticInputSnapshot:
         try:
             self.run_anchor.verify_visible()
             anchored._verify_anchored_evidence(self.run_anchor, self.root_files)
+            if (FIGURE_TEXT_INPUT_NAME not in self.payloads
+                    and FIGURE_TEXT_INPUT_NAME in anchored._anchored_directory_names(self.run_anchor)):
+                raise PdfSemanticReviewError("PDF figure inventory appeared after semantic snapshot")
             for directory_name, directory in self.directories.items():
                 directory.verify_visible()
                 opened = self.directory_files[directory_name]
@@ -196,6 +219,13 @@ def hold_pdf_semantic_inputs(run: Path | Any) -> Iterator[PdfSemanticInputSnapsh
                 opened = anchored._open_anchored_input_file(run_anchor, "source.json", "PDF source record")
                 root_files["source.json"] = opened
                 payloads["source.json"] = anchored._read_opened_bytes(opened, run_anchor.path / "source.json", "PDF source record")
+            inventory_present = FIGURE_TEXT_INPUT_NAME in anchored._anchored_directory_names(run_anchor)
+            if any(block.kind == "figure" for block in document.blocks) and not inventory_present:
+                raise PdfSemanticReviewError("PDF figures require figure-text-input.json; run pdf-figure-review-input and inspect every source figure")
+            if inventory_present:
+                opened = anchored._open_anchored_input_file(run_anchor, FIGURE_TEXT_INPUT_NAME, "PDF figure inventory")
+                root_files[FIGURE_TEXT_INPUT_NAME] = opened
+                payloads[FIGURE_TEXT_INPUT_NAME] = anchored._read_opened_bytes(opened, run_anchor.path / FIGURE_TEXT_INPUT_NAME, "PDF figure inventory")
         zone_ids: dict[str, set[str]] = {}
         for directory_name, suffix in (
             ("zones", ".json"),
@@ -306,7 +336,7 @@ def validate_pdf_semantic_review_snapshot(
         "section_findings",
         "unresolved_required",
     }
-    if set(review) != expected_fields:
+    if not expected_fields <= set(review) <= expected_fields | {"preserved_names", "figure_text_review"}:
         raise PdfSemanticReviewError("PDF semantic review fields are not exact")
     digest = review.get("semantic_input_sha256")
     if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
@@ -317,7 +347,76 @@ def validate_pdf_semantic_review_snapshot(
         raise PdfSemanticReviewError(
             "PDF semantic review digest does not match current reviewed inputs"
         )
+    inventory = snapshot.payloads.get(FIGURE_TEXT_INPUT_NAME)
+    if inventory is not None or "figure_text_review" in review:
+        if inventory is None or "figure_text_review" not in review:
+            raise PdfSemanticReviewError("PDF figure inventory and figure_text_review must be supplied together; inspect every source figure")
+        try:
+            validate_pdf_figure_text_review(review["figure_text_review"], inventory_bytes=inventory)
+        except PdfFigureReviewError as error:
+            raise PdfSemanticReviewError(str(error)) from error
+    if "preserved_names" in review:
+        names = parse_pdf_preserved_names(review["preserved_names"])
+        try:
+            segments = {item.id: item for item in read_segments_stream(
+                io.StringIO(snapshot.payloads["segments.jsonl"].decode("utf-8"))
+            )}
+            translations = {}
+            for path, payload in snapshot.payloads.items():
+                if path.startswith("translations/"):
+                    for line in payload.decode("utf-8").splitlines():
+                        if line.strip():
+                            record = json.loads(line)
+                            translations[record["segment_id"]] = record["text"]
+        except (ValueError, KeyError, TypeError, SegmentContractError) as error:
+            raise PdfSemanticReviewError("cannot validate preserved name inputs") from error
+        for segment_id, records in names.items():
+            segment = segments.get(segment_id)
+            translation = translations.get(segment_id)
+            if segment is None or not segment.target or not isinstance(translation, str):
+                raise PdfSemanticReviewError("preserved name refers to an unknown translation target")
+            source = segment.source_text
+            for token in segment.protected:
+                source = source.replace(token.token, token.value)
+                translation = translation.replace(token.token, token.value)
+            for record in records:
+                pattern = preserved_name_pattern(record["text"])
+                if pattern.search(source) is None or pattern.search(translation) is None:
+                    raise PdfSemanticReviewError("preserved name is not exact in source and translation")
     return semantic_input
+
+
+def preserved_name_pattern(text: str) -> re.Pattern[str]:
+    """Keep exact name spelling while allowing attached Korean particles."""
+    return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(text)}(?![A-Za-z0-9_])")
+
+
+def parse_pdf_preserved_names(value: Any) -> dict[str, list[dict[str, str]]]:
+    """Validate explicit master semantic evidence; never infer names from case."""
+    if not isinstance(value, Mapping):
+        raise PdfSemanticReviewError("preserved names must map segment IDs to reviewed records")
+    result: dict[str, list[dict[str, str]]] = {}
+    for segment_id, records in value.items():
+        if not isinstance(segment_id, str) or re.fullmatch(r"seg-\d{6}", segment_id) is None:
+            raise PdfSemanticReviewError("preserved name segment ID is invalid")
+        if not isinstance(records, list) or not records or len(records) > 64:
+            raise PdfSemanticReviewError("preserved name records must be a nonempty bounded array")
+        seen = set()
+        canonical = []
+        for record in records:
+            if not isinstance(record, Mapping) or set(record) != {"text", "reason"}:
+                raise PdfSemanticReviewError("preserved name fields must be text and reason")
+            text, reason = record["text"], record["reason"]
+            if (
+                not isinstance(text, str) or not text.strip() or text != text.strip()
+                or len(text) > 160 or any(ord(character) < 32 for character in text)
+                or text in seen or not isinstance(reason, str) or not reason.strip()
+            ):
+                raise PdfSemanticReviewError("preserved name text/reason is invalid or duplicated")
+            seen.add(text)
+            canonical.append({"text": text, "reason": reason})
+        result[segment_id] = canonical
+    return result
 
 
 def _semantic_digest(payloads: Mapping[str, bytes]) -> str:

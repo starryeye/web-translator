@@ -45,6 +45,7 @@ from web_translator.pdf_media import build_contact_sheets, render_pdf_pages
 from web_translator.pdf_review import build_pdf_semantic_review_input
 import web_translator.pdf_qa as pdf_qa_module
 from tests.pdf_fixtures import make_text_pdf
+from tests.pdf_fixtures import write_test_empty_artwork_approval
 from tests.pdf_unit_fixtures import write_native_singleton_fixture, rebind_native_fixture
 
 
@@ -370,7 +371,7 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
         schema_version="1.1",
         source_sha256=source_sha256,
         page_count=1,
-        selectable_characters=120,
+        selectable_characters=184,
         scan_candidate_pages=[],
         pages=[PdfPage(number=1, width=612.0, height=792.0, rotation=0)],
         blocks=blocks,
@@ -545,7 +546,6 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
         },
     )
     write_native_singleton_fixture(run_dir)
-    _write_review(run_dir)
     media = run_dir / "media"
     media.mkdir()
     figure = Image.new("RGB", (240, 120), "#336699")
@@ -553,6 +553,8 @@ def assembled_pdf_run(tmp_path: Path) -> PdfQARun:
         figure.putpixel((x, x // 2), (220, 120, 20))
     figure.save(media / "figure-0001.png")
     figure.close()
+    write_test_empty_artwork_approval(run_dir, figures={
+        "pdf:page-0001:block-0003": "TEST ONLY page 1: blue raster with orange diagonal; blank source region has no selectable labels; caption remains separate."})
     output_dir = tmp_path / "translated-pdfs" / "result"
     assemble_pdf(run_dir, translations, {}, output_dir)
     assert not output_dir.exists()
@@ -749,11 +751,11 @@ def test_prepare_pdf_qa_rejects_figure_crop_absorbing_selectable_prose(
     _refresh_review_digest(assembled_pdf_run.run_dir)
     monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
 
-    with pytest.raises(PdfQAFailure, match="figure contains translatable selectable text"):
+    with pytest.raises(PdfQAFailure, match="source/document selectable|figure inventory"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
-def test_prepare_pdf_qa_allows_sparse_source_figure_labels(
+def test_prepare_pdf_qa_rejects_sparse_labels_without_renewed_approval(
     assembled_pdf_run: PdfQARun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -780,9 +782,8 @@ def test_prepare_pdf_qa_allows_sparse_source_figure_labels(
     _refresh_review_digest(assembled_pdf_run.run_dir)
     monkeypatch.setattr(pdf_qa_module, "_validate_figure_media", lambda *_args: None)
 
-    result = prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
-
-    assert result.passed is True
+    with pytest.raises(PdfQAFailure, match="source/document selectable|figure inventory"):
+        prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
 def test_text_image_separation_rejects_single_clear_prose_sentence() -> None:
@@ -805,7 +806,7 @@ def test_text_image_separation_rejects_single_clear_prose_sentence() -> None:
     document = SimpleNamespace(blocks=[figure], page_count=1)
     layout = SimpleNamespace(flowables=[SimpleNamespace(block_id="figure-1", source_block_ids=())])
 
-    with pytest.raises(PdfQAFailure, match="figure contains translatable selectable text"):
+    with pytest.raises(PdfQAFailure, match="explicit AI review"):
         pdf_qa_module._validate_text_image_separation(
             document,
             layout,
@@ -951,15 +952,19 @@ def test_latin_density_keeps_canonical_gloss_after_noncanonical_bilingual_term(
         ("Copyright © 2020 Alice Brown. All rights reserved.", "Copyright © 2020 Alice Brown. All rights reserved. 본문", "body", False),
         ("The Cypher query language 51", "Cypher 쿼리 언어 51", "toc-entry", True),
         ("The Cypher query language 51", "The Cypher query language 51 본문", "toc-entry", False),
+        ("Understanding Distributed Systems 51", "Understanding Distributed Systems 51", "toc-entry", False),
         ("About this Book xiii", "이 책에 대하여 xiii", "toc-chapter", True),
         ("—Alice Brown, Computing Journal (2020)", "—Alice Brown, Computing Journal (2020)", "epigraph-attribution", True),
         ("—Alice Brown explains how systems behave (2020)", "—Alice Brown explains how systems behave (2020)", "epigraph-attribution", False),
         ("SELECT rows.* FROM rows WHERE rows.id = current_user", "SELECT rows.* FROM rows WHERE rows.id = current_user", "body", True),
         ("SELECT rows.* FROM rows", "SELECT other.* FROM other", "body", False),
+        ("SELECT rows.* FROM rows\nThis query returns all records.", "SELECT rows.* FROM rows\nThis query returns all records.", "body", False),
+        ("SELECT rows.* FROM rows\nThis query returns all records.", "SELECT rows.* FROM rows\n이 쿼리는 모든 레코드를 반환한다.", "body", True),
         ("NoSQL database", "NoSQL 데이터베이스", "body", True),
         ("SSTables", "SSTable", "body", True),
         ("Companies such as Atlas, Falcon and Mercury handle traffic.", "Atlas, Falcon, Mercury 같은 기업은 트래픽을 처리한다.", "body", True),
         ("The untranslated paragraph contains 2 numbers and 3 examples.", "The untranslated paragraph contains 2 numbers and 3 examples. 본문", "body", False),
+        ("Use Consistent Hashing For Reliable Distribution.", "Consistent Hashing For Reliable Distribution. 본문", "body", False),
     ],
 )
 def test_latin_density_preserved_metadata_does_not_exempt_untranslated_prose(
@@ -977,9 +982,18 @@ def test_latin_density_preserved_metadata_does_not_exempt_untranslated_prose(
         SimpleNamespace(kind="number", value="3"),
     ])
     if passed:
+        names_by_source = {
+            "Editors: Alice Brown and David Miller": ["Alice Brown", "David Miller"],
+            "The Cypher query language 51": ["Cypher"],
+            "—Alice Brown, Computing Journal (2020)": ["Alice Brown", "Computing Journal"],
+            "Companies such as Atlas, Falcon and Mercury handle traffic.": ["Atlas", "Falcon", "Mercury"],
+        }
+        names = names_by_source.get(source, [])
         evidence = pdf_qa_module._validate_latin_density(
             document, {block.id: translated}, segments={block.segment_id: segment},
-            glossary={},
+            glossary={}, preserved_names=({block.segment_id: [
+                {"text": name, "reason": "Master reviewed name from source."} for name in names
+            ]} if names else {}),
         )
         assert "Validated" in evidence
     else:
@@ -990,12 +1004,52 @@ def test_latin_density_preserved_metadata_does_not_exempt_untranslated_prose(
             )
 
 
-def test_diagram_label_detection_keeps_numbered_prose_translatable() -> None:
-    words = [{"text": token} for token in "This prose contains 2 important explanatory sentences.".split()]
-    assert not pdf_qa_module._looks_like_diagram_label(words)
-    assert pdf_qa_module._looks_like_diagram_label([
-        {"text": token} for token in "4.6 k writes/sec".split()
-    ])
+
+
+
+
+def test_latin_density_excludes_only_master_reviewed_preserved_names() -> None:
+    block = SimpleNamespace(
+        id="block", segment_id="seg-000001", page_number=1, kind="paragraph",
+        semantic_role="body", source_text="Alice Brown wrote this book.",
+    )
+    evidence = pdf_qa_module._validate_latin_density(
+        SimpleNamespace(blocks=[block]), {"block": "Alice Brown 저서"},
+        segments={}, glossary={}, preserved_names={"seg-000001": [{
+            "text": "Alice Brown", "reason": "Reviewed author name in source.",
+        }]},
+    )
+    assert "reviewed-name=1" in evidence
+    with pytest.raises(PdfQAFailure, match="Latin density"):
+        pdf_qa_module._validate_latin_density(
+            SimpleNamespace(blocks=[block]), {"block": "Alice Brown 저서"},
+            segments={}, glossary={},
+        )
+
+
+@pytest.mark.parametrize("lines", [
+    [(72, 580, "Transactions require 2 acknowledgements."),
+     (72, 564, "Clients receive 3 confirmation messages.")],
+    [(92, 580, "This paragraph contains prose requiring translation"),
+     (72, 564, "and its continuation also needs proper review")],
+])
+def test_text_image_separation_rejects_indented_or_numbered_prose(lines) -> None:
+    stream = io.BytesIO()
+    canvas = Canvas(stream, pagesize=(612, 792))
+    canvas.setFont("Helvetica", 10)
+    for x, y, text in lines:
+        canvas.drawString(x, y, text)
+    canvas.save()
+    figure = SimpleNamespace(
+        id="figure-1", kind="figure", segment_id=None, page_number=1,
+        bbox=(60.0, 190.0, 550.0, 290.0),
+    )
+    document = SimpleNamespace(blocks=[figure], page_count=1)
+    layout = SimpleNamespace(flowables=[SimpleNamespace(
+        block_id=figure.id, source_block_ids=(),
+    )])
+    with pytest.raises(PdfQAFailure, match="explicit AI review"):
+        pdf_qa_module._validate_text_image_separation(document, layout, stream.getvalue())
 
 
 def _in_memory_toc_gate(
@@ -2115,7 +2169,7 @@ def test_prepare_pdf_qa_rejects_missing_or_tampered_figure_media(
     media = assembled_pdf_run.run_dir / "media" / "figure-0001.png"
     Image.new("RGB", (240, 120), "magenta").save(media)
 
-    with pytest.raises(PdfQAFailure, match="figure media"):
+    with pytest.raises(PdfQAFailure, match="figure media|figure inventory"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)
 
 
@@ -2896,6 +2950,7 @@ def test_prepare_pdf_qa_rejects_rendered_glyph_replacement_box(
     ):
         path.unlink()
     (assembled_pdf_run.run_dir / "staged-output").rmdir()
+    _refresh_review_digest(assembled_pdf_run.run_dir)
     assemble_pdf(
         assembled_pdf_run.run_dir,
         translations,
@@ -3239,7 +3294,8 @@ def test_prepare_pdf_qa_requires_external_link_for_each_source_block(
     _write_json(path, document)
 
     rebind_native_fixture(assembled_pdf_run.run_dir)
-    _refresh_review_digest(assembled_pdf_run.run_dir)
+    write_test_empty_artwork_approval(assembled_pdf_run.run_dir, figures={
+        "pdf:page-0001:block-0003": "TEST ONLY page 1: inspected empty blue raster with orange diagonal; link-only fixture edit does not affect its artwork."})
 
     with pytest.raises(PdfQAFailure, match="external URI annotation.*block"):
         prepare_pdf_qa(assembled_pdf_run.run_dir, assembled_pdf_run.output_dir)

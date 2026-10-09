@@ -243,6 +243,8 @@ def assemble_pdf(
     owned_layout_identity: _PublishedFile | None = None
     binding_stack = ExitStack()
     binding_inputs: Any | None = None
+    figure_inputs: Any | None = None
+    figure_review_bytes: bytes | None = None
     staging = run_dir / "staged-output"
     try:
         run_anchor = _open_directory_anchor(run_dir, "run")
@@ -272,6 +274,34 @@ def assemble_pdf(
             raise PdfAssemblyError("source.json SHA-256 does not match document.json")
         from web_translator.pdf_unit_bindings import require_assignable_pdf
         require_assignable_pdf(document)
+        from web_translator.pdf_figure_review import (
+            FIGURE_TEXT_INPUT_NAME, hold_pdf_figure_inputs, validate_current_pdf_figure_review,
+        )
+        review_value: Mapping[str, Any] = {}
+        if "review.json" in _anchored_directory_names(run_anchor):
+            from web_translator.pdf_review import _master_review_from_bytes
+            evidence_files["review.json"] = _open_anchored_input_file(run_anchor, "review.json", "PDF master review")
+            figure_review_bytes = _read_opened_bytes(evidence_files["review.json"], run_dir / "review.json", "PDF master review")
+            review_value = _master_review_from_bytes(figure_review_bytes)
+        if (any(block.kind == "figure" for block in document.blocks)
+                or FIGURE_TEXT_INPUT_NAME in _anchored_directory_names(run_anchor)
+                or "figure_text_review" in review_value):
+            from web_translator.pdf_review import hold_pdf_semantic_inputs, validate_pdf_semantic_review_snapshot
+            if semantic_snapshot is None:
+                semantic_snapshot = binding_stack.enter_context(hold_pdf_semantic_inputs(run_anchor))
+            validate_pdf_semantic_review_snapshot(semantic_snapshot, review_value)
+            from web_translator.pdf_report import _semantic_review_from_value
+            zone_attempts = {
+                Path(path).stem: json.loads(payload).get("attempt", 0)
+                for path, payload in semantic_snapshot.payloads.items() if path.startswith("zones/")
+            }
+            _semantic_review_from_value(review_value, set(zone_attempts), zone_attempts)
+            if review_value.get("unresolved_required"):
+                raise PdfAssemblyError("semantic review has unresolved required findings")
+            figure_inputs = binding_stack.enter_context(hold_pdf_figure_inputs(run_anchor))
+            validate_current_pdf_figure_review(figure_inputs,
+                inventory_bytes=semantic_snapshot.payloads[FIGURE_TEXT_INPUT_NAME],
+                review_value=review_value["figure_text_review"])
         if document.schema_version == "1.2":
             from web_translator.pdf_unit_bindings import _binding_from_payloads, _hold_pdf_unit_inputs
 
@@ -423,6 +453,10 @@ def assemble_pdf(
         _verify_anchored_evidence(run_anchor, evidence_files)
         if binding_inputs is not None:
             binding_inputs.verify()
+        if figure_inputs is not None:
+            figure_inputs.verify()
+            if _read_opened_bytes(evidence_files["review.json"], run_dir / "review.json", "PDF master review") != figure_review_bytes:
+                raise PdfAssemblyError("PDF master review changed content during assembly")
         if semantic_snapshot is not None:
             _verify_semantic_snapshot(semantic_snapshot, run_anchor)
         staging_anchor = _create_child_directory(
@@ -450,6 +484,12 @@ def assemble_pdf(
         staging_anchor.verify_visible()
         if binding_inputs is not None:
             binding_inputs.verify()
+        if figure_inputs is not None:
+            figure_inputs.verify()
+            _verify_semantic_snapshot(semantic_snapshot, run_anchor)
+            _verify_anchored_evidence(run_anchor, evidence_files)
+            if _read_opened_bytes(evidence_files["review.json"], run_dir / "review.json", "PDF master review") != figure_review_bytes:
+                raise PdfAssemblyError("PDF master review changed content during assembly")
         binding_stack.close()
         return staging / "translated.pdf"
     except PdfAssemblyError:
@@ -460,7 +500,9 @@ def assemble_pdf(
         raise PdfAssemblyError(f"cannot assemble staged PDF: {error}") from error
     finally:
         active_exception = sys.exc_info()[0] is not None
-        binding_stack.__exit__(*sys.exc_info())
+        # Validation errors are already translated at the API boundary above.
+        # Cleanup must not inject them into input contexts that wrap entry errors.
+        binding_stack.close()
         _close_opened_file(temporary_layout)
         _close_opened_file(temporary_pdf)
         if active_exception:

@@ -35,6 +35,63 @@ from web_translator.pdf_models import (
 from web_translator.pdf_extract import extract_pdf
 
 
+def write_test_empty_artwork_approval(run: Path, *, figures: dict[str, str]) -> None:
+    """Literal decisions for inspected synthetic empty artwork; never approve text."""
+    import hashlib
+    from web_translator.pdf_figure_review import write_pdf_figure_review_input
+    from tests.test_pdf_qa import _write_review
+    inventory_path = run / "figure-text-input.json"
+    # Call only while deliberately constructing fresh test evidence, not races.
+    inventory_path.unlink(missing_ok=True)
+    write_pdf_figure_review_input(run)
+    payload = inventory_path.read_bytes()
+    inventory = json.loads(payload)
+    assert {f["block_id"] for f in inventory["figures"]} == set(figures)
+    assert all(f["characters"] == [] for f in inventory["figures"]), "text is never automatically approved"
+    _write_review(run)
+    path = run / "review.json"
+    master = json.loads(path.read_bytes())
+    master["figure_text_review"] = {"schema_version": "1.0", "inventory_sha256": hashlib.sha256(payload).hexdigest(),
+        "figures": {block_id: {"verdict": "pass", "evidence": evidence, "labels": []}
+                    for block_id, evidence in figures.items()}}
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def prepare_test_empty_artwork_source(run: Path, translations, glossary, *, figures: dict[str, str]) -> None:
+    """Make renderer-only, hand-declared synthetic fixtures use real bound source bytes."""
+    import hashlib
+    import pdfplumber
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    document_path = run / "document.json"
+    document = json.loads(document_path.read_bytes())
+    source_path = run / "source.pdf"
+    assert not source_path.exists(), "never rewrite an existing fixture source PDF"
+    canvas = Canvas(str(source_path), invariant=1)
+    for page in document["pages"]:
+        canvas.setPageSize((page["width"], page["height"]))
+        canvas.setFont("Helvetica", 8)
+        for row in range(3):
+            canvas.drawString(300, page["height"] - 20 - row * 9, "Synthetic source evidence outside empty artwork " * 2)
+        canvas.showPage()
+    canvas.save()
+    payload = source_path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    with pdfplumber.open(source_path) as pdf:
+        document["selectable_characters"] = sum(bool(c["text"].strip()) for p in pdf.pages for c in p.chars)
+    document["source_sha256"] = digest
+    document_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+    source_record_path = run / "source.json"
+    source = json.loads(source_record_path.read_bytes())
+    source.update(sha256=digest, byte_length=len(payload))
+    source_record_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    (run / "glossary.json").write_text(json.dumps(glossary) + "\n", encoding="utf-8")
+    (run / "translations").mkdir(exist_ok=True)
+    (run / "translations/zone-001.jsonl").write_text("".join(
+        json.dumps(value.to_dict(), ensure_ascii=False) + "\n" for value in translations.values()), encoding="utf-8")
+    rebind_native_fixture(run)
+    write_test_empty_artwork_approval(run, figures=figures)
+
+
 def make_decorated_callout_pdf(
     path: Path, *, border: str = "rect", labeled_icon: bool = False,
 ) -> Path:
@@ -243,6 +300,7 @@ def run_publication_fixture_pipeline(tmp_path: Path) -> tuple[Path, Path]:
     from web_translator.models import read_segments
     from web_translator.protection import restore_tokens
     from tests.test_pdf_qa import _write_passing_layout_review, _write_review
+    import hashlib
 
     run_dir = tmp_path / ".web-translator" / "runs" / "publication"
     output_dir = tmp_path / "translated-pdfs" / "publication"
@@ -287,6 +345,7 @@ def run_publication_fixture_pipeline(tmp_path: Path) -> tuple[Path, Path]:
 
     command("pdf-acquire", str(source))
     command("pdf-extract")
+    command("pdf-figure-review-input")
     command("plan-zones")
     _write_json(run_dir / "glossary.json", {"replication": "복제"})
     (run_dir / "document-summary.txt").write_text("출판 구조와 검토 증거에 관한 결정적 시험 문서", encoding="utf-8")
@@ -313,6 +372,30 @@ def run_publication_fixture_pipeline(tmp_path: Path) -> tuple[Path, Path]:
     )
     command("validate-translations")
     _write_review(run_dir)
+    # TEST ONLY inspected fixed page 6: empty icon, chart origin and time-axis label.
+    inventory_bytes = (run_dir / "figure-text-input.json").read_bytes()
+    inventory = json.loads(inventory_bytes)
+    assert [(figure["block_id"], [(c["index"], c["text"]) for c in figure["characters"]])
+            for figure in inventory["figures"]] == [
+        ("pdf:page-0006:block-0006", []),
+        ("pdf:page-0006:block-0007", [(301, "0"), (302, "S"), (303, "e"), (304, "c"),
+                                    (305, "o"), (306, "n"), (307, "d"), (308, "s")]),
+    ]
+    review_path = run_dir / "review.json"
+    master = json.loads(review_path.read_bytes())
+    master["figure_text_review"] = {"schema_version": "1.0",
+        "inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(), "figures": {
+            "pdf:page-0006:block-0006": {"verdict": "pass",
+                "evidence": "TEST ONLY page 6: empty diagonal icon at the left of independent translated callout prose.", "labels": []},
+            "pdf:page-0006:block-0007": {"verdict": "pass",
+                "evidence": "TEST ONLY page 6: line chart has origin and time-axis labels inside its frame; caption and body are below.",
+                "labels": [
+                    {"character_indexes": [301], "text": "0", "reason": "Inspected chart origin tick, not body prose."},
+                    {"character_indexes": [302, 303, 304, 305, 306, 307, 308], "text": "Seconds",
+                     "reason": "Inspected intrinsic time-axis unit, not caption/body prose."},
+                ]},
+        }}
+    review_path.write_text(json.dumps(master, ensure_ascii=False) + "\n", encoding="utf-8")
     command("pdf-assemble", "--output-dir", str(output_dir))
     command("pdf-qa", "prepare", "--output-dir", str(output_dir))
     _write_passing_layout_review(run_dir)
@@ -905,6 +988,26 @@ def _write_known_fixture_translations(fixture_dir: Path) -> None:
             for line in (temporary / "segments.jsonl").read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        if fixture_dir.name == "figures-captions-v1":
+            import hashlib
+            from web_translator.pdf_figure_review import build_pdf_figure_text_input, canonical_figure_text_input_bytes
+            document_bytes = (temporary / "document.json").read_bytes()
+            document = PdfDocument.from_dict(json.loads(document_bytes))
+            inventory = build_pdf_figure_text_input(document, document_bytes=document_bytes,
+                source_pdf_bytes=(fixture_dir / "source.pdf").read_bytes(),
+                media_payloads={b.id: (temporary / b.media_path).read_bytes() for b in document.blocks if b.kind == "figure"})
+            decisions = {
+                "pdf:page-0001:block-0007": "TEST ONLY page 1: inspected solid-blue raster status panel with no intrinsic selectable labels; Figure 1 caption remains outside.",
+                "pdf:page-0001:block-0008": "TEST ONLY page 1: inspected red rising vector trend inside a pale-blue frame with no selectable labels; Figure 2 caption and explanatory body remain outside.",
+            }
+            assert {f["block_id"] for f in inventory["figures"]} == set(decisions)
+            assert all(not f["characters"] for f in inventory["figures"])
+            review_path = fixture_dir / "review.json"
+            review = json.loads(review_path.read_bytes())
+            review["figure_text_review"] = {"schema_version": "1.0",
+                "inventory_sha256": hashlib.sha256(canonical_figure_text_input_bytes(inventory)).hexdigest(),
+                "figures": {key: {"verdict": "pass", "evidence": evidence, "labels": []} for key, evidence in decisions.items()}}
+            _write_json(review_path, review)
     translations = []
     for record in records:
         if not record["target"]:

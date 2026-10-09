@@ -40,7 +40,9 @@ from web_translator.pdf_qa import (
 from web_translator.pdf_review import (
     PdfSemanticInputSnapshot, PdfSemanticReviewError, PdfSemanticReviewInput,
     hold_pdf_semantic_inputs, validate_pdf_semantic_review_snapshot,
+    parse_pdf_preserved_names,
 )
+from web_translator.pdf_figure_review import PdfFigureReviewError, parse_pdf_figure_text_review
 
 
 _SEMANTIC_DIMENSIONS = {
@@ -723,6 +725,23 @@ class PdfFinalManifest:
             except PdfSemanticReviewError as error:
                 raise PdfQAFailure(str(error)) from error
             required_files = {"document.json", "source.json", "segments.jsonl", "glossary.json", "assignments/.pdf-unit-binding.json"}
+            figure_review = translation.master_semantic_review.get("figure_text_review")
+            if figure_review is not None:
+                required_files.add("figure-text-input.json")
+                records = figure_review["figures"]
+                if (len(records) != counts.values["figures"]
+                        or len(records) != output.figure_count
+                        or len(records) != metrics["figure_count"]):
+                    raise PdfQAFailure("manifest figure review disagrees with figure counts")
+                for block_id, record in records.items():
+                    page_number = int(block_id.split(":")[1][5:])
+                    if page_number > source.page_count or block_id in members:
+                        raise PdfQAFailure("manifest figure review refers to a foreign or translatable block")
+                    if record["verdict"] != "pass":
+                        raise PdfQAFailure("manifest figure review requires a fix")
+                inventory_file = next((item for item in semantic_input.files if item.path == "figure-text-input.json"), None)
+                if inventory_file is None or inventory_file.sha256 != figure_review["inventory_sha256"]:
+                    raise PdfQAFailure("manifest figure review inventory digest disagrees with semantic file evidence")
             for zone in translation.retries:
                 required_files.update({f"zones/{zone}.json", f"assignments/{zone}.json", f"translations/{zone}.jsonl"})
             if {item.path for item in semantic_input.files} != required_files:
@@ -1143,6 +1162,16 @@ def render_pdf_review_report(manifest: Mapping[str, object]) -> str:
                             f"{_markdown(finding.get('evidence', ''))}"
                         )
 
+    figure_review = semantic.get("figure_text_review")
+    if isinstance(figure_review, Mapping):
+        lines.extend(["", "### Approved original artwork labels", "",
+                      f"- Inventory SHA-256: `{figure_review['inventory_sha256']}`"])
+        for block_id, figure in sorted(figure_review["figures"].items()):
+            lines.append(f"- **{_markdown(block_id)}** ({_markdown(figure['verdict'])}): {_markdown(figure['evidence'])}")
+            for label in figure["labels"]:
+                lines.append(f"  - Indexes {label['character_indexes']}: {_markdown(label['text'])} — {_markdown(label['reason'])}")
+            if not figure["labels"]:
+                lines.append("  - Inspected empty-text artwork; no selectable labels.")
     lines.extend(["", "## Visual layout review", ""])
     pages = visual.get("pages_reviewed", [])
     contacts = visual.get("contact_sheets_reviewed", {})
@@ -1326,12 +1355,13 @@ def _semantic_review_from_value(
     zone_ids: set[str],
     zone_attempts: Mapping[str, int],
 ) -> dict[str, object]:
-    if set(review) != {
+    fields = {
         "semantic_input_sha256",
         "retries",
         "section_findings",
         "unresolved_required",
-    }:
+    }
+    if not fields <= set(review) <= fields | {"preserved_names", "figure_text_review"}:
         raise PdfQAFailure("semantic review fields are not exact")
     semantic_input_sha256 = review.get("semantic_input_sha256")
     if (
@@ -1400,12 +1430,23 @@ def _semantic_review_from_value(
         raise PdfQAFailure("semantic review unresolved required findings disagree")
     if unresolved:
         raise PdfQAFailure("semantic review has unresolved required findings")
-    return {
+    result = {
         "semantic_input_sha256": semantic_input_sha256,
         "retries": {zone_id: retries[zone_id] for zone_id in sorted(zone_ids)},
         "section_findings": canonical_findings,
         "unresolved_required": [],
     }
+    if "preserved_names" in review:
+        try:
+            result["preserved_names"] = parse_pdf_preserved_names(review["preserved_names"])
+        except PdfSemanticReviewError as error:
+            raise PdfQAFailure(str(error)) from error
+    if "figure_text_review" in review:
+        try:
+            result["figure_text_review"] = parse_pdf_figure_text_review(review["figure_text_review"])
+        except PdfFigureReviewError as error:
+            raise PdfQAFailure(str(error)) from error
+    return result
 
 
 def _string_mapping_value(value: Mapping[str, Any], label: str) -> dict[str, str]:

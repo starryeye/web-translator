@@ -211,6 +211,7 @@ Run the following commands in this exact order. Substitute the completed zone ID
 ```text
 <python> -m web_translator pdf-acquire <source> --run-dir <work-dir>
 <python> -m web_translator pdf-extract --run-dir <work-dir>
+<python> -m web_translator pdf-figure-review-input --run-dir <work-dir>
 <python> -m web_translator plan-zones --run-dir <work-dir> --max-chars 12000 --target-zones 3
 <python> -m web_translator prepare-assignments --run-dir <work-dir>
 <python> -m web_translator validate-translations --run-dir <work-dir> --zone-id zone-001
@@ -230,6 +231,19 @@ Apply these requirements at each stage:
    English technical terms to Korean glosses. Preserve the exact target partition:
    every target `Segment` ID appears once, no context ID becomes a target, and no target
    is added or removed.
+
+   Run `pdf-figure-review-input` to create private canonical `figure-text-input.json`.
+   It inventories every figure, including empty-text artwork, with exact source-page
+   character indexes/text/bounds and source/document/media hashes; it makes no semantic
+   decision. Repeating the command reuses only identical evidence and refuses changes.
+   Inspect EVERY original figure with its source-page context using `view_image` on
+   existing source page renders and source-derived `media/` artwork. Render only missing
+   views through the bounded PDF renderer; do not repeatedly render the whole document.
+   Identify actual node, axis, legend, title, arrow or intrinsic data label groups.
+   Sentence-shaped graph labels can be preserved; numeric/colon prose and an indented
+   explanatory paragraph absorbed by the crop require an ownership correction and a
+   fresh native run. Punctuation, numbers, indentation and sparse character counts do
+   not establish approval. If uncertain, retain the diagnostic and block publication.
 
 2. Run `prepare-assignments` only after the shared summary and glossary exist. Its
    immutable packages contain the same summary and glossary, exactly one zone's target
@@ -261,7 +275,7 @@ Apply these requirements at each stage:
 
 6. After every zone is valid, run aggregate `validate-translations`. Normalize first-use
    glossary placement only after master judgment. Once `segments.jsonl`, every zone and
-   assignment, every translation file, and the glossary policy/content are final, run
+   assignment, every translation file, figure inventory and AI decisions, and the glossary policy/content are final, run
    `pdf-review-input`. Read `semantic-review-input.json` and copy its exact
    `semantic_input_sha256` into the PDF-only `review.json`; this canonical digest binds
    the exact reviewed bytes and policy. Write the remaining review fields using the
@@ -271,6 +285,44 @@ Apply these requirements at each stage:
    set of every `zone-ID:dimension` marked `required-fix`. Assembly, QA preparation, and
    finalization each reject any post-review mutation. The webpage `review.json` contract
    stays unchanged. Do not assemble until unresolved findings are empty.
+
+   For any source figures, `review.json` also requires PDF-only `figure_text_review`
+   with exactly `schema_version: "1.0"`, `inventory_sha256` (SHA-256 of the exact
+   canonical inventory file bytes), and `figures`. The map exactly covers source
+   figure block IDs. Each figure has exactly `verdict` (`pass` or `required-fix`),
+   nonempty page-specific visual `evidence`, and `labels`. Each actual label group has
+   exactly `character_indexes` (sorted unique nonempty integers from that figure),
+   `text` (exact concatenation of those indexed source strings, without normalization),
+   and nonempty `reason` explaining its visual role and why it is not body/caption prose.
+   Passing groups are disjoint and cover every owned non-whitespace character exactly
+   once. Do not use one indiscriminate all-figure group to obtain coverage. An empty-text
+   figure requires `labels: []` and source-specific inspection evidence, not omission.
+   Any `required-fix` independently blocks publication. For a figure-free run, neither
+   field is mandatory; an optional canonical empty inventory must have a matching
+   empty review, and a supplied review must have its inventory.
+   Assembly, prepare and finalize recompute inventory against held source/document/media
+   and refuse missing/stale approvals, ambiguous geometry or translatable overlap.
+   QA also binds exact `review.json` bytes: changed reasons or verdicts require renewed
+   QA and all-page visual review even if the staged PDF is unchanged. The final manifest
+   binds inventory bytes in `semantic_input_sha256`, but never digests `review.json`
+   itself. Review-only reason edits leave that semantic digest unchanged while invalidating
+   the full-review-byte QA binding and requiring renewed QA/visual review. The manifest
+   and report retain complete label evidence, inventory digest and semantic file hashes.
+   The private inventory is not a fourth public artifact. Renew evidence without new
+   translation dispatch when source and translations are unchanged.
+
+   If preserving proper names, product names, bibliographic titles, or publication
+   identifiers causes a short block to exceed the Korean prose Latin-density limit,
+   explicitly review those exact spans. Add the optional PDF-only `preserved_names`
+   mapping to `review.json`, keyed by target segment ID. Each value is a nonempty
+   array of records with exactly `text` (the exact preserved spelling) and `reason`
+   (why master semantic review approved its preservation). For example:
+   `{"seg-000001":[{"text":"Alice Brown","reason":"Source author name; retain exact spelling."}]}`.
+   Every declared span must occur exactly in both the bound source and translation;
+   foreign IDs, changed spellings, duplicate records, and empty reasons are refused.
+   Never infer preserved names merely from capitalization or mark untranslated prose
+   as a name. QA measures all undeclared prose normally, and the final manifest retains
+   these explicit review decisions. This is master evidence, not a translator bypass.
 
 7. Run `pdf-assemble`, then `pdf-qa prepare`. Assembly creates only the private staged
    PDF; prepare performs automated contract, structure, font, rendering, bounds, and page

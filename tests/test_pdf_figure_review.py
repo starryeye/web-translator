@@ -25,6 +25,452 @@ def build(run):
         media_payloads={b.id: (run / b.media_path).read_bytes() for b in document.blocks if b.kind == "figure"})
 
 
+def publication_case(root, *, case="diagram", evidence=True):
+    """TEST ONLY fixed synthetic artwork decisions, not a semantic classifier."""
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from tests.test_pdf_qa import PdfQARun, _write_review
+    from web_translator.models import Segment, Translation, write_segments
+    from web_translator.cli import _zone_payload
+    from web_translator.zones import build_zones
+    run, output = make_figure_review_run(root, case=case)
+    document = PdfDocument.from_dict(json.loads((run / "document.json").read_bytes()))
+    if case != "figure-free":
+        from PIL import Image
+        from web_translator.pdf_media import render_pdf_pages
+        page = render_pdf_pages(run / "source.pdf", root / "publication-source-views", dpi=144)[0]
+        with Image.open(page) as image:
+            image.crop((144, 164, 1080, 384)).save(run / "media/figure-0001.png")
+    block = document.blocks[0]
+    segment = Segment("seg-000001", block.id, "paragraph", [], block.source_text, [], [], True)
+    write_segments(run / "segments.jsonl", [segment])
+    (run / "zones").mkdir()
+    for zone in build_zones([segment]):
+        (run / "zones" / f"{zone.id}.json").write_text(json.dumps(_zone_payload(zone)))
+    rebind_native_fixture(run)
+    (run / "glossary.json").write_text("{}\n")
+    translation = Translation("seg-000001", "독립적인 본문은 원본 그림 밖에서 선택 가능한 한국어로 보존됩니다.", "TEST ONLY", {})
+    (run / "translations").mkdir()
+    (run / "translations/zone-001.jsonl").write_text(json.dumps(translation.to_dict(), ensure_ascii=False) + "\n")
+    if evidence or case != "figure-free":
+        api().write_pdf_figure_review_input(run)
+    _write_review(run)
+    if not evidence and case != "figure-free":
+        (run / "figure-text-input.json").unlink()
+    if evidence:
+        master_path = run / "review.json"
+        master = json.loads(master_path.read_bytes())
+        payload = (run / "figure-text-input.json").read_bytes()
+        labels = []
+        offset = 0
+        for _, text in LABEL_LINES[case]:
+            labels.append({"character_indexes": [offset + i for i, char in enumerate(text) if char != " "],
+                           "text": text.replace(" ", ""), "reason": "TEST ONLY inspected synthetic graph node or arrow label."})
+            offset += len(text)
+        master["figure_text_review"] = {"schema_version": "1.0", "inventory_sha256": hashlib.sha256(payload).hexdigest(),
+            "figures": {} if case == "figure-free" else {FIGURE_ID: {
+                "verdict": "required-fix" if case in {"numeric-prose", "colon-prose", "indent-20", "indent-36"} else "pass",
+                "evidence": "TEST ONLY page 1: artwork inspected against the independent body above; numeric/colon/indented paragraph must be translated, not preserved.",
+                "labels": labels}}}
+        master_path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    return PdfQARun(run, output), {translation.segment_id: translation}
+
+
+def test_figure_input_is_in_semantic_digest(tmp_path):
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    run, _ = publication_case(tmp_path)
+    first = build_pdf_semantic_review_input(run.run_dir)
+    record = next((f for f in first.files if f.path == "figure-text-input.json"), None)
+    assert record is not None, "figure inventory is missing from held semantic evidence"
+    payload = (run.run_dir / "figure-text-input.json").read_bytes()
+    assert (record.sha256, record.byte_length) == (hashlib.sha256(payload).hexdigest(), len(payload))
+    (run.run_dir / "figure-text-input.json").write_bytes(payload + b" ")
+    assert build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256 != first.semantic_input_sha256
+
+
+@pytest.mark.parametrize("entry", ["direct", "cli"])
+def test_figure_review_missing_inventory_refuses_assembly(tmp_path, entry):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    from web_translator.cli import main
+    run, translations = publication_case(tmp_path, evidence=False)
+    if entry == "direct":
+        with pytest.raises(PdfAssemblyError, match="figure|inventory"):
+            assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    else:
+        assert main(["pdf-assemble", "--run-dir", str(run.run_dir), "--output-dir", str(run.output_dir)]) != 0
+    assert not (run.run_dir / "staged-output").exists()
+    assert not (run.run_dir / "layout.json").exists()
+    assert not run.output_dir.exists()
+
+
+def mutate_figure_evidence(run, case):
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    master_path = run / "review.json"
+    master = json.loads(master_path.read_bytes())
+    inventory_path = run / "figure-text-input.json"
+    inventory = json.loads(inventory_path.read_bytes())
+    figure = master["figure_text_review"]["figures"][FIGURE_ID]
+    label = figure["labels"][0] if figure["labels"] else None
+    if case == "missing-inventory": inventory_path.unlink()
+    elif case == "missing-review": master.pop("figure_text_review")
+    elif case == "foreign-figure": master["figure_text_review"]["figures"]["pdf:page-0001:block-9999"] = deepcopy(figure)
+    elif case == "omitted-character": label.update(character_indexes=[0, 1], text="AP")
+    elif case == "duplicate-character": figure["labels"].append(deepcopy(label))
+    elif case == "changed-text": inventory["figures"][0]["characters"][0]["text"] = "X"; label["text"] = "XPI"
+    elif case == "changed-bbox": inventory["figures"][0]["characters"][0]["bbox"][0] += 0.1
+    elif case == "stale-source": (run / "source.pdf").write_bytes((run / "source.pdf").read_bytes() + b"\n")
+    elif case == "stale-document":
+        path = run / "document.json"; path.write_bytes(path.read_bytes() + b" "); rebind_native_fixture(run)
+    elif case == "stale-media": (run / "media/figure-0001.png").write_bytes((run / "media/figure-0001.png").read_bytes() + b" ")
+    elif case == "stale-inventory": master["figure_text_review"]["inventory_sha256"] = "f" * 64
+    elif case == "required-fix": figure["verdict"] = "required-fix"
+    if case in {"changed-text", "changed-bbox"}:
+        payload = (json.dumps(inventory, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        inventory_path.write_bytes(payload)
+        master["figure_text_review"]["inventory_sha256"] = hashlib.sha256(payload).hexdigest()
+    # Reapprove the outer digest where possible; source recomputation is independent.
+    if case != "missing-inventory":
+        master["semantic_input_sha256"] = build_pdf_semantic_review_input(run).semantic_input_sha256
+    master_path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+
+
+INVALID_PUBLICATION = ["missing-inventory", "missing-review", "foreign-figure", "omitted-character", "duplicate-character",
+    "changed-text", "changed-bbox", "stale-source", "stale-document", "stale-media", "stale-inventory", "required-fix"]
+
+
+@pytest.mark.parametrize("case", INVALID_PUBLICATION)
+def test_figure_review_direct_assembly_refuses_invalid_evidence(tmp_path, case):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path)
+    mutate_figure_evidence(run.run_dir, case)
+    with pytest.raises(PdfAssemblyError):
+        assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+    assert not (run.run_dir / "layout.json").exists()
+    assert not run.output_dir.exists()
+
+
+@pytest.mark.parametrize("case", ["diagram", "sentence-labels", "empty-figure", "figure-free"])
+def test_figure_review_prepare_accepts_only_explicit_fixed_approval(tmp_path, case):
+    from web_translator.pdf_assemble import assemble_pdf
+    from web_translator.pdf_qa import prepare_pdf_qa
+    run, translations = publication_case(tmp_path, case=case)
+    assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    qa = prepare_pdf_qa(run.run_dir, run.output_dir)
+    inventory = (run.run_dir / "figure-text-input.json").read_bytes()
+    finding = next(f for f in qa.findings if f.code == "publication.text_image_separation")
+    assert "inventory_sha256=" + hashlib.sha256(inventory).hexdigest() in finding.evidence
+    assert "review_sha256=" + hashlib.sha256((run.run_dir / "review.json").read_bytes()).hexdigest() in finding.evidence
+    assert set(qa.metrics) == {"contact_sheet_count", "embedded_font_count", "figure_count", "link_count",
+        "output_page_count", "rendered_page_count", "translated_block_count", "translation_unit_count"}
+
+
+def test_figure_review_report_parser_retains_exact_groups(tmp_path):
+    from web_translator.pdf_report import _semantic_review_from_value
+    run, _ = publication_case(tmp_path)
+    master = json.loads((run.run_dir / "review.json").read_bytes())
+    result = _semantic_review_from_value(master, {"zone-001"}, {"zone-001": 0})
+    assert result["figure_text_review"] == master["figure_text_review"]
+    master["preserved_names"] = {}
+    result = _semantic_review_from_value(master, {"zone-001"}, {"zone-001": 0})
+    assert result["preserved_names"] == {}
+    assert result["figure_text_review"] == master["figure_text_review"]
+
+
+@pytest.fixture
+def prepared_figure_publication(tmp_path):
+    from tests.test_pdf_qa import _write_passing_layout_review
+    from web_translator.pdf_assemble import assemble_pdf
+    from web_translator.pdf_qa import prepare_pdf_qa
+    run, translations = publication_case(tmp_path)
+    assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    return run
+
+
+@pytest.mark.parametrize("change", ["reason", "evidence", "verdict", "whitespace"])
+def test_figure_review_changed_review_refuses_unchanged_pdf(prepared_figure_publication, change):
+    from web_translator.pdf_qa import finalize_pdf_output, PdfQAFailure
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    run = prepared_figure_publication
+    staged = run.run_dir / "staged-output/translated.pdf"
+    original = staged.read_bytes()
+    path = run.run_dir / "review.json"
+    semantic_digest = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+    value = json.loads(path.read_bytes())
+    figure = value["figure_text_review"]["figures"][FIGURE_ID]
+    if change == "reason": figure["labels"][0]["reason"] += " Revised after QA."
+    elif change == "evidence": figure["evidence"] += " Revised after QA."
+    elif change == "verdict": figure["verdict"] = "required-fix"
+    payload = json.dumps(value, ensure_ascii=False) + "\n" + (" " if change == "whitespace" else "")
+    path.write_text(payload)
+    assert build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256 == semantic_digest
+    with pytest.raises(PdfQAFailure): finalize_pdf_output(run.run_dir, run.output_dir)
+    assert staged.read_bytes() == original
+    assert not run.output_dir.exists()
+    assert sorted(p.name for p in staged.parent.iterdir()) == ["translated.pdf"]
+
+
+@pytest.mark.parametrize("evidence", [False, True])
+def test_figure_free_legacy_or_optional_empty_review_round_trips(tmp_path, evidence):
+    from tests.test_pdf_qa import _write_passing_layout_review
+    from web_translator.pdf_assemble import assemble_pdf
+    from web_translator.pdf_qa import prepare_pdf_qa, finalize_pdf_output
+    from web_translator.pdf_report import PdfFinalManifest, _semantic_review_from_value
+    run, translations = publication_case(tmp_path, case="figure-free", evidence=evidence)
+    master = json.loads((run.run_dir / "review.json").read_bytes())
+    expected = _semantic_review_from_value(master, {"zone-001"}, {"zone-001": 0})
+    assert ("figure_text_review" in expected) is evidence
+    assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    prepare_pdf_qa(run.run_dir, run.output_dir)
+    _write_passing_layout_review(run.run_dir)
+    finalize_pdf_output(run.run_dir, run.output_dir)
+    manifest = json.loads((run.output_dir / "manifest.json").read_bytes())
+    assert PdfFinalManifest.from_dict(manifest).to_dict() == manifest
+    assert manifest["translation"]["master_semantic_review"] == expected
+    files = {record["path"] for record in manifest["semantic_input"]["files"]}
+    assert ("figure-text-input.json" in files) is evidence
+
+
+def test_figure_review_final_manifest_and_report_retain_complete_evidence(prepared_figure_publication):
+    from web_translator.pdf_qa import finalize_pdf_output
+    from web_translator.pdf_report import PdfFinalManifest
+    run = prepared_figure_publication
+    original_review = json.loads((run.run_dir / "review.json").read_bytes())["figure_text_review"]
+    finalize_pdf_output(run.run_dir, run.output_dir)
+    manifest = json.loads((run.output_dir / "manifest.json").read_bytes())
+    assert PdfFinalManifest.from_dict(manifest).to_dict() == manifest
+    assert manifest["translation"]["master_semantic_review"]["figure_text_review"] == original_review
+    record = next(f for f in manifest["semantic_input"]["files"] if f["path"] == "figure-text-input.json")
+    assert record["sha256"] == original_review["inventory_sha256"]
+    assert record["byte_length"] == len((run.run_dir / "figure-text-input.json").read_bytes())
+    report = (run.output_dir / "review-report.md").read_text()
+    embedded = json.loads(report.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert embedded == manifest
+    human = report.split("```json\n", 1)[0]
+    for expected in [FIGURE_ID, "API", "Intrinsic", original_review["inventory_sha256"]]:
+        if expected == "Intrinsic": expected = original_review["figures"][FIGURE_ID]["labels"][0]["reason"]
+        assert expected in human
+    from web_translator.pdf_qa import PdfQAFailure
+    for mutation in ["foreign-page", "translated-block", "inventory-hash", "required-fix", "extra-label-field", "duplicate-index"]:
+        bad = deepcopy(manifest)
+        evidence = bad["translation"]["master_semantic_review"]["figure_text_review"]
+        figure = evidence["figures"][FIGURE_ID]
+        if mutation == "foreign-page": evidence["figures"] = {"pdf:page-0002:block-0002": figure}
+        elif mutation == "translated-block": evidence["figures"] = {"pdf:page-0001:block-0001": figure}
+        elif mutation == "inventory-hash": evidence["inventory_sha256"] = "f" * 64
+        elif mutation == "required-fix": figure["verdict"] = "required-fix"
+        elif mutation == "extra-label-field": figure["labels"][0]["bbox"] = [0, 0, 1, 1]
+        elif mutation == "duplicate-index": figure["labels"].append(deepcopy(figure["labels"][0]))
+        with pytest.raises(PdfQAFailure): PdfFinalManifest.from_dict(bad)
+
+
+@pytest.mark.parametrize("stage", ["prepare", "finalize"])
+@pytest.mark.parametrize("case", INVALID_PUBLICATION)
+def test_figure_review_later_stage_refuses_invalid_preserving_evidence(prepared_figure_publication, stage, case):
+    from web_translator.pdf_qa import prepare_pdf_qa, finalize_pdf_output, PdfQAFailure
+    run = prepared_figure_publication
+    staged = run.run_dir / "staged-output/translated.pdf"
+    retained = {p.relative_to(run.run_dir): p.read_bytes() for p in [staged, run.run_dir / "pdf-qa.json", *sorted((run.run_dir / "qa-pages").iterdir())]}
+    mutate_figure_evidence(run.run_dir, case)
+    action = prepare_pdf_qa if stage == "prepare" else finalize_pdf_output
+    with pytest.raises(PdfQAFailure): action(run.run_dir, run.output_dir)
+    assert not run.output_dir.exists()
+    assert all((run.run_dir / path).read_bytes() == payload for path, payload in retained.items())
+    assert sorted(p.name for p in staged.parent.iterdir()) == ["translated.pdf"]
+
+
+@pytest.mark.parametrize("case", ["numeric-prose", "colon-prose", "indent-20", "indent-36", "empty-figure"])
+@pytest.mark.parametrize("evidence", [False, True])
+def test_figure_review_numeric_colon_indent_prose_and_empty_require_decision(tmp_path, case, evidence):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path, case=case, evidence=evidence)
+    if evidence and case == "empty-figure":
+        assert assemble_pdf(run.run_dir, translations, {}, run.output_dir).is_file()
+    else:
+        with pytest.raises(PdfAssemblyError): assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+        assert not (run.run_dir / "staged-output").exists()
+
+
+@pytest.mark.parametrize("stage", ["prepare", "finalize"])
+@pytest.mark.parametrize("case,evidence", [
+    (case, evidence) for case in ["numeric-prose", "colon-prose", "indent-20", "indent-36"]
+    for evidence in [False, True]
+] + [("empty-figure", False)])
+def test_figure_review_prose_later_stages_never_automatically_approve(
+    prepared_figure_publication, tmp_path, stage, case, evidence,
+):
+    import shutil
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    from web_translator.pdf_qa import prepare_pdf_qa, finalize_pdf_output, PdfQAFailure
+    run = prepared_figure_publication
+    candidate, _ = publication_case(tmp_path / "new-case", case=case, evidence=evidence)
+    staged = run.run_dir / "staged-output/translated.pdf"
+    old_pdf, old_qa = staged.read_bytes(), (run.run_dir / "pdf-qa.json").read_bytes()
+    for name in ["source.pdf", "source.json", "document.json", "media/figure-0001.png", "review.json"]:
+        shutil.copyfile(candidate.run_dir / name, run.run_dir / name)
+    inventory_path = run.run_dir / "figure-text-input.json"
+    if evidence: shutil.copyfile(candidate.run_dir / "figure-text-input.json", inventory_path)
+    else: inventory_path.unlink()
+    rebind_native_fixture(run.run_dir)
+    if evidence:
+        path = run.run_dir / "review.json"
+        master = json.loads(path.read_bytes())
+        master["semantic_input_sha256"] = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+        path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    action = prepare_pdf_qa if stage == "prepare" else finalize_pdf_output
+    with pytest.raises(PdfQAFailure): action(run.run_dir, run.output_dir)
+    assert staged.read_bytes() == old_pdf
+    assert (run.run_dir / "pdf-qa.json").read_bytes() == old_qa
+    assert not run.output_dir.exists()
+
+
+def test_figure_review_horizontally_separated_sentence_labels_pass_exact_approval(tmp_path, monkeypatch):
+    from reportlab.pdfgen.canvas import Canvas
+    from web_translator.pdf_assemble import assemble_pdf
+    from web_translator.pdf_qa import prepare_pdf_qa
+    original = Canvas.drawString
+    def place_second_node(canvas, x, y, text, *args, **kwargs):
+        if text == "Responses leave after processing.": x, y = 330, 680
+        return original(canvas, x, y, text, *args, **kwargs)
+    # Only source construction changes; assertions inspect the real resulting PDF.
+    with monkeypatch.context() as source_layout:
+        source_layout.setattr(Canvas, "drawString", place_second_node)
+        run, translations = publication_case(tmp_path, case="sentence-labels")
+    master_path = run.run_dir / "review.json"
+    original_review = master_path.read_bytes()
+    master = json.loads(original_review)
+    master.pop("figure_text_review")
+    master_path.write_text(json.dumps(master))
+    from web_translator.pdf_assemble import PdfAssemblyError
+    with pytest.raises(PdfAssemblyError): assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    master_path.write_bytes(original_review)
+    with pdfplumber.open(run.run_dir / "source.pdf") as pdf:
+        assert pdf.pages[0].chars[0]["top"] == pdf.pages[0].chars[len(LABEL_LINES["sentence-labels"][0][1])]["top"]
+        assert pdf.pages[0].chars[len(LABEL_LINES["sentence-labels"][0][1])]["x0"] == 330
+    assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert prepare_pdf_qa(run.run_dir, run.output_dir).passed
+
+
+@pytest.mark.parametrize("stage", ["assembly", "prepare", "finalize"])
+def test_figure_review_approval_cannot_bypass_translatable_geometry_overlap(tmp_path, stage):
+    from tests.pdf_unit_fixtures import rebind_native_fixture
+    from tests.test_pdf_qa import _write_passing_layout_review
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    from web_translator.pdf_qa import prepare_pdf_qa, finalize_pdf_output, PdfQAFailure
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    run, translations = publication_case(tmp_path)
+    if stage != "assembly": assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    if stage == "finalize":
+        prepare_pdf_qa(run.run_dir, run.output_dir)
+        _write_passing_layout_review(run.run_dir)
+    document_path = run.run_dir / "document.json"
+    document = json.loads(document_path.read_bytes())
+    document["blocks"][0]["bbox"] = [72., 32., 540., 305.]
+    document_path.write_text(json.dumps(document) + "\n")
+    rebind_native_fixture(run.run_dir)
+    inventory_path = run.run_dir / "figure-text-input.json"
+    inventory = json.loads(inventory_path.read_bytes())
+    inventory["document_sha256"] = hashlib.sha256(document_path.read_bytes()).hexdigest()
+    payload = api().canonical_figure_text_input_bytes(inventory)
+    inventory_path.write_bytes(payload)
+    review_path = run.run_dir / "review.json"
+    master = json.loads(review_path.read_bytes())
+    master["figure_text_review"]["inventory_sha256"] = hashlib.sha256(payload).hexdigest()
+    master["semantic_input_sha256"] = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+    review_path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    with pytest.raises(PdfAssemblyError if stage == "assembly" else PdfQAFailure, match="overlap"):
+        if stage == "assembly": assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+        else: (prepare_pdf_qa if stage == "prepare" else finalize_pdf_output)(run.run_dir, run.output_dir)
+    assert not run.output_dir.exists()
+
+
+@pytest.mark.parametrize("stage", ["assembly", "prepare", "finalize"])
+@pytest.mark.parametrize("artifact", ["source.pdf", "media/figure-0001.png", "figure-text-input.json", "review.json"])
+@pytest.mark.parametrize("mutation", ["identity", "content"])
+def test_figure_review_held_identity_and_content_races_refuse(tmp_path, monkeypatch, stage, artifact, mutation):
+    import web_translator.pdf_assemble as assembly
+    import web_translator.pdf_qa as qa
+    from tests.test_pdf_qa import _write_passing_layout_review
+    run, translations = publication_case(tmp_path)
+    if stage != "assembly": assembly.assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    if stage == "finalize":
+        qa.prepare_pdf_qa(run.run_dir, run.output_dir)
+        _write_passing_layout_review(run.run_dir)
+    path = run.run_dir / artifact
+    payload = path.read_bytes()
+    fired = False
+    def mutate():
+        nonlocal fired
+        if fired: return
+        fired = True
+        if mutation == "identity":
+            path.rename(run.run_dir / ("saved-" + path.name))
+            path.write_bytes(payload)
+        else: path.write_bytes(payload + b" ")
+    owner, hook = (assembly, "_build_rich_document") if stage == "assembly" else (
+        (qa, "render_pdf_pages") if stage == "prepare" else (qa, "_rename_anchored_directory_no_replace"))
+    original = getattr(owner, hook)
+    def raced(*args, **kwargs):
+        if stage == "finalize": mutate()  # immediately before final rename
+        result = original(*args, **kwargs)
+        if stage != "finalize": mutate()
+        return result
+    monkeypatch.setattr(owner, hook, raced)
+    expected_error = assembly.PdfAssemblyError if stage == "assembly" else qa.PdfQAFailure
+    with pytest.raises(expected_error):
+        if stage == "assembly": assembly.assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+        elif stage == "prepare": qa.prepare_pdf_qa(run.run_dir, run.output_dir)
+        else: qa.finalize_pdf_output(run.run_dir, run.output_dir)
+    assert fired
+    assert not run.output_dir.exists()
+    assert (path.read_bytes() == payload) if mutation == "identity" else (path.read_bytes() == payload + b" ")
+    if stage == "assembly": assert not (run.run_dir / "staged-output").exists()
+    else: assert list(run.run_dir.rglob("translated.pdf")), "staged PDF must remain recoverable"
+    if stage == "finalize": assert (run.run_dir / "pdf-qa.json").exists()
+
+
+@pytest.mark.parametrize("missing", ["inventory", "review"])
+def test_figure_review_optional_empty_pair_cannot_be_split(tmp_path, missing):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    from web_translator.pdf_review import build_pdf_semantic_review_input
+    run, translations = publication_case(tmp_path, case="figure-free")
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    if missing == "inventory":
+        (run.run_dir / "figure-text-input.json").unlink()
+        master["semantic_input_sha256"] = build_pdf_semantic_review_input(run.run_dir).semantic_input_sha256
+    else: master.pop("figure_text_review")
+    path.write_text(json.dumps(master) + "\n")
+    with pytest.raises(PdfAssemblyError): assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+
+
+def test_figure_review_duplicate_review_fields_refuse_direct_assembly(tmp_path):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path)
+    path = run.run_dir / "review.json"
+    payload = path.read_text().replace('"verdict": "pass", "evidence": "TEST ONLY page 1',
+        '"verdict": "required-fix", "verdict": "pass", "evidence": "TEST ONLY page 1')
+    assert '"verdict": "required-fix", "verdict": "pass"' in payload
+    path.write_text(payload)
+    with pytest.raises(PdfAssemblyError): assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+
+
+def test_figure_review_direct_assembly_cannot_hide_required_semantic_finding(tmp_path):
+    from web_translator.pdf_assemble import assemble_pdf, PdfAssemblyError
+    run, translations = publication_case(tmp_path)
+    path = run.run_dir / "review.json"
+    master = json.loads(path.read_bytes())
+    master["section_findings"]["zone-001"][0]["verdict"] = "required-fix"
+    path.write_text(json.dumps(master, ensure_ascii=False) + "\n")
+    with pytest.raises(PdfAssemblyError): assemble_pdf(run.run_dir, translations, {}, run.output_dir)
+    assert not (run.run_dir / "staged-output").exists()
+
+
 @pytest.fixture
 def approved_figure_case(tmp_path):
     run, _ = make_figure_review_run(tmp_path)

@@ -1090,7 +1090,7 @@ def _read_pdf_review(
     except PdfSemanticReviewError as error:
         raise CLIContractError(str(error)) from error
     return _review_from_value(
-        {key: value for key, value in data.items() if key != "semantic_input_sha256"},
+        {key: value for key, value in data.items() if key not in {"semantic_input_sha256", "preserved_names", "figure_text_review"}},
         path,
         zones,
     )

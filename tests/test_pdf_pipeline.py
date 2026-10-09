@@ -742,6 +742,8 @@ def test_committed_pdf_acceptance_fixtures_complete_local_reviewed_pipeline(
     shutil.copy2(fixture_dir / "document-summary.txt", run_dir / "document-summary.txt")
     assert main(["prepare-assignments", "--run-dir", str(run_dir)]) == 0
     shutil.copytree(fixture_dir / "translations", run_dir / "translations")
+    if expected["figure_count"]:
+        assert main(["pdf-figure-review-input", "--run-dir", str(run_dir)]) == 0
     assert main(["pdf-review-input", "--run-dir", str(run_dir)]) == 0
     review = json.loads((fixture_dir / "review.json").read_text(encoding="utf-8"))
     semantic_input = json.loads(
