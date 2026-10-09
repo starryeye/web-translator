@@ -94,9 +94,27 @@ _SPECIALIZED_ROLES = {
 _LATIN_DENSITY_LIMIT = 0.35
 _LATIN_CHARACTER = re.compile(r"[A-Za-z]")
 _KOREAN_CHARACTER = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_PROPER_NAME_METADATA = re.compile(
+    r"(?:[A-Z][a-z]+|[A-Z]\.)"
+    r"(?:[ -](?:[A-Z][a-z]+|[A-Z]\.)){1,4}\Z"
+)
+_PUBLICATION_METADATA = re.compile(
+    r"copyright|registered trademark|\btrademarks?\b|"
+    r"^(?:editors?|copyeditor|production editor|proofreader|indexer|"
+    r"interior designer|cover designer|illustrator)\s*:",
+    re.IGNORECASE,
+)
+_SOURCE_NAME_TOKEN = re.compile(
+    r"(?<![A-Za-z])[A-Z][A-Za-z’'\-]*(?![A-Za-z])"
+)
+_SQL_QUERY = re.compile(r"^SELECT\s+.+\s+FROM\s+.+\Z", re.DOTALL)
 _ACRONYM = re.compile(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]{1,}(?![A-Za-z0-9_])")
 _IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]+_[A-Za-z0-9_]+|[a-z]+[A-Z][A-Za-z0-9]*)(?![A-Za-z0-9_])"
+)
+_MIXED_CASE_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Z][a-z]+[A-Z][A-Za-z0-9]*|"
+    r"[A-Z]{2,}[a-z][A-Za-z0-9]*)(?![A-Za-z0-9_])"
 )
 _URL = re.compile(r"(?:https?://|mailto:)[^\s<>()]+", re.IGNORECASE)
 _INLINE_CODE = re.compile(r"`[^`]+`")
@@ -2301,11 +2319,12 @@ def _validate_text_image_separation(
                     for group in line_groups.values()
                     if len(group) >= 4
                     and sum(len(str(word.get("text", ""))) for word in group) >= 24
+                    and not _looks_like_diagram_label(group)
                 ]
                 clear_single_lines = [
                     group for group in prose_lines if _looks_like_complete_prose_line(group)
                 ]
-                if len(prose_lines) >= 2 or clear_single_lines:
+                if _has_aligned_prose_lines(prose_lines) or clear_single_lines:
                     description = (
                         f"{len(prose_lines)} prose lines"
                         if len(prose_lines) >= 2
@@ -2337,6 +2356,54 @@ def _looks_like_complete_prose_line(words: Sequence[Mapping[str, object]]) -> bo
         and letters >= 28
         and re.search(r"[.!?。！？]\s*$", text) is not None
     )
+
+
+def _has_aligned_prose_lines(
+    lines: Sequence[Sequence[Mapping[str, object]]],
+) -> bool:
+    """Recognize multiple prose-like lines as a text block, not diagram labels."""
+    left_edges: list[float] = []
+    for words in lines:
+        try:
+            left_edges.append(min(float(word["x0"]) for word in words))
+        except (KeyError, TypeError, ValueError):
+            continue
+    aligned = any(
+        abs(right - left) <= 12.0
+        for index, left in enumerate(left_edges)
+        for right in left_edges[index + 1 :]
+    )
+    return aligned
+
+
+def _looks_like_diagram_label(words: Sequence[Mapping[str, object]]) -> bool:
+    text = " ".join(str(word.get("text", "")) for word in words)
+    return (
+        len(words) <= 8
+        and not _looks_like_complete_prose_line(words)
+        and bool(re.search(r"[0-9():]", text))
+    )
+
+
+def _mask_source_name_tokens(
+    characters: list[str], source_text: str, exclusions: list[str], label: str,
+    *, prose: bool = False,
+) -> None:
+    """Exclude only preserved capitalized labels backed by exact source tokens."""
+    source_tokens = set()
+    for match in _SOURCE_NAME_TOKEN.finditer(source_text):
+        prefix = source_text[:match.start()].rstrip()
+        if prose and (not prefix.strip("•- ") or re.search(r"[.!?]$", prefix)):
+            continue
+        source_tokens.add(match.group())
+    source_tokens -= {"The", "A", "An", "This", "That", "These", "Those", "All", "It"}
+    for token in sorted(source_tokens, key=lambda value: (-len(value), value)):
+        _mask_matches(
+            characters,
+            re.compile(rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])"),
+            label,
+            exclusions,
+        )
 
 
 def _validate_running_furniture(
@@ -2487,6 +2554,54 @@ def _validate_latin_density(
                     _mask_span(characters, found, found + len(token.value))
                     exclusions.append(f"protected-{token.kind}")
                     start = found + len(token.value)
+        if _PUBLICATION_METADATA.search(block.source_text):
+            _mask_source_name_tokens(
+                characters, block.source_text, exclusions, "source-publication-name"
+            )
+        if block.semantic_role in _TOC_ROLES:
+            _mask_source_name_tokens(
+                characters, block.source_text, exclusions, "source-toc-label"
+            )
+            reference = _TOC_SOURCE_REFERENCE.fullmatch(block.source_text)
+            if reference is not None:
+                _mask_matches(
+                    characters,
+                    re.compile(rf"\b{re.escape(reference['reference'])}\s*$"),
+                    "source-toc-page-reference",
+                    exclusions,
+                )
+        if block.semantic_role == "epigraph-attribution":
+            _mask_source_name_tokens(
+                characters, block.source_text, exclusions, "source-attribution-name"
+            )
+        if block.kind in {"paragraph", "list-item"} and _KOREAN_CHARACTER.search(text):
+            _mask_source_name_tokens(
+                characters, block.source_text, exclusions, "source-prose-name",
+                prose=True,
+            )
+        if (
+            block.kind == "heading"
+            and text == block.source_text
+            and _PROPER_NAME_METADATA.fullmatch(block.source_text.strip())
+            and any(
+                re.search(
+                    rf"\bby\s+{re.escape(block.source_text)}(?![A-Za-z])",
+                    candidate.source_text,
+                    re.IGNORECASE,
+                )
+                for candidate in document.blocks
+            )
+        ):
+            _mask_source_name_tokens(
+                characters, block.source_text, exclusions, "source-author-name"
+            )
+        if (
+            text == block.source_text
+            and _SQL_QUERY.fullmatch(block.source_text)
+            and re.search(r"[.*=]", block.source_text)
+        ):
+            applied_exclusions["source-sql-query"] += 1
+            continue
         visible_before_gloss = "".join(characters)
         for term, gloss in sorted(glossary.items(), key=lambda item: (-len(item[0]), item[0])):
             pair = f"{gloss}({term})"
@@ -2495,15 +2610,19 @@ def _validate_latin_density(
                 english_start = found + len(gloss) + 1
                 _mask_span(characters, english_start, english_start + len(term))
                 exclusions.append(f"first-gloss:{term}")
-            if (
-                term in visible_before_gloss
-                or gloss in visible_before_gloss
-                or pair in visible_before_gloss
-            ):
+            # Only the configured Korean-English canonical pair establishes that
+            # a glossary term has already received its first-use treatment. A
+            # source-backed phrase such as ``애플리케이션(data-intensive
+            # application)`` may contain the English term without using the
+            # canonical glossary form; counting that occurrence would suppress
+            # the later ``애플리케이션(application)`` pair and make its Latin
+            # text fail density validation.
+            if pair in visible_before_gloss:
                 seen_terms.add(term)
         _mask_matches(characters, _URL, "url", exclusions)
         _mask_matches(characters, _INLINE_CODE, "code", exclusions)
         _mask_matches(characters, _IDENTIFIER, "identifier", exclusions)
+        _mask_matches(characters, _MIXED_CASE_IDENTIFIER, "identifier", exclusions)
         _mask_matches(characters, _ACRONYM, "acronym", exclusions)
         measured_text = "".join(characters)
         applied_exclusions.update(exclusions)

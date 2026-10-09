@@ -919,6 +919,85 @@ def test_latin_density_excludes_exact_first_canonical_gloss_only(
         )
 
 
+def test_latin_density_keeps_canonical_gloss_after_noncanonical_bilingual_term(
+    assembled_pdf_run: PdfQARun,
+) -> None:
+    document = PdfDocument.from_dict(json.loads(
+        (assembled_pdf_run.run_dir / "document.json").read_text(encoding="utf-8")
+    ))
+    first, second = document.blocks[:2]
+
+    evidence = pdf_qa_module._validate_latin_density(
+        document,
+        {
+            first.id: (
+                "애플리케이션(data-intensive application)을 설계하고 검토하며 "
+                "한국어 설명을 충분히 덧붙여 독자가 전체 맥락을 쉽게 이해하도록 "
+                "자세하게 설명한다."
+            ),
+            second.id: "애플리케이션(application) 설계",
+        },
+        segments={},
+        glossary={"application": "애플리케이션"},
+    )
+
+    assert "first-gloss:application=1" in evidence
+
+
+@pytest.mark.parametrize(
+    ("source", "translated", "role", "passed"),
+    [
+        ("Editors: Alice Brown and David Miller", "편집: Alice Brown 및 David Miller", "body", True),
+        ("Copyright © 2020 Alice Brown. All rights reserved.", "Copyright © 2020 Alice Brown. All rights reserved. 본문", "body", False),
+        ("The Cypher query language 51", "Cypher 쿼리 언어 51", "toc-entry", True),
+        ("The Cypher query language 51", "The Cypher query language 51 본문", "toc-entry", False),
+        ("About this Book xiii", "이 책에 대하여 xiii", "toc-chapter", True),
+        ("—Alice Brown, Computing Journal (2020)", "—Alice Brown, Computing Journal (2020)", "epigraph-attribution", True),
+        ("—Alice Brown explains how systems behave (2020)", "—Alice Brown explains how systems behave (2020)", "epigraph-attribution", False),
+        ("SELECT rows.* FROM rows WHERE rows.id = current_user", "SELECT rows.* FROM rows WHERE rows.id = current_user", "body", True),
+        ("SELECT rows.* FROM rows", "SELECT other.* FROM other", "body", False),
+        ("NoSQL database", "NoSQL 데이터베이스", "body", True),
+        ("SSTables", "SSTable", "body", True),
+        ("Companies such as Atlas, Falcon and Mercury handle traffic.", "Atlas, Falcon, Mercury 같은 기업은 트래픽을 처리한다.", "body", True),
+        ("The untranslated paragraph contains 2 numbers and 3 examples.", "The untranslated paragraph contains 2 numbers and 3 examples. 본문", "body", False),
+    ],
+)
+def test_latin_density_preserved_metadata_does_not_exempt_untranslated_prose(
+    source: str, translated: str, role: str, passed: bool,
+) -> None:
+    block = PdfBlock(
+        id="pdf:page-0001:block-0001", page_number=1, order=1,
+        kind="paragraph", bbox=(72, 72, 500, 120),
+        style=PdfBlockStyle(font_size=10, bold=False, alignment="center", indentation=0, space_after=0), source_text=source,
+        segment_id="seg-000001", semantic_role=role,
+    )
+    document = SimpleNamespace(blocks=[block])
+    segment = SimpleNamespace(protected=[
+        SimpleNamespace(kind="number", value="2"),
+        SimpleNamespace(kind="number", value="3"),
+    ])
+    if passed:
+        evidence = pdf_qa_module._validate_latin_density(
+            document, {block.id: translated}, segments={block.segment_id: segment},
+            glossary={},
+        )
+        assert "Validated" in evidence
+    else:
+        with pytest.raises(PdfQAFailure, match="Latin density"):
+            pdf_qa_module._validate_latin_density(
+                document, {block.id: translated}, segments={block.segment_id: segment},
+                glossary={},
+            )
+
+
+def test_diagram_label_detection_keeps_numbered_prose_translatable() -> None:
+    words = [{"text": token} for token in "This prose contains 2 important explanatory sentences.".split()]
+    assert not pdf_qa_module._looks_like_diagram_label(words)
+    assert pdf_qa_module._looks_like_diagram_label([
+        {"text": token} for token in "4.6 k writes/sec".split()
+    ])
+
+
 def _in_memory_toc_gate(
     *, semantic_role: str, source_text: str, source_reference: str | None
 ) -> tuple[object, object, PdfTocResolution, PdfReader]:
