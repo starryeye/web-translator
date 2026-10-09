@@ -12,6 +12,8 @@ import struct
 import subprocess
 import sys
 
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
 import pdfplumber
 from PIL import Image
@@ -57,10 +59,24 @@ FONT_LICENSE_URL = (
     "f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE"
 )
 FONT_LICENSE_SHA256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+SUPPLEMENTAL_SOURCE_URL = (
+    "https://raw.githubusercontent.com/google/fonts/"
+    "2984c575fdce412ee02b2baaba67672b9a9434d8/ofl/notosans/"
+    "NotoSans[wdth,wght].ttf"
+)
+SUPPLEMENTAL_SOURCE_SHA256 = "bfb7bb691513f12e734dc346c03a03f784912432d7e3fa8e56efcf906fe86b3d"
+SUPPLEMENTAL_LICENSE_URL = (
+    "https://raw.githubusercontent.com/google/fonts/"
+    "2984c575fdce412ee02b2baaba67672b9a9434d8/ofl/notosans/OFL.txt"
+)
+SUPPLEMENTAL_LICENSE_SHA256 = "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a"
 UNICODE_RANGES = [
     {"name": "ASCII", "start": "U+0000", "end": "U+007F"},
     {"name": "Latin-1", "start": "U+0080", "end": "U+00FF"},
+    {"name": "Latin Extended-A and B", "start": "U+0100", "end": "U+024F"},
+    {"name": "Combining Diacritical Marks", "start": "U+0300", "end": "U+036F"},
     {"name": "Hangul Jamo", "start": "U+1100", "end": "U+11FF"},
+    {"name": "Latin Extended Additional", "start": "U+1E00", "end": "U+1EFF"},
     {"name": "General Punctuation", "start": "U+2000", "end": "U+206F"},
     {"name": "Currency Symbols", "start": "U+20A0", "end": "U+20CF"},
     {"name": "Arrows", "start": "U+2190", "end": "U+21FF"},
@@ -1449,9 +1465,10 @@ def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> Non
         "schema_version",
         "source_sha256",
         "source_url",
+        "supplemental_source",
         "unicode_ranges",
     }
-    assert provenance["schema_version"] == "1.0"
+    assert provenance["schema_version"] == "1.1"
     assert provenance["source_url"] == FONT_SOURCE_URL
     assert provenance["source_sha256"] == FONT_SOURCE_SHA256
     assert provenance["license"] == {
@@ -1461,6 +1478,17 @@ def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> Non
         "url": FONT_LICENSE_URL,
     }
     assert provenance["unicode_ranges"] == UNICODE_RANGES
+    assert provenance["supplemental_source"] == {
+        "axes": {"wdth": 100},
+        "license": {
+            "filename": "NotoSans-OFL.txt",
+            "sha256": SUPPLEMENTAL_LICENSE_SHA256,
+            "url": SUPPLEMENTAL_LICENSE_URL,
+        },
+        "source_sha256": SUPPLEMENTAL_SOURCE_SHA256,
+        "source_url": SUPPLEMENTAL_SOURCE_URL,
+        "strategy": "missing-required-glyphs-only",
+    }
     assert set(provenance["outputs"]) == {
         "NotoSansKR-Bold.ttf",
         "NotoSansKR-Regular.ttf",
@@ -1499,6 +1527,71 @@ def test_font_resources_are_pinned_static_subsets_with_exact_provenance() -> Non
     license_text = asset_root.joinpath("OFL.txt").read_text("utf-8")
     assert "SIL OPEN FONT LICENSE Version 1.1" in license_text
     assert hashlib.sha256(license_text.encode("utf-8")).hexdigest() == FONT_LICENSE_SHA256
+    assert hashlib.sha256(asset_root.joinpath("NotoSans-OFL.txt").read_bytes()).hexdigest() == SUPPLEMENTAL_LICENSE_SHA256
+
+
+def test_bundled_fonts_preserve_extended_latin_names_in_both_weights() -> None:
+    root = files("web_translator").joinpath("font_assets")
+    for filename in ("NotoSansKR-Regular.ttf", "NotoSansKR-Bold.ttf"):
+        with as_file(root.joinpath(filename)) as path:
+            font = TTFont(path)
+            cmap = font.getBestCmap()
+            for character in "ğĞİıčŁễ":
+                glyph_name = cmap.get(ord(character))
+                assert glyph_name is not None, (filename, character)
+                assert font["glyf"][glyph_name].numberOfContours != 0
+
+
+def test_font_augmentation_preserves_existing_glyphs_and_decomposes_scaled_missing_glyphs() -> None:
+    def rectangle(width: int):
+        pen = TTGlyphPen(None)
+        pen.moveTo((0, 0))
+        pen.lineTo((width, 0))
+        pen.lineTo((width, 400))
+        pen.lineTo((0, 400))
+        pen.closePath()
+        return pen.glyph()
+
+    def font(units: int, width: int, *, composite: bool) -> TTFont:
+        glyphs = {".notdef": TTGlyphPen(None).glyph(), "existing": rectangle(width)}
+        cmap = {0x41: "existing"}
+        if composite:
+            pen = TTGlyphPen(glyphs)
+            pen.addComponent("existing", (1, 0, 0, 1, 20, 0))
+            glyphs["missing"] = pen.glyph()
+            cmap[0x11F] = "missing"
+        builder = FontBuilder(units, isTTF=True)
+        builder.setupGlyphOrder(list(glyphs))
+        builder.setupCharacterMap(cmap)
+        builder.setupGlyf(glyphs)
+        builder.setupHorizontalMetrics({name: (width + 50, 20) for name in glyphs})
+        return builder.font
+
+    target = font(1000, 100, composite=False)
+    supplemental = font(2000, 600, composite=True)
+    original = target["glyf"]["existing"].compile(target["glyf"])
+    font_vendor._augment_missing_glyphs(target, supplemental)
+
+    assert target.getBestCmap()[0x41] == "existing"
+    assert target["glyf"]["existing"].compile(target["glyf"]) == original
+    assert target["hmtx"].metrics["existing"] == (150, 20)
+    name = target.getBestCmap()[0x11F]
+    glyph = target["glyf"][name]
+    assert not glyph.isComposite()
+    assert list(glyph.coordinates) == [(10, 0), (310, 0), (310, 200), (10, 200)]
+    assert target["hmtx"].metrics[name] == (325, 10)
+    assert len(target["glyf"]) == len(target.getGlyphOrder()) == 3
+
+
+@pytest.mark.parametrize("role", ["body", "chapter-title"])
+def test_assemble_pdf_keeps_extended_latin_names_selectable(tmp_path: Path, role: str) -> None:
+    text = "한국어와 인명: Uğur Çetintemel, Iğdır, Łódź, Čapek, Nguyễn."
+    run = _publication_assembly_run(tmp_path, [(1, role, text)])
+    result = _assemble_publication(run, tmp_path / "out")
+    with pdfplumber.open(result) as pdf:
+        selected = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        assert text in " ".join(selected.split())
+        assert "\x00" not in selected
 
 
 def test_vendoring_refuses_source_hash_mismatch_without_outputs(tmp_path: Path) -> None:
@@ -1554,6 +1647,56 @@ def test_vendoring_refuses_tampered_license_hash_without_outputs(
         )
 
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("tampered", ["source", "license"])
+def test_vendoring_refuses_tampered_supplemental_inputs_without_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tampered: str
+) -> None:
+    source = tmp_path / "source.ttf"
+    source.write_bytes(b"controlled primary source")
+    monkeypatch.setattr(font_vendor, "FONT_SOURCE_SHA256", hashlib.sha256(source.read_bytes()).hexdigest())
+    license_path = tmp_path / "OFL.txt"
+    license_path.write_bytes(files("web_translator").joinpath("font_assets/OFL.txt").read_bytes())
+    supplemental_source = tmp_path / "supplemental.ttf"
+    supplemental_source.write_bytes(b"controlled supplemental source")
+    supplemental_license = tmp_path / "supplemental-OFL.txt"
+    supplemental_license.write_bytes(b"tampered license")
+    if tampered == "license":
+        monkeypatch.setattr(font_vendor, "SUPPLEMENTAL_SOURCE_SHA256", hashlib.sha256(supplemental_source.read_bytes()).hexdigest())
+    destination = tmp_path / "font-assets"
+
+    with pytest.raises(font_vendor.FontVendoringError, match=f"supplemental {tampered} SHA-256 mismatch"):
+        font_vendor.vendor_fonts(
+            destination, source_file=source, license_file=license_path,
+            supplemental_source_file=supplemental_source,
+            supplemental_license_file=supplemental_license,
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("tampered", ["license-file", "license-provenance"])
+def test_assemble_pdf_rejects_tampered_supplemental_license_without_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tampered: str
+) -> None:
+    run_dir, translations, glossary = _assembly_run(tmp_path)
+    package_root = tmp_path / "installed" / "web_translator"
+    with as_file(files("web_translator").joinpath("font_assets")) as original:
+        shutil.copytree(original, package_root / "font_assets")
+    asset_root = package_root / "font_assets"
+    if tampered == "license-file":
+        (asset_root / "NotoSans-OFL.txt").write_bytes(b"tampered license")
+    else:
+        provenance_path = asset_root / "PROVENANCE.json"
+        provenance = json.loads(provenance_path.read_text("utf-8"))
+        provenance["supplemental_source"]["license"]["sha256"] = "0" * 64
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    monkeypatch.setattr(pdf_assemble_module, "files", lambda _name: package_root)
+
+    with pytest.raises(PdfAssemblyError, match="supplemental font.*license.*(hash|invalid)"):
+        assemble_pdf(run_dir, translations, glossary, tmp_path / "final")
+    assert not (run_dir / "staged-output").exists()
+    assert not (run_dir / "layout.json").exists()
 
 
 def test_assemble_pdf_rejects_tampered_bundled_license_without_outputs(

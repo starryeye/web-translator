@@ -82,6 +82,7 @@ BOLD_FONT_NAME = "WT-NotoSansKR-Bold"
 BODY_FONT_SIZE = 11.0
 MINIMUM_FONT_SIZE = 9.0
 FONT_LICENSE_SHA256 = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+SUPPLEMENTAL_FONT_LICENSE_SHA256 = "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a"
 _REPARSE_POINT = 0x400
 _IS_WINDOWS = os.name == "nt"
 _DIRFD_PUBLICATION_SUPPORTED = all(
@@ -2897,6 +2898,7 @@ def _register_fonts(stack: ExitStack) -> None:
         "schema_version",
         "source_sha256",
         "source_url",
+        "supplemental_source",
         "unicode_ranges",
     }:
         raise PdfAssemblyError("bundled font provenance fields are invalid")
@@ -2919,6 +2921,24 @@ def _register_fonts(stack: ExitStack) -> None:
         raise PdfAssemblyError(f"cannot read bundled font license: {error}") from error
     if hashlib.sha256(license_data).hexdigest() != FONT_LICENSE_SHA256:
         raise PdfAssemblyError("bundled font license hash mismatch")
+    supplemental = provenance.get("supplemental_source")
+    if not isinstance(supplemental, Mapping) or set(supplemental) != {
+        "axes", "license", "source_sha256", "source_url", "strategy",
+    }:
+        raise PdfAssemblyError("supplemental font provenance is invalid")
+    supplemental_license = supplemental.get("license")
+    if not isinstance(supplemental_license, Mapping) or set(supplemental_license) != {
+        "filename", "sha256", "url",
+    } or supplemental_license.get("filename") != "NotoSans-OFL.txt":
+        raise PdfAssemblyError("supplemental font license provenance is invalid")
+    if supplemental_license.get("sha256") != SUPPLEMENTAL_FONT_LICENSE_SHA256:
+        raise PdfAssemblyError("supplemental font license provenance hash is invalid")
+    try:
+        supplemental_license_data = root.joinpath("NotoSans-OFL.txt").read_bytes()
+    except OSError as error:
+        raise PdfAssemblyError(f"cannot read supplemental font license: {error}") from error
+    if hashlib.sha256(supplemental_license_data).hexdigest() != SUPPLEMENTAL_FONT_LICENSE_SHA256:
+        raise PdfAssemblyError("supplemental font license hash mismatch")
     for registered_name, filename in (
         (REGULAR_FONT_NAME, "NotoSansKR-Regular.ttf"),
         (BOLD_FONT_NAME, "NotoSansKR-Bold.ttf"),

@@ -10,18 +10,31 @@
       "axes": {
         "wght": 700
       },
-      "sha256": "df5ef3d0a6d9cca010b8ee2b3b54d901f111a82fc7f62c452756fa779fb2f331"
+      "sha256": "e229d4775d7ee21ec80a629245f1f9780179f44d62d92f8231e3ebd2ca3d2f58"
     },
     "NotoSansKR-Regular.ttf": {
       "axes": {
         "wght": 400
       },
-      "sha256": "074380419d8a6980515719cb2db8906164ea003ed021e1454e6f3134a8ac6528"
+      "sha256": "45ddd6b7041d083708ed098122f7d374a93de7bee08de2c6ff9d0e8ea58a75a8"
     }
   },
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "source_sha256": "7715af52f5fe77153ce5678546258993982d2da61abea8d25fb89eb5aaec5ca6",
   "source_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/Variable/TTF/NotoSansCJKkr-VF.ttf",
+  "supplemental_source": {
+    "axes": {
+      "wdth": 100
+    },
+    "license": {
+      "filename": "NotoSans-OFL.txt",
+      "sha256": "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a",
+      "url": "https://raw.githubusercontent.com/google/fonts/2984c575fdce412ee02b2baaba67672b9a9434d8/ofl/notosans/OFL.txt"
+    },
+    "source_sha256": "bfb7bb691513f12e734dc346c03a03f784912432d7e3fa8e56efcf906fe86b3d",
+    "source_url": "https://raw.githubusercontent.com/google/fonts/2984c575fdce412ee02b2baaba67672b9a9434d8/ofl/notosans/NotoSans[wdth,wght].ttf",
+    "strategy": "missing-required-glyphs-only"
+  },
   "unicode_ranges": [
     {
       "end": "U+007F",
@@ -34,9 +47,24 @@
       "start": "U+0080"
     },
     {
+      "end": "U+024F",
+      "name": "Latin Extended-A and B",
+      "start": "U+0100"
+    },
+    {
+      "end": "U+036F",
+      "name": "Combining Diacritical Marks",
+      "start": "U+0300"
+    },
+    {
       "end": "U+11FF",
       "name": "Hangul Jamo",
       "start": "U+1100"
+    },
+    {
+      "end": "U+1EFF",
+      "name": "Latin Extended Additional",
+      "start": "U+1E00"
     },
     {
       "end": "U+206F",

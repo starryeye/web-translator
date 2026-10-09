@@ -41,6 +41,7 @@ where = ["src"]
 web_translator = [
     "font_assets/*.ttf",
     "font_assets/OFL.txt",
+    "font_assets/NotoSans-OFL.txt",
     "font_assets/PROVENANCE.json",
 ]
 
