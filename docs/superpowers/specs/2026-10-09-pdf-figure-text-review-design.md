@@ -1,6 +1,6 @@
 # PDF Figure Text Review
 
-Status: direction approved on 2026-10-09; written specification awaits user review.
+Status: written specification approved on 2026-10-09; implementation awaits plan review.
 
 ## Intent and boundaries
 
