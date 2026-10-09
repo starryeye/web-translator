@@ -45,6 +45,7 @@ from web_translator.pdf_acquire import PdfAcquireError, acquire_pdf
 from web_translator.pdf_assemble import PdfAssemblyError, assemble_pdf
 from web_translator.pdf_extract import PdfExtractionError, extract_pdf
 from web_translator.pdf_extract_transaction import extract_pdf_transaction
+from web_translator.pdf_figure_review import PdfFigureReviewError, write_pdf_figure_review_input
 from web_translator.pdf_models import PdfContractError, PdfSourceRecord
 from web_translator.pdf_qa import PdfQAFailure, finalize_pdf_output, prepare_pdf_qa
 from web_translator.pdf_review import (
@@ -201,7 +202,7 @@ def _hold_command_run_contract(args: argparse.Namespace) -> Iterator[object]:
 
 def _command_output_root(args: argparse.Namespace, run_dir: Path) -> str:
     command = str(args.command)
-    if command in {"pdf-acquire", "pdf-extract", "pdf-review-input", "pdf-assemble", "pdf-qa"}:
+    if command in {"pdf-acquire", "pdf-extract", "pdf-review-input", "pdf-figure-review-input", "pdf-assemble", "pdf-qa"}:
         return "translated-pdfs"
     if command in {"capture", "extract", "assemble", "qa"}:
         return "translated-pages"
@@ -272,6 +273,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_run_dir(pdf_review_input)
     pdf_review_input.set_defaults(handler=_pdf_review_input_command)
+
+    figure_review_input = subparsers.add_parser(
+        "pdf-figure-review-input", help="Inventory exact source glyphs for artwork label review."
+    )
+    _add_run_dir(figure_review_input)
+    figure_review_input.set_defaults(handler=_pdf_figure_review_input_command)
 
     extract = subparsers.add_parser("extract", help="Extract translation segments.")
     _add_run_dir(extract)
@@ -391,6 +398,14 @@ def _pdf_extract_command(args: argparse.Namespace) -> None:
         raise
     except (CLIContractError, OSError, UnicodeError) as error:
         raise CLIContractError(f"cannot extract PDF source: {error}") from error
+
+
+def _pdf_figure_review_input_command(args: argparse.Namespace) -> None:
+    _validate_run_root(Path(args.run_dir))
+    try:
+        write_pdf_figure_review_input(Path(args.run_dir))
+    except PdfFigureReviewError as error:
+        raise CLIContractError(str(error)) from error
 
 
 def _pdf_review_input_command(args: argparse.Namespace) -> None:

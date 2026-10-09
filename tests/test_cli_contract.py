@@ -34,6 +34,33 @@ from web_translator.zones import Zone
 from tests.pdf_fixtures import make_image_only_pdf, make_text_pdf
 
 
+def test_pdf_figure_input_command_routes_native_unicode_paths_to_pdf_root(tmp_path, capsys):
+    from tests.pdf_figure_review_fixtures import make_figure_review_run
+    run, output = make_figure_review_run(tmp_path)
+    assert main(["pdf-figure-review-input", "--run-dir", str(run)]) == 0
+    assert (run / "figure-text-input.json").is_file()
+    assert not output.exists()
+    assert not (tmp_path / "translated-pages").exists()
+    assert '"status": "ok"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("native_argument", ["/tmp/그림 검토 with spaces", r"C:\workspace\그림 검토 with spaces"])
+def test_pdf_figure_input_parser_keeps_native_path_one_argument_and_pdf_root(tmp_path, native_argument):
+    args = cli_module._build_parser().parse_args(["pdf-figure-review-input", "--run-dir", native_argument])
+    assert str(args.run_dir) == native_argument
+    assert cli_module._command_output_root(args, tmp_path / "no-source-marker") == "translated-pdfs"
+
+
+def test_pdf_figure_input_command_contract_failure_preserves_old_evidence(tmp_path, capsys):
+    from tests.pdf_figure_review_fixtures import make_figure_review_run
+    run, _ = make_figure_review_run(tmp_path)
+    path = run / "figure-text-input.json"
+    path.write_bytes(b"keep old evidence\n")
+    assert main(["pdf-figure-review-input", "--run-dir", str(run)]) == cli_module.EXIT_CONTRACT_FAILURE
+    assert path.read_bytes() == b"keep old evidence\n"
+    assert "figure" in capsys.readouterr().err
+
+
 def test_native_pdf_assignment_publishes_binding_with_unchanged_package_shape(tmp_path):
     from tests.test_pdf_unit_bindings import BINDING, make_unit_run, manual_binding
     run = make_unit_run(tmp_path)
