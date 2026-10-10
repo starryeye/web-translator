@@ -1865,7 +1865,15 @@ def _continues_hanging_list(
         return weights.most_common(1)[0][0]
 
     if dominant_font(body) != dominant_font(current):
-        return False
+        # Inline styles already observed in the owned body are positive font
+        # evidence; the marker's font cannot authorize unrelated following text.
+        observed_fonts = {
+            word.fontname.split("+")[-1].casefold()
+            for line in (body, *owned[1:]) for word in line.words
+        }
+        if any(word.fontname.split("+")[-1].casefold() not in observed_fonts
+               for word in current.words):
+            return False
     if len(owned) > 1:
         established_gap = owned[1].top - first.bottom
         if abs(gap - established_gap) > size * 0.25:

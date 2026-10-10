@@ -1028,6 +1028,106 @@ def test_hanging_list_does_not_own_unproven_following_text(case: str) -> None:
         assert blocks[1].source_text == "Independent following content."
 
 
+@pytest.mark.parametrize("fonts", [("Helvetica", "Helvetica-Oblique"), ("OpaqueText", "UnrelatedInlineFace")])
+@pytest.mark.parametrize("scale,margin", [(0.75, 20), (1.5, 90)])
+@pytest.mark.parametrize("evidence", ["absent", "marker-only", "body-inline"])
+def test_hanging_list_continuation_requires_observed_inline_font(
+    fonts: tuple[str, str], scale: float, margin: float, evidence: str,
+) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    regular, alternate = fonts
+    specs = [
+        ("1.", margin, margin + 6, 100, alternate if evidence == "marker-only" else regular),
+        ("Ordinary opening with", margin + 16, margin + 116, 100, regular),
+        ("emphasis", margin + 120, margin + 160, 100, alternate if evidence == "body-inline" else regular),
+        ("continu‐", margin + 16, margin + 160, 112, alternate),
+        ("ation ends.", margin + 16, margin + 120, 124, alternate),
+        ("Separate body.", margin, margin + 160, 180, regular),
+    ]
+    lines = group_words_into_lines([
+        _word(text, x0=x0*scale, x1=x1*scale, top=top*scale,
+              bottom=(top+10)*scale, size=10*scale, fontname=font)
+        for text, x0, x1, top, font in specs
+    ])
+    blocks = build_text_blocks(lines, page_number=1)
+    assert [(block.kind, block.source_text) for block in blocks] == (
+        [("list-item", "1. Ordinary opening with emphasis continuation ends."),
+         ("paragraph", "Separate body.")] if evidence == "body-inline" else
+        [("list-item", "1. Ordinary opening with emphasis"),
+         ("paragraph", "continuation ends."), ("paragraph", "Separate body.")]
+    )
+    # Only the discretionary hyphen is removed; no source glyph is lost/repeated.
+    assert sum(len("".join(block.source_text.split())) for block in blocks) == sum(
+        line.character_count for line in lines) - 1
+    assert all(block.continuation_of is None for block in blocks)
+
+
+@pytest.mark.parametrize("scale", [0.75, 1.5])
+def test_hanging_list_reuses_inline_run_from_an_owned_continuation(scale: float) -> None:
+    from web_translator.pdf_layout import build_text_blocks, group_words_into_lines
+
+    # A style observed in an already owned second line is evidence for line 3.
+    specs = [
+        ("1.", 40, 46, 100, "OpaqueRegular"),
+        ("Ordinary opening", 56, 170, 100, "OpaqueRegular"),
+        ("regular continuation with", 56, 180, 112, "OpaqueRegular"),
+        ("new emphasis", 184, 240, 112, "OpaqueInline"),
+        ("later style completes the item.", 56, 240, 124, "OpaqueInline"),
+    ]
+    lines = group_words_into_lines([
+        _word(text, x0=x0*scale, x1=x1*scale, top=top*scale,
+              bottom=(top+10)*scale, size=10*scale, fontname=font)
+        for text, x0, x1, top, font in specs
+    ])
+    blocks = build_text_blocks(lines, page_number=1)
+    assert [(block.kind, block.source_text) for block in blocks] == [
+        ("list-item", "1. Ordinary opening regular continuation with new emphasis later style completes the item."),
+    ]
+    assert sum(len("".join(block.source_text.split())) for block in blocks) == sum(
+        line.character_count for line in lines)
+
+
+@pytest.mark.parametrize("regular,italic", [("Helvetica", "Helvetica-Oblique"), ("Times-Roman", "Times-Italic")])
+@pytest.mark.parametrize("scale,margin", [(0.75, 30), (1.5, 60)])
+def test_hanging_list_inline_emphasis_real_pdf_retains_complete_logical_item(
+    tmp_path: Path, regular: str, italic: str, scale: float, margin: float,
+) -> None:
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from web_translator.pdf_extract import extract_pdf
+    from web_translator.models import read_segments
+
+    source = tmp_path / "inline-hanging-list.pdf"
+    canvas = Canvas(str(source), pagesize=(500*scale, 500*scale))
+    canvas.setFont(regular, 10*scale)
+    canvas.drawString(margin*scale, 350*scale, "1.")
+    canvas.drawString((margin+16)*scale, 350*scale, "An ordinary opening with ")
+    end = margin+16+stringWidth("An ordinary opening with ", regular, 10)
+    canvas.setFont(italic, 10*scale)
+    canvas.drawString(end*scale, 350*scale, "emphasis")
+    canvas.drawString((margin+16)*scale, 338*scale, "continues in the same inline style")
+    canvas.drawString((margin+16)*scale, 326*scale, "and ends as one item.")
+    canvas.setFont(regular, 10*scale)
+    canvas.drawString(margin*scale, 300*scale, "Independent prose remains outside the list.")
+    canvas.save()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    document = extract_pdf(source, run_dir / "document.json", run_dir / "segments.jsonl", run_dir / "media")
+    assert [(block.kind, block.source_text) for block in document.blocks] == [
+        ("list-item", "1. An ordinary opening with emphasis continues in the same inline style and ends as one item."),
+        ("paragraph", "Independent prose remains outside the list."),
+    ]
+    units = document.translation_units
+    assert len(units) == 2
+    assert units[0].source_block_ids == (document.blocks[0].id,)
+    segments = read_segments(run_dir / "segments.jsonl")
+    from web_translator.protection import restore_tokens
+    assert [restore_tokens(segment.source_text, segment.protected) for segment in segments] == [
+        "1. An ordinary opening with emphasis continues in the same inline style and ends as one item.",
+        "Independent prose remains outside the list.",
+    ]
+
+
 def test_hanging_list_real_pdf_extracts_and_assembles_one_complete_item(tmp_path: Path) -> None:
     from pypdf import PdfReader
     from tests.test_pdf_assemble import _assembly_run, _assemble_publication

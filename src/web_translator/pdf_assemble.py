@@ -2316,6 +2316,10 @@ def _build_rich_document(
                 if block.kind == "footnote" and block.id in section_notes:
                     continue
                 append_text(block, portrait_frame)
+                if block.semantic_role == "body" and block.kind in {"paragraph", "list-item"}:
+                    # The opener's physical-page fence ends when ordinary flow
+                    # resumes, including a unit whose later members cross pages.
+                    composition_page = None
             append_pending_section_notes(None)
             story.extend([_PublicationIndex(update_note_plan), ActionFlowable(("noteTail",))])
             pdf = PublicationDocTemplate(

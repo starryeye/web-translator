@@ -769,12 +769,33 @@ def replace_fixture_document(document, **changes):
 def rebind_native_fixture(run):
     """Bind deliberate synthetic setup changes before any fresh review."""
     import json
+    from web_translator.cli import _assignment_records, _zone_payload
+    from web_translator.models import read_segments
     from web_translator.pdf_unit_bindings import build_pdf_unit_binding
+    from web_translator.zones import Zone
+    if any(not (run / name).exists() for name in ("zones", "assignments")):
+        segments = read_segments(run / "segments.jsonl")
+        targets = [segment for segment in segments if segment.target]
+        # Renderer fixtures intentionally use one hand-declared assignment, not a
+        # planning-budget test. Still provide complete canonical semantic metadata.
+        zone = Zone("zone-001", [], [segment.id for segment in targets], [], [],
+                    expected_tokens={segment.id: tuple(token.token for token in segment.protected)
+                                     for segment in targets})
+        payloads = {
+            "zones": _zone_payload(zone),
+            "assignments": {
+                "context_after": [], "context_before": [],
+                "document_summary": "TEST ONLY synthetic renderer fixture",
+                "glossary": {}, "schema_version": "1.0",
+                "targets": _assignment_records(zone.target_ids, {segment.id: segment for segment in segments}, zone.id),
+                "zone_id": zone.id,
+            },
+        }
     for name in ("zones", "assignments"):
         directory = run / name
         if not directory.exists():
             directory.mkdir()
-            (directory / "zone-001.json").write_text('{"zone_id":"zone-001"}\n', encoding="utf-8")
+            (directory / "zone-001.json").write_text(json.dumps(payloads[name]) + "\n", encoding="utf-8")
     binding = build_pdf_unit_binding((run / "document.json").read_bytes(),
         (run / "segments.jsonl").read_bytes(),
         {p.name: p.read_bytes() for p in (run / "zones").glob("zone-*.json")},

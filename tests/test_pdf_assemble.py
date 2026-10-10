@@ -1265,6 +1265,87 @@ def test_toc_hierarchy_and_wrapped_label_keep_numeric_column_aligned(tmp_path: P
         assert abs(pages[0]["x1"] - pages[1]["x1"]) < 0.01
 
 
+@pytest.mark.parametrize("role,text", [
+    ("dedication", "For the readers."),
+    ("part-title", "A distinct part"),
+    ("chapter-title", "A distinct chapter"),
+    ("epigraph", "A distinct thought."),
+])
+@pytest.mark.parametrize("resumed_body", [False, True], ids=["composition-only", "resumed-body"])
+def test_source_composition_fence_ends_when_body_resumes(
+    tmp_path: Path, role: str, text: str, resumed_body: bool,
+) -> None:
+    # A stale source-page fence must not separate body that has already resumed.
+    rows = [(1, "body", "Before the composition."), (2, role, text)]
+    if resumed_body:
+        rows.append((2, "body", "Ordinary prose resumes here."))
+    rows.append((3, "body", "The following source page continues the body."))
+    run_dir = _publication_assembly_run(tmp_path, rows)
+    output = _assemble_publication(run_dir, tmp_path / "out")
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    assert [record.page_number for record in records] == (
+        [1, 2, 2, 2] if resumed_body else [1, 2, 3]
+    )
+    pages = PdfReader(output).pages
+    assert len(pages) == (2 if resumed_body else 3)
+    for _, _, source_text in rows:
+        assert " ".join(" ".join(page.extract_text() or "" for page in pages).split()).count(source_text) == 1
+
+
+def test_resumed_cross_page_unit_keeps_following_body_on_its_last_output_page(tmp_path: Path) -> None:
+    from web_translator.pdf_extract import build_pdf_unit_segments
+    from web_translator.pdf_models import (
+        PdfBlockBoundary, PdfBoundaryLine, PdfJoinEvidence, PdfTextJoin,
+    )
+
+    # The body starts on the opener source page but splits in output and owns
+    # a second physical member. Removing tracking or retaining the fence fails.
+    first_text = " ".join(f"token{i:04d}" for i in range(225))
+    second_text = " ".join(f"token{i:04d}" for i in range(225, 450))
+    run_dir = _publication_assembly_run(tmp_path, [
+        (1, "chapter-title", "Opening composition"),
+        (1, "body", first_text), (2, "body", second_text),
+        (2, "body", "Following body stays with the completed unit."),
+    ])
+    path = run_dir / "document.json"
+    document = PdfDocument.from_dict(json.loads(path.read_text()))
+    left, right = document.blocks[1:3]
+
+    def boundary(block: PdfBlock) -> PdfBlockBoundary:
+        line = PdfBoundaryLine(block.bbox, 11, "Helvetica", block.source_text)
+        return PdfBlockBoundary(block.id, line, line, (72, 54, 432, 607.5), 0)
+
+    join = PdfTextJoin(left.id, right.id, "space", PdfJoinEvidence(
+        boundary(left), boundary(right), (504, 661.5), (504, 661.5),
+    ))
+    units = [document.translation_units[0], replace(document.translation_units[1],
+        source_block_ids=(left.id, right.id), joins=(join,)),
+        replace(document.translation_units[3], id="pdf:unit-000003")]
+    blocks, units, segments = build_pdf_unit_segments(document.blocks, units)
+    document = replace(document, blocks=blocks, translation_units=units)
+    path.write_text(json.dumps(document.to_dict()))
+    (run_dir / "segments.jsonl").unlink()
+    write_segments(run_dir / "segments.jsonl", segments)
+    rebind_native_fixture(run_dir)
+    before = path.read_bytes()
+    output = assemble_pdf(run_dir, {segment.id: Translation(segment.id, segment.source_text)
+                                   for segment in segments}, {}, tmp_path / "out")
+    assert path.read_bytes() == before
+    records = read_pdf_layout(run_dir / "layout.json").flowables
+    body = [record for record in records if record.unit_id == units[1].id]
+    following = next(record for record in records if record.block_id == blocks[3].id)
+    assert len({record.page_number for record in body}) >= 2
+    assert all(record.source_block_ids == (left.id, right.id) for record in body)
+    assert [record.split_part for record in body] == list(range(len(body)))
+    assert following.page_number == body[-1].page_number
+    assert following.bounds[1] + following.bounds[3] <= body[-1].bounds[1]
+    pages = PdfReader(output).pages
+    assert len(pages) == body[-1].page_number
+    rendered = " ".join(" ".join(page.extract_text() or "" for page in pages).split())
+    assert all(rendered.count(f"token{i:04d}") == 1 for i in range(450))
+    assert rendered.count("Following body stays with the completed unit.") == 1
+
+
 def test_source_trim_opener_and_epigraph_groups_preserve_source_page_structure(tmp_path: Path) -> None:
     run_dir = _publication_assembly_run(tmp_path, [
         (1, "body", "Before."),
